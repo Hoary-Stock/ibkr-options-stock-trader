@@ -13,10 +13,19 @@ MARKET_DATA_TYPE = 1  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
 MAX_SIMULTANEOUS_STREAMS = 95  # IBKR limit ~100, leave headroom
 
 # ── Price Ladder ─────────────────────────────────────────────────────
-TICK_SIZE_SMALL = 0.05   # For options priced < $3
-TICK_SIZE_LARGE = 0.10   # For options priced >= $3
+# Penny Pilot (SPY, QQQ, IWM, AAPL, TSLA, NVDA, AMZN, etc.)
+TICK_SIZE_SMALL = 0.01   # For options priced < $3
+TICK_SIZE_LARGE = 0.05   # For options priced >= $3
 TICK_THRESHOLD = 3.0     # Price threshold for tick size switch
 LADDER_ROWS = 25         # Number of price levels to display
+
+# Non-Penny-Pilot overrides (index options like SPX)
+TICK_SIZE_OVERRIDES = {
+    "SPX":  (0.05, 0.10),   # SPX: $0.05 < $3, $0.10 >= $3
+    "XSP":  (0.05, 0.10),
+    "NDX":  (0.05, 0.10),
+    "RUT":  (0.05, 0.10),
+}
 
 # ── Market Depth ─────────────────────────────────────────────────────
 DEPTH_ROWS = 10          # Number of depth levels to request

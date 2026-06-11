@@ -22,7 +22,7 @@ from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QBrush, QFont
 
 from config import (
-    TICK_SIZE_SMALL, TICK_SIZE_LARGE, TICK_THRESHOLD,
+    TICK_SIZE_SMALL, TICK_SIZE_LARGE, TICK_THRESHOLD, TICK_SIZE_OVERRIDES,
     LADDER_ROWS, COLOR_BUY, COLOR_SELL, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BUTTON_DISABLED, COLOR_BG_DARK, COLOR_BORDER, COLOR_BG,
     COLOR_BG_PANEL, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
@@ -672,7 +672,13 @@ class PriceLadder(QWidget):
         if mid <= 0:
             mid = 1.0
 
-        tick = TICK_SIZE_SMALL if mid < TICK_THRESHOLD else TICK_SIZE_LARGE
+        # Use symbol-specific tick size (SPX uses wider ticks)
+        sym = self._option.symbol.upper()
+        if sym in TICK_SIZE_OVERRIDES:
+            ts, tl = TICK_SIZE_OVERRIDES[sym]
+        else:
+            ts, tl = TICK_SIZE_SMALL, TICK_SIZE_LARGE
+        tick = ts if mid < TICK_THRESHOLD else tl
 
         # Generate price levels centered on mid
         half = LADDER_ROWS // 2
@@ -755,14 +761,19 @@ class PriceLadder(QWidget):
                 bid_depth_map[round(p, 2)] = s
             for p, s in self._depth_asks:
                 ask_depth_map[round(p, 2)] = s
-        else:
-            # Fall back to bid/ask size from tick data
-            bid_sz = tick.get("bid_size", 0)
-            ask_sz = tick.get("ask_size", 0)
-            if bid > 0 and bid_sz > 0:
-                bid_depth_map[round(bid, 2)] = bid_sz
-            if ask > 0 and ask_sz > 0:
-                ask_depth_map[round(ask, 2)] = ask_sz
+
+        # Always show bid/ask from tick data (ensures prices are visible
+        # even without depth subscription or when depth is sparse)
+        bid_sz = tick.get("bid_size", 0)
+        ask_sz = tick.get("ask_size", 0)
+        if bid > 0:
+            bid_key = round(bid, 2)
+            if bid_key not in bid_depth_map:
+                bid_depth_map[bid_key] = max(bid_sz, 1)
+        if ask > 0:
+            ask_key = round(ask, 2)
+            if ask_key not in ask_depth_map:
+                ask_depth_map[ask_key] = max(ask_sz, 1)
 
         max_bid = max((s for s in bid_depth_map.values()), default=1)
         max_ask = max((s for s in ask_depth_map.values()), default=1)

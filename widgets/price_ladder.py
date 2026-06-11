@@ -428,10 +428,15 @@ class PriceLadder(QWidget):
         checkbox_layout = QHBoxLayout()
         checkbox_layout.setSpacing(12)
 
-        self.confirm_checkbox = QCheckBox("订单二次确认")
-        self.confirm_checkbox.setChecked(True)
-        self.confirm_checkbox.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
-        checkbox_layout.addWidget(self.confirm_checkbox)
+        self.no_confirm_checkbox = QCheckBox("免确认下单")
+        self.no_confirm_checkbox.setChecked(False)
+        self.no_confirm_checkbox.setToolTip(
+            "勾选后点价/市价下单不弹出确认框，直接提交\n"
+            "TWS 端: 请在 全局配置 → API → 设置 中\n"
+            "勾选「Bypass Order Precautions for API Orders」"
+        )
+        self.no_confirm_checkbox.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+        checkbox_layout.addWidget(self.no_confirm_checkbox)
 
         self.outside_rth_checkbox = QCheckBox("盘外交易 (GTH)")
         self.outside_rth_checkbox.setChecked(True)
@@ -928,7 +933,7 @@ class PriceLadder(QWidget):
 
     def _on_market_buy(self):
         if self._option:
-            if self.confirm_checkbox.isChecked():
+            if not self.no_confirm_checkbox.isChecked():
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认市价买入",
@@ -941,7 +946,7 @@ class PriceLadder(QWidget):
 
     def _on_market_sell(self):
         if self._option:
-            if self.confirm_checkbox.isChecked():
+            if not self.no_confirm_checkbox.isChecked():
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认市价卖出",
@@ -958,28 +963,32 @@ class PriceLadder(QWidget):
             pos_qty = self._engine.get_position_qty(key) if self._engine else 0
             if pos_qty <= 0:
                 return
-            reply = QMessageBox.question(
-                self, "确认市价平仓",
-                f"确认市价平仓 {pos_qty} 张\n{self._option.display_name}？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                self.close_position_requested.emit(self._option)
+            if not self.no_confirm_checkbox.isChecked():
+                reply = QMessageBox.question(
+                    self, "确认市价平仓",
+                    f"确认市价平仓 {pos_qty} 张\n{self._option.display_name}？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            self.close_position_requested.emit(self._option)
 
     def _on_cancel_all(self):
-        reply = QMessageBox.question(
-            self, "确认取消",
-            "确认取消所有挂单？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self.cancel_all_requested.emit()
+        if not self.no_confirm_checkbox.isChecked():
+            reply = QMessageBox.question(
+                self, "确认取消",
+                "确认取消所有挂单？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self.cancel_all_requested.emit()
 
     # ── Price Button Clicks ────────────────────────────────────────────
 
     def _on_buy(self, price: float):
         if self._option:
-            if self.confirm_checkbox.isChecked():
+            if not self.no_confirm_checkbox.isChecked():
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认买入",
@@ -994,7 +1003,7 @@ class PriceLadder(QWidget):
 
     def _on_sell(self, price: float):
         if self._option:
-            if self.confirm_checkbox.isChecked():
+            if not self.no_confirm_checkbox.isChecked():
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认卖出",

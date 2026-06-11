@@ -550,20 +550,6 @@ class MainWindow(QMainWindow):
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
         qty = self.price_ladder.get_quantity()
 
-        # Live mode confirmation (if not already confirmed by ladder checkbox)
-        if self._active_engine.mode == TradingMode.LIVE and not self.price_ladder.confirm_checkbox.isChecked():
-            action_text = "买入" if action == OrderAction.BUY else "卖出"
-            reply = QMessageBox.question(
-                self, "确认下单",
-                f"确认在实盘 {action_text} {qty} 张\n"
-                f"{option.display_name}\n"
-                f"限价: ${price:.2f}？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
         outside_rth = self.price_ladder.get_outside_rth()
         order_id = self._active_engine.place_limit_order(
             option, action, qty, price, outside_rth=outside_rth

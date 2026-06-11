@@ -183,7 +183,8 @@ class PaperEngine:
     # ── Order Management ──────────────────────────────────────────────
 
     def place_limit_order(self, option: OptionInfo, action: OrderAction,
-                          quantity: int, price: float) -> int:
+                          quantity: int, price: float,
+                          outside_rth: bool = False) -> int:
         """Place a simulated limit order. Returns orderId."""
         # Prevent short selling
         if action == OrderAction.SELL:
@@ -217,7 +218,8 @@ class PaperEngine:
         return order_id
 
     def place_market_order(self, option: OptionInfo, action: OrderAction,
-                           quantity: int) -> int:
+                           quantity: int,
+                           outside_rth: bool = False) -> int:
         """Place a simulated market order — immediate fill at ask (buy) or bid (sell)."""
         if action == OrderAction.SELL:
             key = option.to_ibkr_key()
@@ -295,14 +297,16 @@ class PaperEngine:
                     order_id, OrderStatus.CANCELLED.value, 0, 0, 0
                 )
 
-    def close_position(self, option: OptionInfo) -> int:
+    def close_position(self, option: OptionInfo,
+                       outside_rth: bool = False) -> int:
         """Close entire position with a market sell."""
         key = option.to_ibkr_key()
         pos = self._positions.get(key)
         if not pos or pos.quantity <= 0:
             self.bridge.error_received.emit(-1, -1, "无持仓可平")
             return -1
-        return self.place_market_order(option, OrderAction.SELL, pos.quantity)
+        return self.place_market_order(option, OrderAction.SELL, pos.quantity,
+                                       outside_rth=outside_rth)
 
     def place_forex_order(self, base: str, quote: str, action: str, amount: float):
         """Forex not supported in paper mode."""

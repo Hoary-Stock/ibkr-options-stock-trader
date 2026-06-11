@@ -424,11 +424,29 @@ class PriceLadder(QWidget):
         )
         main_layout.addWidget(self.contract_label)
 
-        # ── Confirm checkbox ──
+        # ── Checkboxes row: confirm + outside RTH ──
+        checkbox_layout = QHBoxLayout()
+        checkbox_layout.setSpacing(12)
+
         self.confirm_checkbox = QCheckBox("订单二次确认")
         self.confirm_checkbox.setChecked(True)
         self.confirm_checkbox.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
-        main_layout.addWidget(self.confirm_checkbox)
+        checkbox_layout.addWidget(self.confirm_checkbox)
+
+        self.outside_rth_checkbox = QCheckBox("盘外交易 (GTH)")
+        self.outside_rth_checkbox.setChecked(True)
+        self.outside_rth_checkbox.setToolTip(
+            "允许在盘前/盘后/夜盘 (GTH/Curb) 时段执行订单\n"
+            "SPX 期权 GTH: 20:15-09:15 ET\n"
+            "SPX 期权 RTH: 09:30-16:15 ET"
+        )
+        self.outside_rth_checkbox.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 11px; font-weight: bold;"
+        )
+        checkbox_layout.addWidget(self.outside_rth_checkbox)
+
+        checkbox_layout.addStretch()
+        main_layout.addLayout(checkbox_layout)
 
         # ── Position summary row ──
         pos_frame = QFrame()
@@ -603,6 +621,10 @@ class PriceLadder(QWidget):
     def get_quantity(self) -> int:
         """Get current quantity from the integrated spinner."""
         return self.qty_spin.value()
+
+    def get_outside_rth(self) -> bool:
+        """Whether orders should be allowed outside regular trading hours."""
+        return self.outside_rth_checkbox.isChecked()
 
     def _qty_increment(self):
         self.qty_spin.setValue(self.qty_spin.value() + 1)

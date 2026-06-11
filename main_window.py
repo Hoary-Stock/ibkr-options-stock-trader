@@ -1,17 +1,20 @@
 """Main window layout — assembles all widgets."""
 
 import threading
+from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QMessageBox, QStatusBar,
-    QPushButton,
+    QPushButton, QLabel,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 from config import (
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT,
     COLOR_BORDER, COLOR_ACCENT, COLOR_GREEN, COLOR_RED,
+    SPX_SESSION_GTH_START, SPX_SESSION_GTH_END,
+    SPX_SESSION_RTH_START, SPX_SESSION_RTH_END,
 )
 from models import OptionInfo, OrderAction, TradingMode
 from ibkr_engine import IBKREngine
@@ -149,6 +152,12 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLESHEET)
         self.statusBar().showMessage("就绪 — 点击「连接」开始")
 
+        # Session indicator timer (updates every 10 seconds)
+        self._session_timer = QTimer()
+        self._session_timer.timeout.connect(self._update_session_indicator)
+        self._session_timer.start(10_000)
+        self._update_session_indicator()
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -172,6 +181,21 @@ class MainWindow(QMainWindow):
         )
         self._chart_btn.clicked.connect(self._on_open_chart)
         top_bar_layout.addWidget(self._chart_btn)
+
+        # Session indicator (shows current market session for SPX options)
+        self._session_label = QLabel("--")
+        self._session_label.setFixedHeight(30)
+        self._session_label.setStyleSheet(
+            f"color: {COLOR_TEXT}; background-color: {COLOR_BG_PANEL}; "
+            f"border: 1px solid {COLOR_BORDER}; padding: 2px 10px; "
+            f"border-radius: 3px; font-size: 12px; font-weight: bold;"
+        )
+        self._session_label.setToolTip(
+            "SPX 期权交易时段 (ET)\n"
+            "GTH 夜盘: 20:15 - 09:15\n"
+            "RTH 正常盘: 09:30 - 16:15"
+        )
+        top_bar_layout.addWidget(self._session_label)
 
         main_layout.addLayout(top_bar_layout)
 
@@ -540,11 +564,15 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
-        order_id = self._active_engine.place_limit_order(option, action, qty, price)
+        outside_rth = self.price_ladder.get_outside_rth()
+        order_id = self._active_engine.place_limit_order(
+            option, action, qty, price, outside_rth=outside_rth
+        )
         if order_id > 0:
             action_text = "买入" if action == OrderAction.BUY else "卖出"
+            rth_tag = " [盘外]" if outside_rth else ""
             self.statusBar().showMessage(
-                f"已提交: {action_text} {qty}张 {option.display_name} @ ${price:.2f}"
+                f"已提交: {action_text} {qty}张 {option.display_name} @ ${price:.2f}{rth_tag}"
             )
             # Switch to order tab
             self.right_tabs.setCurrentIndex(1)
@@ -553,20 +581,28 @@ class MainWindow(QMainWindow):
         """Handle market order from price ladder action buttons."""
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
         qty = self.price_ladder.get_quantity()
+        outside_rth = self.price_ladder.get_outside_rth()
 
-        order_id = self._active_engine.place_market_order(option, action, qty)
+        order_id = self._active_engine.place_market_order(
+            option, action, qty, outside_rth=outside_rth
+        )
         if order_id > 0:
             action_text = "市价买入" if action == OrderAction.BUY else "市价卖出"
+            rth_tag = " [盘外]" if outside_rth else ""
             self.statusBar().showMessage(
-                f"已提交: {action_text} {qty}张 {option.display_name}"
+                f"已提交: {action_text} {qty}张 {option.display_name}{rth_tag}"
             )
             self.right_tabs.setCurrentIndex(1)
 
     def _on_close_position_requested(self, option: OptionInfo):
         """Handle close position from price ladder."""
-        order_id = self._active_engine.close_position(option)
+        outside_rth = self.price_ladder.get_outside_rth()
+        order_id = self._active_engine.close_position(
+            option, outside_rth=outside_rth
+        )
         if order_id > 0:
-            self.statusBar().showMessage(f"已提交平仓: {option.display_name}")
+            rth_tag = " [盘外]" if outside_rth else ""
+            self.statusBar().showMessage(f"已提交平仓: {option.display_name}{rth_tag}")
             self.right_tabs.setCurrentIndex(1)
 
     def _on_cancel_all_requested(self):
@@ -606,6 +642,55 @@ class MainWindow(QMainWindow):
                                 if chart in self._chart_windows else None)
         chart.show_and_load()
 
+    # ── Session Indicator ────────────────────────────────────────────
+
+    def _update_session_indicator(self):
+        """Update the session status label based on current ET time."""
+        try:
+            import zoneinfo
+            et = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+        except Exception:
+            # Fallback: assume local time is ET (close enough for display)
+            et = datetime.now()
+
+        h, m = et.hour, et.minute
+        t = h * 60 + m  # minutes since midnight
+
+        gth_start = SPX_SESSION_GTH_START[0] * 60 + SPX_SESSION_GTH_START[1]  # 20:15 = 1215
+        gth_end = SPX_SESSION_GTH_END[0] * 60 + SPX_SESSION_GTH_END[1]        # 09:15 = 555
+        rth_start = SPX_SESSION_RTH_START[0] * 60 + SPX_SESSION_RTH_START[1]  # 09:30 = 570
+        rth_end = SPX_SESSION_RTH_END[0] * 60 + SPX_SESSION_RTH_END[1]        # 16:15 = 975
+
+        weekday = et.weekday()  # 0=Mon ... 6=Sun
+        is_weekend = weekday >= 5
+
+        if is_weekend:
+            session_text = "休市"
+            session_color = COLOR_RED
+        elif t >= rth_start and t < rth_end:
+            session_text = "RTH 正常盘"
+            session_color = COLOR_GREEN
+        elif t >= gth_start or t < gth_end:
+            session_text = "GTH 夜盘"
+            session_color = COLOR_ACCENT
+        elif t >= gth_end and t < rth_start:
+            session_text = "盘前过渡"
+            session_color = "#ff9800"
+        elif t >= rth_end and t < gth_start:
+            session_text = "盘后"
+            session_color = "#ff9800"
+        else:
+            session_text = "休市"
+            session_color = COLOR_RED
+
+        time_str = et.strftime("%H:%M ET")
+        self._session_label.setText(f"{session_text} {time_str}")
+        self._session_label.setStyleSheet(
+            f"color: {session_color}; background-color: {COLOR_BG_PANEL}; "
+            f"border: 1px solid {COLOR_BORDER}; padding: 2px 10px; "
+            f"border-radius: 3px; font-size: 12px; font-weight: bold;"
+        )
+
     # ── Error Handling ────────────────────────────────────────────────
 
     def _on_error(self, req_id: int, code: int, msg: str):
@@ -617,6 +702,9 @@ class MainWindow(QMainWindow):
     # ── Cleanup ───────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Stop session timer
+        self._session_timer.stop()
+
         # Close all chart windows
         for chart in list(self._chart_windows):
             chart.cleanup()

@@ -758,8 +758,11 @@ class IBKREngine:
     # ── Order Management ──────────────────────────────────────────────
 
     def place_limit_order(self, option: OptionInfo, action: OrderAction,
-                          quantity: int, price: float) -> int:
-        """Place a limit order. Returns orderId."""
+                          quantity: int, price: float,
+                          outside_rth: bool = False) -> int:
+        """Place a limit order. Returns orderId.
+        outside_rth: allow execution during GTH/Curb sessions (盘外交易).
+        """
         contract = self._make_option_contract(
             option.symbol, option.expiry, option.strike, option.right
         )
@@ -772,6 +775,7 @@ class IBKREngine:
         order.eTradeOnly = ""
         order.firmQuoteOnly = ""
         order.tif = "DAY"
+        order.outsideRth = outside_rth
 
         order_id = self._app.next_order_id()
 
@@ -795,8 +799,11 @@ class IBKREngine:
         return order_id
 
     def place_market_order(self, option: OptionInfo, action: OrderAction,
-                           quantity: int) -> int:
-        """Place a market order. Returns orderId."""
+                           quantity: int,
+                           outside_rth: bool = False) -> int:
+        """Place a market order. Returns orderId.
+        outside_rth: allow execution during GTH/Curb sessions (盘外交易).
+        """
         contract = self._make_option_contract(
             option.symbol, option.expiry, option.strike, option.right
         )
@@ -808,6 +815,7 @@ class IBKREngine:
         order.eTradeOnly = ""
         order.firmQuoteOnly = ""
         order.tif = "DAY"
+        order.outsideRth = outside_rth
 
         order_id = self._app.next_order_id()
 
@@ -844,14 +852,16 @@ class IBKREngine:
                 except Exception:
                     pass
 
-    def close_position(self, option: OptionInfo) -> int:
+    def close_position(self, option: OptionInfo,
+                       outside_rth: bool = False) -> int:
         """Close entire position with a market sell order. Returns orderId or -1."""
         key = option.to_ibkr_key()
         pos = self._positions.get(key)
         if not pos or pos.quantity <= 0:
             self.bridge.error_received.emit(-1, -1, "无持仓可平")
             return -1
-        return self.place_market_order(option, OrderAction.SELL, pos.quantity)
+        return self.place_market_order(option, OrderAction.SELL, pos.quantity,
+                                       outside_rth=outside_rth)
 
     def place_forex_order(self, base: str, quote: str, action: str, amount: float):
         """Place a forex conversion order on IDEALPRO."""

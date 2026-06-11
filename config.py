@@ -80,6 +80,19 @@ DEFAULT_SYMBOLS = ["SPY", "SPX", "QQQ", "IWM", "AAPL", "TSLA", "NVDA", "AMZN", "
 # ── Option Chain ─────────────────────────────────────────────────────
 MAX_EXPIRY_TABS_PER_RANGE = 10  # Show at most 10 expiries per range filter
 
+# ── SPX Options Trading Sessions (all times ET) ───────────────────
+# GTH = Global Trading Hours (夜盘/盘前): 20:15 → 09:15 next day
+# RTH = Regular Trading Hours (正常盘): 09:30 → 16:15
+# Curb = After-hours (盘后): 16:15 → 17:00 (limited)
+# Note: SPY options are RTH only; SPX/SPXW support GTH+RTH
+SPX_SESSION_GTH_START = (20, 15)  # 8:15 PM ET
+SPX_SESSION_GTH_END = (9, 15)    # 9:15 AM ET
+SPX_SESSION_RTH_START = (9, 30)   # 9:30 AM ET
+SPX_SESSION_RTH_END = (16, 15)    # 4:15 PM ET
+
+# Symbols that support extended hours (GTH) trading
+EXTENDED_HOURS_SYMBOLS = {"SPX"}
+
 # ── Chart (K-Line) ─────────────────────────────────────────────────
 # (display_name, ibkr_bar_size, duration, keep_up_to_date)
 CHART_TIMEFRAMES = {

@@ -1,8 +1,11 @@
-"""Custom pyqtgraph GraphicsObject for drawing OHLC candlesticks."""
+"""Custom pyqtgraph GraphicsObject for drawing OHLC candlesticks.
 
-import numpy as np
+Style: Up candles = hollow (green outline), Down candles = filled (red).
+Matches Futu / traditional Asian market convention.
+"""
+
 import pyqtgraph as pg
-from PyQt5.QtCore import QRectF, QPointF
+from PyQt5.QtCore import QRectF, QPointF, Qt
 from PyQt5.QtGui import QPicture, QPainter, QColor, QPen, QBrush
 
 
@@ -36,7 +39,7 @@ class CandlestickItem(pg.GraphicsObject):
         painter = QPainter(self._picture)
         painter.setRenderHint(QPainter.Antialiasing, False)
 
-        w = 0.33  # half-width of candle body
+        w = 0.35  # half-width of candle body
 
         all_lows = []
         all_highs = []
@@ -49,20 +52,24 @@ class CandlestickItem(pg.GraphicsObject):
             all_highs.append(h)
 
             if c >= o:
+                # Up candle: hollow (outline only, background shows through)
                 color = self._color_up
+                pen = QPen(color)
+                pen.setWidthF(1.0)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
             else:
+                # Down candle: filled solid
                 color = self._color_down
-
-            pen = QPen(color)
-            pen.setWidthF(1.0)
-            painter.setPen(pen)
+                pen = QPen(color)
+                pen.setWidthF(1.0)
+                painter.setPen(pen)
+                painter.setBrush(QBrush(color))
 
             # Wick (high-low line)
             painter.drawLine(QPointF(x, l), QPointF(x, h))
 
             # Body
-            brush = QBrush(color)
-            painter.setBrush(brush)
             body_top = max(o, c)
             body_bot = min(o, c)
             body_h = body_top - body_bot

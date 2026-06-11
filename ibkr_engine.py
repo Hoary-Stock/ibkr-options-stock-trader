@@ -606,9 +606,11 @@ class IBKREngine:
     def request_historical_data(
         self, symbol: str, bar_size: str, duration: str,
         keep_up_to_date: bool = False, timeout: float = 30,
+        end_date_time: str = "",
     ) -> tuple[int, list[dict]]:
         """Request historical bars (blocking). Returns (reqId, bars).
         If keep_up_to_date is True, caller must later call cancel_historical_data(reqId).
+        end_date_time: "" = now, or "yyyyMMdd HH:mm:ss" for earlier data.
         """
         if not self._app or not self._connected:
             raise RuntimeError("Not connected")
@@ -622,7 +624,7 @@ class IBKREngine:
         self._app.reqHistoricalData(
             reqId=req_id,
             contract=contract,
-            endDateTime="",          # empty = up to now
+            endDateTime=end_date_time,
             durationStr=duration,
             barSizeSetting=bar_size,
             whatToShow="TRADES",

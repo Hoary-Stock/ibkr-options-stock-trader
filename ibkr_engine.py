@@ -127,6 +127,13 @@ class IBKRApp(EWrapper, EClient):
         self.bridge.disconnected.emit()
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        # Log order-related errors (reqId in order ID range) for debugging
+        if reqId >= self._next_order_id - 100 and reqId < self._next_order_id + 100:
+            print(f"[ORDER ERROR] reqId={reqId} code={errorCode} "
+                  f"msg={errorString}", flush=True)
+            if advancedOrderRejectJson:
+                print(f"[ORDER REJECT] {advancedOrderRejectJson}", flush=True)
+
         # Market data subscription info — show one-time warning then suppress
         if errorCode == 10167:
             if not self._mkt_data_warned:
@@ -282,6 +289,9 @@ class IBKRApp(EWrapper, EClient):
     def orderStatus(self, orderId, status, filled, remaining,
                     avgFillPrice, permId, parentId, lastFillPrice,
                     clientId, whyHeld, mktCapPrice):
+        print(f"[ORDER STATUS] orderId={orderId} status={status} "
+              f"filled={filled} remaining={remaining} "
+              f"avgFill={avgFillPrice} whyHeld={whyHeld}", flush=True)
         self.bridge.order_status_changed.emit(
             orderId, status, float(filled), float(remaining), float(avgFillPrice)
         )
@@ -772,8 +782,8 @@ class IBKREngine:
         order.orderType = "LMT"
         order.totalQuantity = quantity
         order.lmtPrice = price
-        order.eTradeOnly = ""
-        order.firmQuoteOnly = ""
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
         order.tif = "DAY"
         order.outsideRth = outside_rth
 
@@ -792,6 +802,9 @@ class IBKREngine:
         )
         self._orders[order_id] = order_info
 
+        print(f"[ORDER] Placing LMT {action.value} {quantity}x "
+              f"{option.display_name} @ {price:.2f} "
+              f"outsideRth={outside_rth} orderId={order_id}", flush=True)
         self._app.placeOrder(order_id, contract, order)
         self.bridge.order_status_changed.emit(
             order_id, OrderStatus.PENDING.value, 0, float(quantity), 0
@@ -812,8 +825,8 @@ class IBKREngine:
         order.action = action.value
         order.orderType = "MKT"
         order.totalQuantity = quantity
-        order.eTradeOnly = ""
-        order.firmQuoteOnly = ""
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
         order.tif = "DAY"
         order.outsideRth = outside_rth
 
@@ -833,6 +846,9 @@ class IBKREngine:
         )
         self._orders[order_id] = order_info
 
+        print(f"[ORDER] Placing MKT {action.value} {quantity}x "
+              f"{option.display_name} outsideRth={outside_rth} "
+              f"orderId={order_id}", flush=True)
         self._app.placeOrder(order_id, contract, order)
         self.bridge.order_status_changed.emit(
             order_id, OrderStatus.PENDING.value, 0, float(quantity), 0

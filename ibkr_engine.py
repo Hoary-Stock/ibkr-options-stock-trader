@@ -53,6 +53,10 @@ class IBKRSignalBridge(QObject):
     pnl_updated = pyqtSignal(float, float, float)  # dailyPnL, unrealizedPnL, realizedPnL
     depth_updated = pyqtSignal(int, int, int, int, float, int)  # reqId, position, operation, side, price, size
 
+    # Historical data signals
+    historical_bars_ready = pyqtSignal(int, list)   # reqId, list[dict]
+    historical_bar_update = pyqtSignal(int, dict)   # reqId, bar dict (streaming)
+
 
 # ── IBKR API App ─────────────────────────────────────────────────────
 
@@ -97,6 +101,9 @@ class IBKRApp(EWrapper, EClient):
 
         # One-time market data warning flag
         self._mkt_data_warned: bool = False
+
+        # Historical data tracking
+        self._hist_data: dict[int, dict] = {}
 
     def next_req_id(self) -> int:
         with self._req_id_lock:
@@ -156,7 +163,7 @@ class IBKRApp(EWrapper, EClient):
             return
 
         # Signal errors to waiting threads (reqContractDetails, etc.)
-        for store in (self._contract_data, self._opt_data):
+        for store in (self._contract_data, self._opt_data, self._hist_data):
             if reqId in store:
                 store[reqId]["error"] = (errorCode, errorString)
                 store[reqId]["event"].set()
@@ -234,6 +241,41 @@ class IBKRApp(EWrapper, EClient):
 
     def tickGeneric(self, reqId, tickType, value):
         pass
+
+    # ── Historical Data Callbacks ─────────────────────────────────────
+
+    def historicalData(self, reqId, bar):
+        """Accumulate bars during initial historical data load."""
+        if reqId in self._hist_data:
+            self._hist_data[reqId]["bars"].append({
+                "date": bar.date,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": int(bar.volume),
+                "wap": float(bar.average) if bar.average else 0.0,
+                "count": int(bar.barCount) if bar.barCount else 0,
+            })
+
+    def historicalDataEnd(self, reqId, start, end):
+        """All initial bars received — set event for waiting thread."""
+        if reqId in self._hist_data:
+            self._hist_data[reqId]["event"].set()
+
+    def historicalDataUpdate(self, reqId, bar):
+        """Streaming bar update (keepUpToDate=True)."""
+        bar_dict = {
+            "date": bar.date,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": int(bar.volume),
+            "wap": float(bar.average) if bar.average else 0.0,
+            "count": int(bar.barCount) if bar.barCount else 0,
+        }
+        self.bridge.historical_bar_update.emit(reqId, bar_dict)
 
     # ── Order Callbacks ───────────────────────────────────────────────
 
@@ -558,6 +600,66 @@ class IBKREngine:
         if self._app:
             return self._app._tick_data.get(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
         return {"bid": 0.0, "ask": 0.0, "last": 0.0}
+
+    # ── Historical Data ─────────────────────────────────────────────
+
+    def request_historical_data(
+        self, symbol: str, bar_size: str, duration: str,
+        keep_up_to_date: bool = False, timeout: float = 30,
+    ) -> tuple[int, list[dict]]:
+        """Request historical bars (blocking). Returns (reqId, bars).
+        If keep_up_to_date is True, caller must later call cancel_historical_data(reqId).
+        """
+        if not self._app or not self._connected:
+            raise RuntimeError("Not connected")
+
+        contract = self._make_underlying_contract(symbol)
+        req_id = self._app.next_req_id()
+        self._app._hist_data[req_id] = {
+            "bars": [], "event": threading.Event(), "error": None,
+        }
+
+        self._app.reqHistoricalData(
+            reqId=req_id,
+            contract=contract,
+            endDateTime="",          # empty = up to now
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=0,               # include extended hours
+            formatDate=1,           # yyyyMMdd HH:mm:ss format
+            keepUpToDate=keep_up_to_date,
+            chartOptions=[],
+        )
+
+        state = self._app._hist_data[req_id]
+        if not state["event"].wait(timeout=timeout):
+            # Timeout — cancel and clean up
+            try:
+                self._app.cancelHistoricalData(req_id)
+            except Exception:
+                pass
+            self._app._hist_data.pop(req_id, None)
+            raise RuntimeError(f"Timeout requesting historical data for {symbol}")
+
+        if state["error"]:
+            code, msg = state["error"]
+            self._app._hist_data.pop(req_id, None)
+            raise RuntimeError(f"Historical data error {symbol}: code={code} {msg}")
+
+        bars = state["bars"]
+        if not keep_up_to_date:
+            self._app._hist_data.pop(req_id, None)
+        return req_id, bars
+
+    def cancel_historical_data(self, req_id: int):
+        """Cancel a keepUpToDate historical data subscription."""
+        if self._app:
+            try:
+                self._app.cancelHistoricalData(req_id)
+            except Exception:
+                pass
+            self._app._hist_data.pop(req_id, None)
 
     # ── Account Summary ──────────────────────────────────────────────
 

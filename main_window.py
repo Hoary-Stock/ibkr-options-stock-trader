@@ -5,6 +5,7 @@ import threading
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QMessageBox, QStatusBar,
+    QPushButton,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
@@ -22,6 +23,7 @@ from widgets.position_panel import PositionPanel
 from widgets.order_panel import OrderPanel
 from widgets.account_bar import AccountBar
 from widgets.currency_dialog import CurrencyExchangeDialog
+from widgets.chart_window import ChartWindow
 
 
 DARK_STYLESHEET = f"""
@@ -139,6 +141,7 @@ class MainWindow(QMainWindow):
 
         self._current_symbol = "SPY"
         self._current_option: OptionInfo | None = None
+        self._chart_windows: list[ChartWindow] = []
 
         self._build_ui()
         self._connect_signals()
@@ -158,6 +161,17 @@ class MainWindow(QMainWindow):
 
         self.symbol_bar = SymbolBar()
         top_bar_layout.addWidget(self.symbol_bar, stretch=1)
+
+        self._chart_btn = QPushButton("K线图")
+        self._chart_btn.setFixedHeight(30)
+        self._chart_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BG_PANEL}; color: {COLOR_ACCENT}; "
+            f"border: 1px solid {COLOR_BORDER}; padding: 2px 12px; border-radius: 3px; "
+            f"font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_ACCENT}; color: {COLOR_BG}; }}"
+        )
+        self._chart_btn.clicked.connect(self._on_open_chart)
+        top_bar_layout.addWidget(self._chart_btn)
 
         main_layout.addLayout(top_bar_layout)
 
@@ -574,6 +588,24 @@ class MainWindow(QMainWindow):
         dialog = CurrencyExchangeDialog(self._active_engine, self)
         dialog.exec_()
 
+    # ── Chart Window ─────────────────────────────────────────────────
+
+    def _on_open_chart(self):
+        """Open a K-line chart window for the current symbol."""
+        if not self.ibkr_engine.is_connected:
+            QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
+            return
+
+        chart = ChartWindow(
+            engine=self.ibkr_engine,
+            symbol=self._current_symbol,
+            parent=None,  # independent window
+        )
+        self._chart_windows.append(chart)
+        chart.destroyed.connect(lambda: self._chart_windows.remove(chart)
+                                if chart in self._chart_windows else None)
+        chart.show_and_load()
+
     # ── Error Handling ────────────────────────────────────────────────
 
     def _on_error(self, req_id: int, code: int, msg: str):
@@ -585,6 +617,12 @@ class MainWindow(QMainWindow):
     # ── Cleanup ───────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Close all chart windows
+        for chart in list(self._chart_windows):
+            chart.cleanup()
+            chart.close()
+        self._chart_windows.clear()
+
         self.account_bar.cleanup()
         self.option_chain.cleanup()
         self.price_ladder.cleanup()

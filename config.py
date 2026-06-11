@@ -79,3 +79,34 @@ DEFAULT_SYMBOLS = ["SPY", "SPX", "QQQ", "IWM", "AAPL", "TSLA", "NVDA", "AMZN", "
 
 # ── Option Chain ─────────────────────────────────────────────────────
 MAX_EXPIRY_TABS_PER_RANGE = 10  # Show at most 10 expiries per range filter
+
+# ── Chart (K-Line) ─────────────────────────────────────────────────
+# (display_name, ibkr_bar_size, duration, keep_up_to_date)
+CHART_TIMEFRAMES = {
+    "1秒":   ("1 secs",  "1800 S", False),
+    "5秒":   ("5 secs",  "3600 S", False),
+    "15秒":  ("15 secs", "7200 S", False),
+    "30秒":  ("30 secs", "14400 S", False),
+    "1分钟": ("1 min",   "1 D",    True),
+    "5分钟": ("5 mins",  "1 W",    True),
+    "15分钟":("15 mins", "2 W",    True),
+    "30分钟":("30 mins", "1 M",    True),
+    "1小时": ("1 hour",  "1 M",    True),
+    "2小时": ("2 hours", "1 M",    True),
+    "4小时": ("4 hours", "1 M",    True),
+    "日线":  ("1 day",   "1 Y",    True),
+    "周线":  ("1 week",  "5 Y",    False),
+    "月线":  ("1 month", "10 Y",   False),
+}
+
+CHART_COLOR_CANDLE_UP = "#00c853"
+CHART_COLOR_CANDLE_DOWN = "#ff1744"
+CHART_COLOR_MA5 = "#ffeb3b"
+CHART_COLOR_MA20 = "#ff9800"
+CHART_COLOR_MA50 = "#e040fb"
+CHART_COLOR_MA200 = "#00bcd4"
+CHART_COLOR_VWAP = "#ffffff"
+CHART_COLOR_VOLUME_UP = "#1b5e20"
+CHART_COLOR_VOLUME_DOWN = "#b71c1c"
+CHART_COLOR_BG = "#0d0d1a"
+CHART_COLOR_CROSSHAIR = "#888888"

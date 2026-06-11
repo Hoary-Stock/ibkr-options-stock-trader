@@ -389,6 +389,19 @@ class OptionChainWidget(QWidget):
         if not self._engine:
             return
 
+        # Update title with real-time underlying price
+        if self._symbol:
+            stock_key = f"__stock__{self._symbol}"
+            stock_tick = self._engine.get_tick(stock_key)
+            price = stock_tick.get("last", 0)
+            if price <= 0:
+                bid = stock_tick.get("bid", 0)
+                ask = stock_tick.get("ask", 0)
+                price = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
+            if price > 0:
+                self._stock_price = price
+                self.title_label.setText(f"期权链 — {self._symbol}  ${price:.2f}")
+
         idx = self.tab_widget.currentIndex()
         if idx < 0 or idx >= len(self._expirations):
             return

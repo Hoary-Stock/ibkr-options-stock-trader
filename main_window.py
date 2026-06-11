@@ -436,32 +436,44 @@ class MainWindow(QMainWindow):
         threading.Thread(target=do_load, daemon=True).start()
 
     def _fetch_stock_price(self, symbol: str) -> float:
-        """Fetch current stock price via a short-lived tick subscription."""
+        """Subscribe to underlying stock price and return initial value.
+
+        The subscription stays alive so the option chain title can display
+        a continuously-updating price.  The tick data key is
+        ``__stock__{symbol}`` inside ``app._tick_data``.
+        """
         import time
-        from ibapi.contract import Contract
+
+        app = self.ibkr_engine._app
+        key = f"__stock__{symbol}"
+
+        # Cancel previous underlying subscription if any
+        old_req = getattr(self, '_stock_price_req_id', None)
+        if old_req is not None:
+            try:
+                app.cancelMktData(old_req)
+            except Exception:
+                pass
+            app._active_mkt_data_reqs.discard(old_req)
 
         contract = IBKREngine._make_underlying_contract(symbol)
-        app = self.ibkr_engine._app
         req_id = app.next_req_id()
-        key = f"__stock__{symbol}"
+        self._stock_price_req_id = req_id
+        self._stock_price_key = key
         app._tick_req_to_key[req_id] = key
         app._tick_data[key] = {"bid": 0.0, "ask": 0.0, "last": 0.0}
+        app._active_mkt_data_reqs.add(req_id)
         app.reqMktData(req_id, contract, "", False, False, [])
 
-        # Wait up to 5 seconds for a price
+        # Wait up to 5 seconds for initial price
         for _ in range(50):
             time.sleep(0.1)
             d = app._tick_data.get(key, {})
             if d.get("last", 0) > 0 or d.get("bid", 0) > 0:
                 break
 
-        try:
-            app.cancelMktData(req_id)
-        except Exception:
-            pass
-        app._tick_req_to_key.pop(req_id, None)
-
-        d = app._tick_data.pop(key, {})
+        # Return initial price (subscription stays alive)
+        d = app._tick_data.get(key, {})
         last = d.get("last", 0)
         bid = d.get("bid", 0)
         ask = d.get("ask", 0)

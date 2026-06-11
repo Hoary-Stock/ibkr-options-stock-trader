@@ -57,6 +57,10 @@ class IBKRSignalBridge(QObject):
     historical_bars_ready = pyqtSignal(int, list)   # reqId, list[dict]
     historical_bar_update = pyqtSignal(int, dict)   # reqId, bar dict (streaming)
 
+    # Open order restore (from TWS on reconnect)
+    # orderId, OptionInfo, action_str, qty, price, order_type_str, status_str
+    open_order_received = pyqtSignal(int, object, str, int, float, str, str)
+
 
 # ── IBKR API App ─────────────────────────────────────────────────────
 
@@ -297,7 +301,23 @@ class IBKRApp(EWrapper, EClient):
         )
 
     def openOrder(self, orderId, contract, order, orderState):
-        # Restore existing orders on reconnect
+        # Build OptionInfo from contract for orders placed in prior sessions
+        # or via TWS directly.  Only track option orders.
+        if contract.secType == "OPT":
+            option = OptionInfo(
+                symbol=contract.symbol,
+                expiry=contract.lastTradeDateOrContractMonth,
+                strike=contract.strike,
+                right=contract.right,
+                con_id=contract.conId,
+            )
+            action = OrderAction.BUY if order.action == "BUY" else OrderAction.SELL
+            price = order.lmtPrice if order.orderType == "LMT" else 0.0
+            order_type = OrderType.LIMIT if order.orderType == "LMT" else OrderType.MARKET
+            self.bridge.open_order_received.emit(
+                orderId, option, action.value, int(order.totalQuantity),
+                price, order_type.value, orderState.status,
+            )
         self.bridge.order_status_changed.emit(
             orderId, orderState.status, 0, 0, 0
         )
@@ -423,6 +443,7 @@ class IBKREngine:
         # Connect internal signals
         self.bridge.order_status_changed.connect(self._on_order_status)
         self.bridge.execution_received.connect(self._on_execution)
+        self.bridge.open_order_received.connect(self._on_open_order)
 
     @property
     def is_connected(self) -> bool:
@@ -473,6 +494,10 @@ class IBKREngine:
 
         self._connected = True
         self._app.reqMarketDataType(MARKET_DATA_TYPE)
+
+        # Fetch existing open orders (from previous session or TWS-placed)
+        self._app.reqOpenOrders()
+
         return True
 
     def disconnect(self):
@@ -857,16 +882,12 @@ class IBKREngine:
 
     def cancel_order(self, order_id: int):
         """Cancel an order."""
-        self._app.cancelOrder(order_id, "")
+        print(f"[ORDER] Cancelling orderId={order_id}", flush=True)
+        self._app.cancelOrder(order_id)
 
     def cancel_all_orders(self):
-        """Cancel all pending orders."""
-        for order_id, order in list(self._orders.items()):
-            if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
-                try:
-                    self._app.cancelOrder(order_id, "")
-                except Exception:
-                    pass
+        """Cancel all open orders (including those placed in prior sessions)."""
+        self._app.reqGlobalCancel()
 
     def close_position(self, option: OptionInfo,
                        outside_rth: bool = False) -> int:
@@ -905,6 +926,41 @@ class IBKREngine:
         )
 
     # ── Order/Execution Callbacks ─────────────────────────────────────
+
+    def _on_open_order(self, order_id: int, option: OptionInfo,
+                       action_str: str, quantity: int, price: float,
+                       order_type_str: str, status_str: str):
+        """Restore an order from TWS (prior session or TWS-placed)."""
+        if order_id in self._orders:
+            return  # Already tracked
+
+        action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
+        order_type = OrderType.LIMIT if order_type_str == "LMT" else OrderType.MARKET
+        order_info = OrderInfo(
+            order_id=order_id,
+            option=option,
+            action=action,
+            quantity=quantity,
+            limit_price=price,
+            order_type=order_type,
+        )
+        # Map status
+        sl = status_str.lower()
+        if "fill" in sl:
+            order_info.status = OrderStatus.FILLED
+        elif "cancel" in sl:
+            order_info.status = OrderStatus.CANCELLED
+        elif "submit" in sl:
+            order_info.status = OrderStatus.SUBMITTED
+        elif "inactive" in sl:
+            order_info.status = OrderStatus.ERROR
+        else:
+            order_info.status = OrderStatus.PENDING
+
+        self._orders[order_id] = order_info
+        print(f"[ORDER RESTORE] id={order_id} {action_str} {quantity}x "
+              f"{option.display_name} @ {price:.2f} status={status_str}",
+              flush=True)
 
     def _on_order_status(self, order_id: int, status: str,
                          filled: float, remaining: float, avg_price: float):

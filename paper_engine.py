@@ -38,6 +38,7 @@ class PaperSignalBridge(QObject):
     portfolio_positions_end = pyqtSignal()
     pnl_updated = pyqtSignal(float, float, float)
     depth_updated = pyqtSignal(int, int, int, int, float, int)
+    open_order_received = pyqtSignal(int, object, str, int, float, str, str)
 
 
 class PaperEngine:

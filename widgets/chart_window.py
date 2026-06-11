@@ -35,6 +35,11 @@ _POLL_CONFIG = {
     "月线":  (120000, "6 M"),
 }
 
+# How close to the left edge (in bars) before triggering earlier-data load
+_SCROLL_TRIGGER_BARS = 30
+# Cooldown (ms) after a failed earlier-data load before allowing retry
+_SCROLL_RETRY_COOLDOWN_MS = 3000
+
 
 class _DateAxisItem(pg.AxisItem):
     """Custom X-axis that shows date/time strings."""
@@ -81,6 +86,7 @@ class ChartWindow(QMainWindow):
         # State flags
         self._loading_more = False       # loading earlier data in progress
         self._no_earlier_data = False    # no more historical data available
+        self._earlier_load_error = False # last earlier-data load was an error
         self._at_right_edge = True       # auto-follow latest bar
         self._adjusting_range = False    # suppress range-change handler re-entry
         self._initial_load_done = False
@@ -89,6 +95,7 @@ class ChartWindow(QMainWindow):
         # Timers
         self._poll_timer: QTimer | None = None
         self._poll_duration: str | None = None
+        self._retry_cooldown_active = False
 
         # IV subscription
         self._iv_req_id: int | None = None
@@ -307,6 +314,7 @@ class ChartWindow(QMainWindow):
         self._stop_polling()
         self._no_earlier_data = False
         self._initial_load_done = False
+        self._retry_cooldown_active = False
 
         tf_cfg = CHART_TIMEFRAMES.get(self._current_tf)
         if not tf_cfg:
@@ -383,8 +391,8 @@ class ChartWindow(QMainWindow):
         n = len(bars)
         self._status.showMessage(f"{self._symbol} {self._current_tf} — {n} 根K线")
 
-        # Set initial view: show last ~200 bars, not the full dataset
-        visible = min(200, n)
+        # Set initial view: show last ~120 bars for comfortable density
+        visible = min(120, n)
         self._adjusting_range = True
         self._price_plot.setXRange(n - visible - 5, n + 5, padding=0)
         self._update_y_range()
@@ -427,8 +435,13 @@ class ChartWindow(QMainWindow):
         self._at_right_edge = x_max >= n - 5
 
         # Load earlier data when scrolled near the left edge
-        if (x_min < 20 and not self._loading_more
-                and not self._no_earlier_data and n > 0):
+        can_load = (
+            not self._loading_more
+            and not self._no_earlier_data
+            and not self._retry_cooldown_active
+            and n > 0
+        )
+        if x_min < _SCROLL_TRIGGER_BARS and can_load:
             self._load_earlier_data()
 
     def _update_y_range(self):
@@ -468,6 +481,7 @@ class ChartWindow(QMainWindow):
     def _load_earlier_data(self):
         """Request data before the earliest bar."""
         self._loading_more = True
+        self._earlier_load_error = False
         self._status.showMessage("加载更早数据...")
 
         end_dt = self._get_earliest_datetime()
@@ -490,6 +504,7 @@ class ChartWindow(QMainWindow):
                 self._earlier_bars_loaded.emit(bars)
             except Exception as e:
                 print(f"[Chart] Earlier data error: {e}", flush=True)
+                self._earlier_load_error = True
                 self._earlier_bars_loaded.emit([])
 
         threading.Thread(target=worker, daemon=True).start()
@@ -497,20 +512,38 @@ class ChartWindow(QMainWindow):
     def _on_earlier_bars_loaded(self, bars: list):
         """Prepend earlier bars and adjust view so visual position stays put."""
         if not bars:
-            self._no_earlier_data = True
             self._loading_more = False
-            self._status.showMessage(f"{self._symbol} {self._current_tf} — 无更早数据")
+            if self._earlier_load_error:
+                # API/network error — allow retry after cooldown
+                self._status.showMessage(
+                    f"{self._symbol} {self._current_tf} — 加载失败, 稍后可重试"
+                )
+                self._retry_cooldown_active = True
+                QTimer.singleShot(
+                    _SCROLL_RETRY_COOLDOWN_MS,
+                    self._clear_retry_cooldown,
+                )
+                return
+            # Genuinely no earlier data from IBKR
+            self._no_earlier_data = True
+            self._status.showMessage(
+                f"{self._symbol} {self._current_tf} — 已到最早数据"
+            )
             return
 
-        # Remove overlap: drop any bars that are >= our earliest bar date
+        # Remove overlap: drop any bars whose date >= our earliest bar
         if self._bars and bars:
             earliest = self._bars[0]["date"]
             while bars and bars[-1]["date"] >= earliest:
                 bars.pop()
 
         if not bars:
+            # All returned bars overlap — no genuinely new data
             self._no_earlier_data = True
             self._loading_more = False
+            self._status.showMessage(
+                f"{self._symbol} {self._current_tf} — 已到最早数据"
+            )
             return
 
         # Save current view X range
@@ -531,15 +564,22 @@ class ChartWindow(QMainWindow):
 
         self._loading_more = False
         n = len(self._bars)
-        self._status.showMessage(f"{self._symbol} {self._current_tf} — {n} 根K线")
+        self._status.showMessage(
+            f"{self._symbol} {self._current_tf} — {n} 根K线 (+{shift})"
+        )
+
+    def _clear_retry_cooldown(self):
+        self._retry_cooldown_active = False
 
     def _get_earliest_datetime(self) -> str:
         """Convert earliest bar's date to IBKR endDateTime format."""
         if not self._bars:
             return ""
-        date_str = self._bars[0]["date"].strip()
-        # "20260611  09:30:00" -> "20260611 09:30:00"
-        return date_str.replace("  ", " ")
+        date_str = self._bars[0]["date"].strip().replace("  ", " ")
+        # Daily bars: "20260611" -> "20260611 00:00:00"
+        if " " not in date_str and len(date_str) == 8 and date_str.isdigit():
+            date_str += " 00:00:00"
+        return date_str
 
     # ── Polling (non-keepUpToDate timeframes) ────────────────────────
 
@@ -607,15 +647,12 @@ class ChartWindow(QMainWindow):
 
         for i, bar in enumerate(new_bars):
             if bar["date"] == last_date:
-                # Update the last bar (current bar may still be forming)
                 self._bars[-1] = bar
                 updated = True
-                # Append any bars after this one (new completed bars)
                 for j in range(i + 1, len(new_bars)):
                     self._bars.append(new_bars[j])
                 break
             elif bar["date"] > last_date:
-                # New bar after our last one
                 self._bars.append(bar)
                 updated = True
 
@@ -715,7 +752,8 @@ class ChartWindow(QMainWindow):
             )
             brushes = [pg.mkBrush(c) for c in colors]
             self._volume_item = pg.BarGraphItem(
-                x=x, height=volumes, width=0.6, brushes=brushes,
+                x=x, height=volumes, width=0.5, brushes=brushes,
+                pen=pg.mkPen(None),  # no outline — just filled bars
             )
             self._vol_plot.addItem(self._volume_item)
 
@@ -752,14 +790,12 @@ class ChartWindow(QMainWindow):
         for d in dates:
             d = d.strip().replace("  ", " ")
             if " " in d:
-                # Intraday: "20260611 09:30:00"
                 time_part = d.split(" ")[-1]
                 if show_seconds:
                     result.append(time_part)      # "09:30:00"
                 else:
                     result.append(time_part[:5])   # "09:30"
             elif len(d) == 8 and d.isdigit():
-                # Daily: "20260611" -> "06/11"
                 result.append(f"{d[4:6]}/{d[6:8]}")
             else:
                 result.append(d)

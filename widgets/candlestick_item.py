@@ -1,7 +1,7 @@
 """Custom pyqtgraph GraphicsObject for drawing OHLC candlesticks.
 
 Style: Up candles = hollow (green outline), Down candles = filled (red).
-Matches Futu / traditional Asian market convention.
+All pens are cosmetic (pixel-width) so candles look clean at any zoom.
 """
 
 import pyqtgraph as pg
@@ -10,12 +10,19 @@ from PyQt5.QtGui import QPicture, QPainter, QColor, QPen, QBrush
 
 
 class CandlestickItem(pg.GraphicsObject):
-    """Draws OHLC candlestick bars using QPicture for performance."""
+    """Draws OHLC candlestick bars using QPicture for performance.
+
+    Rendering approach (matches TradingView / Futu conventions):
+    - Wick: 1px cosmetic line from low to high
+    - Body: rectangle from open to close, 50% of bar spacing
+    - Up candles: hollow (outline only), Down candles: filled
+    - All pen widths in pixels (cosmetic), not data coordinates
+    """
 
     def __init__(self, color_up="#00c853", color_down="#ff1744"):
         super().__init__()
         self._picture = QPicture()
-        self._data = []  # list of dict with date_idx, open, high, low, close
+        self._data = []
         self._color_up = QColor(color_up)
         self._color_down = QColor(color_down)
         self._bounding_rect = QRectF(0, 0, 1, 1)
@@ -39,7 +46,27 @@ class CandlestickItem(pg.GraphicsObject):
         painter = QPainter(self._picture)
         painter.setRenderHint(QPainter.Antialiasing, False)
 
-        w = 0.35  # half-width of candle body
+        # Body half-width in data-X units (50% of bar spacing = thinner, cleaner)
+        w = 0.25
+
+        # Pre-build cosmetic pens (pixel-width, independent of zoom)
+        wick_pen_up = QPen(self._color_up)
+        wick_pen_up.setWidthF(1.0)
+        wick_pen_up.setCosmetic(True)
+
+        wick_pen_down = QPen(self._color_down)
+        wick_pen_down.setWidthF(1.0)
+        wick_pen_down.setCosmetic(True)
+
+        body_pen_up = QPen(self._color_up)
+        body_pen_up.setWidthF(1.0)
+        body_pen_up.setCosmetic(True)
+
+        body_pen_down = QPen(self._color_down)
+        body_pen_down.setWidthF(1.0)
+        body_pen_down.setCosmetic(True)
+
+        brush_down = QBrush(self._color_down)
 
         all_lows = []
         all_highs = []
@@ -52,29 +79,29 @@ class CandlestickItem(pg.GraphicsObject):
             all_highs.append(h)
 
             if c >= o:
-                # Up candle: hollow (outline only, background shows through)
-                color = self._color_up
-                pen = QPen(color)
-                pen.setWidthF(1.0)
-                painter.setPen(pen)
+                # Up candle: hollow body (outline only)
+                painter.setPen(wick_pen_up)
                 painter.setBrush(Qt.NoBrush)
+                # Wick
+                painter.drawLine(QPointF(x, l), QPointF(x, h))
+                # Body
+                painter.setPen(body_pen_up)
+                body_top = c
+                body_bot = o
             else:
-                # Down candle: filled solid
-                color = self._color_down
-                pen = QPen(color)
-                pen.setWidthF(1.0)
-                painter.setPen(pen)
-                painter.setBrush(QBrush(color))
+                # Down candle: filled body
+                painter.setPen(wick_pen_down)
+                painter.setBrush(brush_down)
+                # Wick
+                painter.drawLine(QPointF(x, l), QPointF(x, h))
+                # Body
+                painter.setPen(body_pen_down)
+                body_top = o
+                body_bot = c
 
-            # Wick (high-low line)
-            painter.drawLine(QPointF(x, l), QPointF(x, h))
-
-            # Body
-            body_top = max(o, c)
-            body_bot = min(o, c)
             body_h = body_top - body_bot
             if body_h < 1e-8:
-                # Doji — draw a thin line
+                # Doji — 1px horizontal line at body width
                 painter.drawLine(QPointF(x - w, o), QPointF(x + w, o))
             else:
                 painter.drawRect(QRectF(x - w, body_bot, w * 2, body_h))

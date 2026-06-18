@@ -48,8 +48,8 @@ from ibkr_engine import IBKREngine
 from single_instance import kill_previous_instances
 from widgets.strategy_defs import STRATEGY_REGISTRY, StrategyType
 from widgets.combo_pricing import (
-    resolved_legs, compute_combo_series, leg_sign, combo_price_from_prices,
-    auto_assign_strikes,
+    resolved_legs, compute_combo_series, compute_combo_ohlc, leg_sign,
+    combo_price_from_prices, auto_assign_strikes,
 )
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +76,7 @@ class ComboAnalyzerWindow(QMainWindow):
     _chain_error = pyqtSignal(str)
     _status = pyqtSignal(str)
     _order_placed = pyqtSignal(int, object, str)  # order_id, pending-dict, mode
+    _today_ready = pyqtSignal(object)   # dict: ohlc 合并K线结果
 
     def __init__(self):
         super().__init__()
@@ -91,6 +92,8 @@ class ComboAnalyzerWindow(QMainWindow):
         self._expiry_combos: dict[str, QComboBox] = {}
         self._plot_widget = None       # 延迟创建 (pyqtgraph)
         self._curve = None
+        self._candle = None            # 合并 K 线 (CandlestickItem)
+        self._bottom_axis = None
 
         # 实时录制当日组合价 (用各腿实时盘口合成, 不依赖历史行情权限)
         self._recording = False
@@ -118,6 +121,7 @@ class ComboAnalyzerWindow(QMainWindow):
         self._chain_error.connect(self._on_chain_error)
         self._status.connect(lambda m: self.statusBar().showMessage(m))
         self._order_placed.connect(self._on_order_placed)
+        self._today_ready.connect(self._on_today_ready)
 
         self._rebuild_params()
         self._refresh_positions_table()
@@ -246,6 +250,15 @@ class ComboAnalyzerWindow(QMainWindow):
         )
         self.record_btn.clicked.connect(self._toggle_record)
         ctrl2.addWidget(self.record_btn)
+
+        self.today_btn = QPushButton("今日合并K线")
+        self.today_btn.setToolTip(
+            "只取今日: 拉各腿当日 OHLC, 合并成组合的蜡烛图。\n"
+            "滚轮缩放 / 拖动平移 / 右键菜单可自动缩放。需期权历史权限。"
+        )
+        self.today_btn.clicked.connect(self._on_today_kline)
+        self.today_btn.setEnabled(False)
+        ctrl2.addWidget(self.today_btn)
         ctrl2.addStretch(1)
         root.addLayout(ctrl2)
 
@@ -450,6 +463,7 @@ class ComboAnalyzerWindow(QMainWindow):
         self.connect_btn.setEnabled(True)
         self.load_chain_btn.setEnabled(False)
         self.compute_btn.setEnabled(False)
+        self.today_btn.setEnabled(False)
         self.open_buy_btn.setEnabled(False)
         self.open_sell_btn.setEnabled(False)
         self.statusBar().showMessage("已断开")
@@ -494,6 +508,7 @@ class ComboAnalyzerWindow(QMainWindow):
         self._strikes = sorted(data["strikes"])
         self.load_chain_btn.setEnabled(True)
         self.compute_btn.setEnabled(True)
+        self.today_btn.setEnabled(True)
         if self._strikes and self.center_spin.value() == 0:
             # 默认中心取行权价网格中位数 (近似 ATM)
             self.center_spin.setValue(self._strikes[len(self._strikes) // 2])
@@ -583,10 +598,68 @@ class ComboAnalyzerWindow(QMainWindow):
         )
 
     def _on_combo_error(self, msg):
-        self.compute_btn.setEnabled(True)
+        self.compute_btn.setEnabled(self.engine.is_connected)
+        self.today_btn.setEnabled(self.engine.is_connected)
         self.connect_btn.setEnabled(True)
         if msg:
             self.statusBar().showMessage(f"计算失败: {msg}")
+
+    # ── 今日合并 K 线 (各腿当日 OHLC 合并成组合蜡烛图) ────────────────────
+
+    def _on_today_kline(self):
+        if not self.engine.is_connected:
+            self.statusBar().showMessage("未连接")
+            return
+        legs = self._gather_legs()
+        if not legs or any(not l["strike"] or not l["expiry"] for l in legs):
+            self.statusBar().showMessage("请先填好各腿行权价与到期 (可点「自动填行权价」)")
+            return
+        symbol = self.symbol_input.currentText().strip().upper()
+        bar_size, _, _ = CHART_TIMEFRAMES[self.timeframe_combo.currentText()]
+        if bar_size in ("1 day", "1 week", "1 month"):
+            bar_size = "5 mins"   # 只看今日 → 用盘中周期
+        what = self.what_combo.currentText()
+        self.today_btn.setEnabled(False)
+        self.statusBar().showMessage("拉取各腿当日 K 线并合并...")
+
+        def worker():
+            try:
+                cache, leg_bars = {}, []
+                for l in legs:
+                    key = (l["expiry"], l["strike"], l["right"])
+                    if key not in cache:
+                        cache[key] = self.engine.request_option_historical_data(
+                            symbol, l["expiry"], l["strike"], l["right"],
+                            bar_size, "1 D", what_to_show=what, timeout=30,
+                        )
+                    leg_bars.append(cache[key])
+                signed = [leg_sign(l["action"]) * l["ratio"] for l in legs]
+                ohlc = compute_combo_ohlc(signed, leg_bars)
+                self._today_ready.emit({"ohlc": ohlc, "bar_size": bar_size, "what": what})
+            except Exception as e:
+                self._combo_error.emit(str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_today_ready(self, data):
+        self.today_btn.setEnabled(self.engine.is_connected)
+        ohlc = data["ohlc"]
+        if not ohlc:
+            self.statusBar().showMessage(
+                "各腿当日 K 线无共同时间戳 — 试 MIDPOINT 数据或更大周期"
+            )
+            self._plot_candles([])
+            return
+        self._plot_candles(ohlc)
+        first = datetime.fromtimestamp(float(ohlc[0]["date"]))
+        last = datetime.fromtimestamp(float(ohlc[-1]["date"]))
+        self.summary_label.setText(
+            f"今日合并 K 线: {len(ohlc)} 根 (收盘净价 ${ohlc[-1]['close']:.2f})"
+        )
+        self.statusBar().showMessage(
+            f"今日合并K线: {len(ohlc)} 根 ({data['bar_size']}, {data['what']}) "
+            f"{first:%H:%M} → {last:%H:%M} — 滚轮缩放 / 拖动平移"
+        )
 
     # ── 实时录制当日组合价 (零历史权限) ──────────────────────────────────
 
@@ -655,10 +728,12 @@ class ComboAnalyzerWindow(QMainWindow):
         if self._plot_widget is not None:
             return
         import pyqtgraph as pg
+        from widgets.candlestick_item import CandlestickItem
         pg.setConfigOptions(antialias=True)
         self._chart_placeholder.hide()
-        axis = pg.DateAxisItem(orientation="bottom")
-        self._plot_widget = pg.PlotWidget(axisItems={"bottom": axis})
+        # 索引 x 轴 + 自定义时间刻度 (蜡烛图与折线共用; pyqtgraph 默认滚轮缩放/拖动平移)
+        self._bottom_axis = pg.AxisItem(orientation="bottom")
+        self._plot_widget = pg.PlotWidget(axisItems={"bottom": self._bottom_axis})
         self._plot_widget.setBackground(COLOR_BG_DARK)
         self._plot_widget.showGrid(x=True, y=True, alpha=0.2)
         self._plot_widget.setLabel("left", "组合净价 ($/组)")
@@ -666,15 +741,43 @@ class ComboAnalyzerWindow(QMainWindow):
         self._curve = self._plot_widget.plot(
             [], [], pen=pg.mkPen(COLOR_ACCENT, width=2)
         )
+        self._candle = CandlestickItem(COLOR_GREEN, COLOR_RED)
+        self._plot_widget.addItem(self._candle)
         self.chart_layout.addWidget(self._plot_widget)
 
+    def _time_ticks(self, dates, n_labels=8):
+        """由 epoch 字符串列表生成索引轴的 [(idx, 'MM-DD HH:MM')] 刻度。"""
+        n = len(dates)
+        if n == 0:
+            return []
+        step = max(1, n // n_labels)
+        ticks = []
+        for i in range(0, n, step):
+            try:
+                t = datetime.fromtimestamp(float(dates[i]))
+                ticks.append((i, t.strftime("%m-%d %H:%M")))
+            except (TypeError, ValueError):
+                ticks.append((i, str(dates[i])))
+        return ticks
+
     def _plot_series(self, series):
+        """收盘价折线 (录制/历史线), 索引 x + 时间刻度。"""
         self._ensure_plot()
-        import pyqtgraph as pg
-        xs = [float(p["date"]) for p in series]
-        ys = [p["price"] for p in series]
-        self._curve.setData(xs, ys)
-        if xs:
+        self._candle.set_data([])
+        self._curve.setData(list(range(len(series))), [p["price"] for p in series])
+        self._bottom_axis.setTicks([self._time_ticks([p["date"] for p in series])])
+        if series:
+            self._plot_widget.enableAutoRange()
+
+    def _plot_candles(self, ohlc):
+        """组合合并 K 线 (蜡烛), 索引 x + 时间刻度。"""
+        self._ensure_plot()
+        self._curve.setData([], [])
+        data = [{"date_idx": i, "open": b["open"], "high": b["high"],
+                 "low": b["low"], "close": b["close"]} for i, b in enumerate(ohlc)]
+        self._candle.set_data(data)
+        self._bottom_axis.setTicks([self._time_ticks([b["date"] for b in ohlc])])
+        if data:
             self._plot_widget.enableAutoRange()
 
     # ── 组合交易 (原生 BAG, 原子成交; 只整组平仓/加仓) ────────────────────

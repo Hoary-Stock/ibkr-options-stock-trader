@@ -76,6 +76,49 @@ def compute_combo_series(signed_ratios: list[float],
     return series
 
 
+def compute_combo_ohlc(signed_ratios: list[float],
+                       leg_bars: list[list[dict]]) -> list[dict]:
+    """合成组合的「合并 K 线」(OHLC)。
+    open/close = Σ 各腿 signed_ratio × leg_open/close;
+    high/low: 多头腿(signed_ratio>0)用其 high/low, 空头腿(<0)反向用其 low/high
+      —— 给出组合在该根内的价值包络 (上下界), 是价差合并 K 线的常用近似。
+    返回按各腿时间交集排序的 [{date, open, high, low, close}]。"""
+    maps = []
+    for sr, bars in zip(signed_ratios, leg_bars):
+        m = {b["date"]: b for b in bars if b.get("close") and b["close"] > 0}
+        maps.append((sr, m))
+    if not maps or any(not m for _, m in maps):
+        return []
+
+    common = set(maps[0][1].keys())
+    for _, m in maps[1:]:
+        common &= set(m.keys())
+    if not common:
+        return []
+
+    def _key(d):
+        try:
+            return float(d)
+        except (TypeError, ValueError):
+            return d
+
+    out = []
+    for date in sorted(common, key=_key):
+        o = h = l = c = 0.0
+        for sr, m in maps:
+            bar = m[date]
+            o += sr * bar.get("open", bar["close"])
+            c += sr * bar["close"]
+            if sr >= 0:
+                h += sr * bar.get("high", bar["close"])
+                l += sr * bar.get("low", bar["close"])
+            else:
+                h += sr * bar.get("low", bar["close"])
+                l += sr * bar.get("high", bar["close"])
+        out.append({"date": date, "open": o, "high": h, "low": l, "close": c})
+    return out
+
+
 def auto_assign_strikes(template: StrategyTemplate,
                         available_strikes: list[float],
                         center: float,

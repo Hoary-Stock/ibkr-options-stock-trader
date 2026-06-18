@@ -172,6 +172,9 @@ class PaperEngine:
         pass
 
     def _calc_unrealized_pnl(self) -> float:
+        """未实现盈亏 (已扣除未平仓持仓已付的开仓/加仓手续费)。
+        用 net_pnl 而非毛 unrealized_pnl, 使今日盈亏 / 未实现盈亏 / 净值都计入手续费,
+        与真实模式下 IBKR 的口径一致 (IBKR avgCost 含佣金, 已平仓佣金计入 realized_pnl)。"""
         total = 0.0
         for key, pos in self._positions.items():
             tick = self.ibkr.get_tick(key)
@@ -181,7 +184,7 @@ class PaperEngine:
             current = last if last > 0 else ((bid + ask) / 2 if bid > 0 and ask > 0 else bid)
             if current > 0:
                 pos.current_price = current
-            total += pos.unrealized_pnl
+            total += pos.net_pnl
         return total
 
     def _calc_cost_basis(self) -> float:

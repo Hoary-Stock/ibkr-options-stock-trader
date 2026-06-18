@@ -301,6 +301,45 @@ class IBKRApp(EWrapper, EClient):
     def tickGeneric(self, reqId, tickType, value):
         pass
 
+    def tickOptionComputation(
+        self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice,
+        pvDividend, gamma, vega, theta, undPrice,
+    ):
+        """IBKR 期权模型计算回调 (IV + Greeks + 标的价)。
+        tickType 13 = 模型值 (IB 模型 IV/greeks/undPrice, 最优来源);
+        10/11/12 = bid/ask/last 计算值 (作为 IV/undPrice 的回退)。
+        结果写入 _tick_data[key], 期权计算器在自己的刷新定时器里轮询。"""
+        key = self._tick_req_to_key.get(reqId)
+        if key is None:
+            return
+        self._last_tick_time = time.time()
+        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+
+        def _ok(x):  # 非 None / 非 NaN / 正数 (IBKR 用 NaN 或负值表示无效)
+            return x is not None and x == x and x > 0
+
+        def _num(x):  # 非 None / 非 NaN (greeks 可为负, 不要求正)
+            return x is not None and x == x
+
+        if tickType == 13:  # 模型值 — 优先覆盖
+            if _ok(impliedVol):
+                d["iv"] = float(impliedVol)
+            if _ok(undPrice):
+                d["und_price"] = float(undPrice)
+            if _num(delta):
+                d["delta"] = float(delta)
+            if _num(gamma):
+                d["gamma"] = float(gamma)
+            if _num(vega):
+                d["vega"] = float(vega)
+            if _num(theta):
+                d["theta"] = float(theta)
+        elif tickType in (10, 11, 12):  # bid/ask/last 计算值 — 仅在模型值缺失时回退
+            if "iv" not in d and _ok(impliedVol):
+                d["iv"] = float(impliedVol)
+            if "und_price" not in d and _ok(undPrice):
+                d["und_price"] = float(undPrice)
+
     # ── Historical Data Callbacks ─────────────────────────────────────
 
     def historicalData(self, reqId, bar):
@@ -864,7 +903,11 @@ class IBKREngine:
         key = option.to_ibkr_key()
         self._app._tick_req_to_key[req_id] = key
         self._app._active_mkt_data_reqs.add(req_id)
-        self._app.reqMktData(req_id, contract, "", False, False, [])
+        # generic tick 106 = Option Implied Volatility; 确保期权计算器拿到 IV。
+        # 模型 greeks 与标的价 (tickOptionComputation tickType 13) 随期权订阅默认下发。
+        # 正股伪合约无 IV 概念, 保持空 generic tick。
+        generic_ticks = "" if option.right == "STK" else "106"
+        self._app.reqMktData(req_id, contract, generic_ticks, False, False, [])
         return req_id
 
     def subscribe_stock_tick(self, symbol: str) -> int:

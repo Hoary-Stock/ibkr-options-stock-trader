@@ -100,6 +100,12 @@ DATA_CONNECTION_ERROR_CODES = {
     2108,  # Market data farm connection is inactive
 }
 
+# ── Option Pricing (Black-Scholes 理论价计算器) ──────────────────────
+RISK_FREE_RATE = 0.045        # 无风险年利率 (≈美国短债); 计算器默认值, 可在界面调整
+DIVIDEND_YIELD = 0.0          # 标的连续股息率 (SPY/SPX 用 0 即可)
+OPTION_MARKET_CLOSE_ET = 16   # 期权到期日收盘小时 (ET); 用于计算剩余时间 T
+CALCULATOR_REFRESH_MS = 700   # 计算器随实时行情/时间衰减刷新间隔
+
 # ── Index Symbols (secType=IND, not STK) ────────────────────────────
 INDEX_SYMBOLS = {"SPX", "XSP", "NDX", "RUT", "VIX", "DJX"}
 

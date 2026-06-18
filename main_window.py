@@ -26,6 +26,7 @@ from widgets.price_ladder import PriceLadder
 from widgets.position_panel import PositionPanel
 from widgets.order_panel import OrderPanel
 from widgets.account_bar import AccountBar
+from widgets.option_calculator import OptionCalculator
 from widgets.currency_dialog import CurrencyExchangeDialog
 # ChartWindow is imported lazily (first chart open) — it pulls in
 # numpy + pyqtgraph (~25MB), which shouldn't load at startup
@@ -236,13 +237,19 @@ class MainWindow(QMainWindow):
         self.price_ladder = PriceLadder()
         self.bottom_splitter.addWidget(self.price_ladder)
 
-        # Right: Position + Order tabs
+        # Right: Position + Order tabs (top) + 期权理论价计算器 (bottom-right corner)
         self.right_tabs = QTabWidget()
         self.position_panel = PositionPanel()
         self.order_panel = OrderPanel()
         self.right_tabs.addTab(self.position_panel, "持仓")
         self.right_tabs.addTab(self.order_panel, "委托")
-        self.bottom_splitter.addWidget(self.right_tabs)
+
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.addWidget(self.right_tabs)
+        self.calculator = OptionCalculator()
+        self.right_splitter.addWidget(self.calculator)
+        self.right_splitter.setSizes([520, 300])
+        self.bottom_splitter.addWidget(self.right_splitter)
 
         self.bottom_splitter.setSizes([380, 500])
         self.main_splitter.addWidget(self.bottom_splitter)
@@ -349,6 +356,7 @@ class MainWindow(QMainWindow):
         self.position_panel.set_engine(self._active_engine)
         self.order_panel.set_engine(self._active_engine)
         self.account_bar.set_engine(self._active_engine)
+        self.calculator.set_engine(self._active_engine)
 
         self.statusBar().setStyleSheet("")
         self.statusBar().showMessage(f"已连接 ({mode.value})")
@@ -393,6 +401,7 @@ class MainWindow(QMainWindow):
             self.position_panel.set_engine(self._active_engine)
             self.order_panel.set_engine(self._active_engine)
             self.account_bar.set_engine(self._active_engine)
+            self.calculator.set_engine(self._active_engine)
 
     def _on_reconnect_requested(self, mode_text: str):
         """Handle hot switch: disconnect and reconnect to different port."""
@@ -522,6 +531,7 @@ class MainWindow(QMainWindow):
     def _on_option_selected(self, option: OptionInfo):
         self._current_option = option
         self.price_ladder.set_option(option)
+        self.calculator.set_option(option)
         self.symbol_bar.set_current_option(option.display_name)
         self.statusBar().showMessage(f"已选择: {option.display_name}")
 
@@ -583,6 +593,7 @@ class MainWindow(QMainWindow):
                 self._active_engine.subscribe_option_tick(option)
 
         self.price_ladder.set_option(option)
+        self.calculator.set_option(option)
         self.symbol_bar.set_current_option(option.display_name)
         self.statusBar().showMessage(f"已加载: {option.display_name}")
 
@@ -912,5 +923,6 @@ class MainWindow(QMainWindow):
         self.price_ladder.cleanup()
         self.position_panel.cleanup()
         self.order_panel.cleanup()
+        self.calculator.cleanup()
         self.ibkr_engine.disconnect()
         event.accept()

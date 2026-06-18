@@ -15,11 +15,13 @@ class OrderPanel(QWidget):
     """Displays orders with cancel buttons."""
 
     cancel_requested = pyqtSignal(int)  # orderId
+    option_selected = pyqtSignal(object)  # OptionInfo — 双击委托行跳到该合约
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._engine = None
         self._last_sig = None          # skip rebuild when order state unchanged
+        self._row_options: list = []   # row -> OptionInfo (供双击跳转)
         self._brush_cache: dict[str, QBrush] = {}
         self._build_ui()
 
@@ -55,7 +57,16 @@ class OrderPanel(QWidget):
         for i in range(2, len(headers)):
             header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
 
+        self.table.doubleClicked.connect(self._on_double_click)
         layout.addWidget(self.table)
+
+    def _on_double_click(self, index):
+        """双击委托行 → 跳到该合约 (加载到点价梯)。COMBO 组合跳过。"""
+        row = index.row()
+        if 0 <= row < len(self._row_options):
+            opt = self._row_options[row]
+            if opt is not None and opt.right in ("C", "P", "STK"):
+                self.option_selected.emit(opt)
 
     def set_engine(self, engine):
         self._engine = engine
@@ -68,6 +79,8 @@ class OrderPanel(QWidget):
         # Show most recent first, limit to 50
         sorted_orders = sorted(orders.values(),
                                key=lambda o: o.create_time, reverse=True)[:50]
+        # 行→合约映射 (双击跳转用), 每次刷新都更新, 与表格行一一对应
+        self._row_options = [o.option for o in sorted_orders]
 
         # Skip the (expensive) rebuild when nothing visible changed — avoids
         # recreating cancel buttons and re-painting cells every second while

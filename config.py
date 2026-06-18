@@ -1,18 +1,33 @@
 """Configuration constants for IBKR Trader."""
 
+import os
+
 # ── IBKR Connection ──────────────────────────────────────────────────
 IBKR_HOST = "127.0.0.1"
 IBKR_PAPER_PORT = 7497
 IBKR_LIVE_PORT = 7496
-IBKR_GW_PAPER_PORT = 4001
-IBKR_GW_LIVE_PORT = 4002
+IBKR_GW_LIVE_PORT = 4001   # IB Gateway 默认: 实盘
+IBKR_GW_PAPER_PORT = 4002  # IB Gateway 默认: 模拟盘
+# 注: 以上为 IB Gateway 出厂默认端口; 实际以 Gateway → Configure → Settings
+# → API → Socket Port 里的设置为准, 不一致时改这里或改 Gateway 设置。
 IBKR_CLIENT_ID = 10        # Options GUI (avoid collision with tradebot=1,2)
 IBKR_STOCK_CLIENT_ID = 11  # Stock trader client (stock_trader.py)
 IBKR_COMBO_CLIENT_ID = 12  # Combo analyzer (combo_analyzer.py)
 
+# ── 新版本开关 (Gateway + 更轻的行情订阅) ────────────────────────────
+# 设环境变量 IBKR_USE_GATEWAY=1 → 连 IB Gateway (端口 4001/4002) 而非 TWS
+# (7496/7497), 并收紧行情订阅占用, 让期权 GUI + 正股 GUI 同开时不超过
+# ~100 行账户上限。旧启动脚本 (start.bat) 不设此变量 → 行为与之前完全一致。
+# 新启动脚本 start_gateway.bat 通过独立入口 main_gw.py 设置该变量。
+USE_GATEWAY = os.environ.get("IBKR_USE_GATEWAY", "0") == "1"
+
 # ── Market Data ──────────────────────────────────────────────────────
 MARKET_DATA_TYPE = 1  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
-MAX_SIMULTANEOUS_STREAMS = 95  # IBKR limit ~100, leave headroom
+# 单组件 (option_chain 每个到期日 tab) 同时订阅的行情上限。
+# 新版 (Gateway) 调小, 让期权+正股两个 GUI 合计 <100 行账户上限。
+MAX_SIMULTANEOUS_STREAMS = 45 if USE_GATEWAY else 95  # IBKR limit ~100
+# 期权链显示/订阅的 ATM 上下行权价档数 (±N); 新版调小减少行情占用。
+CHAIN_STRIKES_AROUND_ATM = 10 if USE_GATEWAY else 15
 
 # ── Price Ladder ─────────────────────────────────────────────────────
 # Penny Pilot (SPY, QQQ, IWM, AAPL, TSLA, NVDA, AMZN, etc.)

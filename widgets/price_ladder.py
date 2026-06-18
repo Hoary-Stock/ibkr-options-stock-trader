@@ -964,7 +964,8 @@ class PriceLadder(QWidget):
         qty_val.setText(str(qty))
 
         if qty > 0:
-            pos = self._engine.positions.get(key)
+            # 持仓以 API 为准: get_position() (真实引擎读 reqPositions, 模拟引擎读本地撮合)
+            pos = self._engine.get_position(key) if self._engine else None
             if pos:
                 _, avg_val = self.pos_avg_label
                 avg_val.setText(f"{pos.avg_price:.2f}")

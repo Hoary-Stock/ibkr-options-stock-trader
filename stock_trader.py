@@ -39,6 +39,8 @@ from ibkr_engine import IBKREngine
 from widgets.price_ladder import PriceLadder
 from widgets.position_panel import PositionPanel
 from widgets.order_panel import OrderPanel
+from widgets.currency_balance import CurrencyBalanceBar
+from sound_alerts import play_fill
 # ChartWindow imported lazily (pulls numpy + pyqtgraph)
 
 APP_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_app.ico")
@@ -146,6 +148,11 @@ class StockTraderWindow(QMainWindow):
         top_row.addWidget(self.chart_btn)
 
         top_row.addStretch()
+
+        # Per-currency cash balances (EUR/USD/...)
+        self.currency_bar = CurrencyBalanceBar()
+        top_row.addWidget(self.currency_bar)
+
         layout.addLayout(top_row)
 
         # Main area: ladder (left) | positions + orders (right)
@@ -178,6 +185,8 @@ class StockTraderWindow(QMainWindow):
         b.portfolio_position_received.connect(self.position_panel.on_portfolio_position)
         b.portfolio_positions_end.connect(self.position_panel.on_portfolio_positions_end)
         b.pnl_single_updated.connect(self.position_panel.on_pnl_single)
+        b.currency_balance_updated.connect(self.currency_bar.on_balance)
+        b.execution_received.connect(lambda oid, side, q, p: play_fill(side))
 
         # Price ladder → orders
         self.price_ladder.order_requested.connect(self._on_order_requested)
@@ -216,6 +225,7 @@ class StockTraderWindow(QMainWindow):
         self.order_panel.set_engine(self.engine)
         self.price_ladder.set_engine(self.engine)
         self.engine.request_account_summary()  # needed for reqPnLSingle account name
+        self.engine.request_currency_balances()  # 各币种现金余额 (流式更新)
         self.engine.request_positions()
         # Re-subscribe the ladder if a symbol was already loaded
         if self._symbol:
@@ -226,6 +236,7 @@ class StockTraderWindow(QMainWindow):
         self.status_label.setStyleSheet(f"color: {COLOR_RED}; font-weight: bold;")
         self.connect_btn.setText("连接")
         self.statusBar().showMessage("已断开连接")
+        self.currency_bar.clear_balances()
 
     # ── Symbol ────────────────────────────────────────────────────────
 

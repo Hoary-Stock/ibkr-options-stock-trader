@@ -15,6 +15,7 @@ from config import (
     COLOR_ATM_HIGHLIGHT, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
     COLOR_BORDER, COLOR_BUTTON_DISABLED,
     MAX_EXPIRY_TABS_PER_RANGE, MAX_SIMULTANEOUS_STREAMS,
+    CHAIN_STRIKES_AROUND_ATM,
 )
 from models import OptionInfo
 
@@ -88,6 +89,30 @@ class OptionChainWidget(QWidget):
             range_layout.addWidget(btn)
 
         range_layout.addStretch()
+
+        # 手动刷新按钮: 拉一次快照报价 (不占常驻行情线, 避免持续订阅压垮 Gateway)
+        self._refresh_btn = QPushButton("🔄 刷新报价")
+        self._refresh_btn.setFixedHeight(26)
+        self._refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_ACCENT};
+                color: white;
+                border: 1px solid {COLOR_ACCENT};
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 2px 10px;
+            }}
+            QPushButton:hover {{ background-color: #0097a7; }}
+            QPushButton:disabled {{
+                background-color: {COLOR_BUTTON_DISABLED}; color: #555555;
+                border: 1px solid {COLOR_BORDER};
+            }}
+        """)
+        self._refresh_btn.clicked.connect(self._request_snapshots)
+        range_layout.addWidget(self._refresh_btn)
+
         self._range_bar.hide()  # Hidden until chain is loaded
         layout.addWidget(self._range_bar)
 
@@ -152,13 +177,13 @@ class OptionChainWidget(QWidget):
         today = datetime.now().strftime("%Y%m%d")
         self._all_expirations = [e for e in expirations if e >= today]
 
-        # Filter strikes near the money (+-15 strikes around ATM)
+        # Filter strikes near the money (±CHAIN_STRIKES_AROUND_ATM around ATM)
         if stock_price > 0:
             atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - stock_price))
         else:
             atm_idx = len(strikes) // 2
-        start = max(0, atm_idx - 15)
-        end = min(len(strikes), atm_idx + 16)
+        start = max(0, atm_idx - CHAIN_STRIKES_AROUND_ATM)
+        end = min(len(strikes), atm_idx + CHAIN_STRIKES_AROUND_ATM + 1)
         self._strikes = strikes[start:end]
 
         print(f"[DEBUG] Option chain: {len(self._all_expirations)} total expirations, "
@@ -359,15 +384,24 @@ class OptionChainWidget(QWidget):
         return table
 
     def _on_tab_changed(self, index: int):
-        """When tab changes, resubscribe to market data."""
+        """切到新到期日: 自动拉一次快照报价 (一次性, 不占常驻行情线)。"""
         if index < 0 or index >= len(self._expirations):
             return
+        self._request_snapshots()
 
-        # Unsubscribe old
-        self._unsubscribe_all()
+    def _request_snapshots(self):
+        """对当前到期日的所有行权价拉一次 one-shot 快照报价。
 
-        # Subscribe new
-        expiry = self._expirations[index]
+        用完即弃 (IBKR 自动取消), **不占常驻行情线** —— 这样切 Tab / 点刷新
+        才不会因持续订阅压垮 Gateway 的行情线上限。快照异步到达, 由显示定时器
+        `_refresh_prices` 在 ~1s 内绘出; 另排几个 singleShot 让它更快显示。
+        """
+        if not self._engine or not hasattr(self._engine, "snapshot_option_tick"):
+            return
+        idx = self.tab_widget.currentIndex()
+        if idx < 0 or idx >= len(self._expirations):
+            return
+        expiry = self._expirations[idx]
         count = 0
         for strike in self._strikes:
             for right in ("C", "P"):
@@ -377,11 +411,11 @@ class OptionChainWidget(QWidget):
                     symbol=self._symbol, expiry=expiry,
                     strike=strike, right=right,
                 )
-                key = opt.to_ibkr_key()
-                if self._engine and key not in self._sub_req_ids:
-                    req_id = self._engine.subscribe_option_tick(opt)
-                    self._sub_req_ids[key] = req_id
-                    count += 1
+                self._engine.snapshot_option_tick(opt)
+                count += 1
+        # 快照异步返回, 多排几次重绘让数据尽快出现
+        for delay_ms in (300, 800, 1500, 2500):
+            QTimer.singleShot(delay_ms, self._refresh_prices)
 
     def _unsubscribe_all(self):
         """Cancel all current subscriptions."""

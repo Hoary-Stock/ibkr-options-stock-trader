@@ -20,6 +20,7 @@ from config import (
 from models import OptionInfo, OrderAction, TradingMode
 from ibkr_engine import IBKREngine
 from paper_engine import PaperEngine
+from sound_alerts import play_fill
 from widgets.symbol_bar import SymbolBar
 from widgets.option_chain import OptionChainWidget
 from widgets.price_ladder import PriceLadder
@@ -309,6 +310,9 @@ class MainWindow(QMainWindow):
         # Position panel -> open ladder
         self.position_panel.position_clicked.connect(self._on_option_selected)
 
+        # 双击委托/交易记录的合约 -> 跳到该标的并加载到点价梯
+        self.order_panel.option_selected.connect(self._on_option_selected)
+
         # Order panel -> cancel
         self.order_panel.cancel_requested.connect(self._on_cancel_order)
 
@@ -327,6 +331,9 @@ class MainWindow(QMainWindow):
         # IBKR account/portfolio signals
         self.ibkr_engine.bridge.account_summary_updated.connect(self.account_bar.update_account)
         self.ibkr_engine.bridge.pnl_updated.connect(self.account_bar.update_daily_pnl)
+        self.ibkr_engine.bridge.computed_daily_pnl.connect(
+            self.account_bar.on_computed_daily
+        )
         self.ibkr_engine.bridge.portfolio_position_received.connect(
             self.position_panel.on_portfolio_position
         )
@@ -334,17 +341,28 @@ class MainWindow(QMainWindow):
             self.position_panel.on_portfolio_positions_end
         )
         self.ibkr_engine.bridge.account_summary_end.connect(self._on_account_summary_end)
+        self.ibkr_engine.bridge.currency_balance_updated.connect(
+            self.account_bar.on_currency_balance
+        )
+        # 真正成交 → 提示音 (仅真实引擎; 本地模拟不响)
+        self.ibkr_engine.bridge.execution_received.connect(self._on_fill_sound)
 
         # Paper engine signals
         self.paper_engine.bridge.error_received.connect(self._on_error)
         self.paper_engine.bridge.account_summary_updated.connect(self.account_bar.update_account)
         self.paper_engine.bridge.pnl_updated.connect(self.account_bar.update_daily_pnl)
+        self.paper_engine.bridge.computed_daily_pnl.connect(
+            self.account_bar.on_computed_daily
+        )
+        self.paper_engine.bridge.currency_balance_updated.connect(
+            self.account_bar.on_currency_balance
+        )
 
     # ── Connection ────────────────────────────────────────────────────
 
     def _on_connect(self):
         mode = self.symbol_bar.get_mode()
-        self.statusBar().showMessage(f"正在连接 ({mode.value})...")
+        self.statusBar().showMessage(f"正在连接 ({mode.label})...")
 
         # Connect in background thread
         def do_connect():
@@ -362,11 +380,15 @@ class MainWindow(QMainWindow):
         self.ibkr_engine.disconnect()
 
     def _on_connected(self):
+        # 结束"切换中"状态 → 重新启用模式下拉 + 标的输入框 (热切换后必须复位,
+        # 否则切到模拟/实盘后这俩控件一直禁用, 无法再改标的/再切回)。
+        self.symbol_bar.set_switching(False)
         mode = self.ibkr_engine.mode
-        if mode == TradingMode.PAPER:
-            self._active_engine = self.paper_engine
-        else:
+        # 本地模拟走 PaperEngine; IBKR模拟盘 / 实盘都走真实 IBKR 引擎 (真实发单)
+        if mode.uses_ibkr_engine:
             self._active_engine = self.ibkr_engine
+        else:
+            self._active_engine = self.paper_engine
 
         self.symbol_bar.set_connected(True, mode)
         self.symbol_bar.set_engine(self.ibkr_engine)
@@ -378,7 +400,7 @@ class MainWindow(QMainWindow):
         self.calculator.set_engine(self._active_engine)
 
         self.statusBar().setStyleSheet("")
-        self.statusBar().showMessage(f"已连接 ({mode.value})")
+        self.statusBar().showMessage(f"已连接 ({mode.label})")
 
         # Request account data
         self._active_engine.request_account_summary()
@@ -389,12 +411,18 @@ class MainWindow(QMainWindow):
         self._load_option_chain(self._current_symbol)
 
     def _on_disconnected(self):
+        # 复位"切换中"状态, 避免切换失败后控件卡在禁用
+        self.symbol_bar.set_switching(False)
         self.symbol_bar.set_connected(False)
         self.account_bar.stop()
         self.statusBar().setStyleSheet(
             f"QStatusBar {{ color: {COLOR_RED}; }}"
         )
         self.statusBar().showMessage("已断开连接")
+
+    def _on_fill_sound(self, order_id: int, side: str, qty: float, price: float):
+        """真正成交回报 → 播放提示音 (后台线程, 不阻塞 GUI)。"""
+        play_fill(side)
 
     def _on_account_summary_end(self):
         """After first account summary, request PnL (needs account name)."""
@@ -407,14 +435,14 @@ class MainWindow(QMainWindow):
         if self.ibkr_engine.is_connected:
             self._load_option_chain(symbol)
 
-    def _on_mode_changed(self, mode_text: str):
+    def _on_mode_changed(self, mode_value: str):
         """Handle mode change before connection."""
-        mode = TradingMode.PAPER if mode_text == "Paper" else TradingMode.LIVE
+        mode = TradingMode(mode_value)
         if self.ibkr_engine.is_connected:
-            if mode == TradingMode.PAPER:
-                self._active_engine = self.paper_engine
-            else:
+            if mode.uses_ibkr_engine:
                 self._active_engine = self.ibkr_engine
+            else:
+                self._active_engine = self.paper_engine
             self.option_chain.set_engine(self._active_engine)
             self.price_ladder.set_engine(self._active_engine)
             self.position_panel.set_engine(self._active_engine)
@@ -422,10 +450,10 @@ class MainWindow(QMainWindow):
             self.account_bar.set_engine(self._active_engine)
             self.calculator.set_engine(self._active_engine)
 
-    def _on_reconnect_requested(self, mode_text: str):
+    def _on_reconnect_requested(self, mode_value: str):
         """Handle hot switch: disconnect and reconnect to different port."""
-        mode = TradingMode.PAPER if mode_text == "Paper" else TradingMode.LIVE
-        self.statusBar().showMessage(f"切换到 {mode.value} 模式...")
+        mode = TradingMode(mode_value)
+        self.statusBar().showMessage(f"切换到 {mode.label} 模式...")
         self.symbol_bar.set_switching(True)
         self.account_bar.stop()
 
@@ -433,7 +461,7 @@ class MainWindow(QMainWindow):
             success = self.ibkr_engine.reconnect(mode)
             if not success:
                 self.ibkr_engine.bridge.error_received.emit(
-                    -1, -1, f"重连失败 — 请确认 TWS/Gateway 已启动 ({mode.value})"
+                    -1, -1, f"重连失败 — 请确认 TWS/Gateway 已启动 ({mode.label})"
                 )
                 self.ibkr_engine.bridge.disconnected.emit()
 
@@ -549,6 +577,15 @@ class MainWindow(QMainWindow):
 
     def _on_option_selected(self, option: OptionInfo):
         self._current_option = option
+        # 跳转到对应标的: 若双击的合约属于另一个标的, 切换标的并重载期权链
+        sym = getattr(option, "symbol", "")
+        if (sym and getattr(option, "right", "") != "COMBO"
+                and sym != self._current_symbol):
+            self._current_symbol = sym
+            self.symbol_bar.set_symbol(sym)
+            if self.ibkr_engine.is_connected:
+                self._load_option_chain(sym)
+        # 加载到点价梯 + 计算器 (点价交易界面就在左侧, 一直可见)
         self.price_ladder.set_option(option)
         self.calculator.set_option(option)
         self.symbol_bar.set_current_option(option.display_name)

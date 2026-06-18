@@ -19,8 +19,28 @@ class OrderStatus(Enum):
 
 
 class TradingMode(Enum):
-    PAPER = "Paper"
-    LIVE = "Live"
+    PAPER = "Paper"            # 本地模拟: PaperEngine 本地撮合, 不向 TWS 发单
+    IBKR_PAPER = "IBKRPaper"   # IBKR 模拟盘: 真实 API 发单到 7497 端口的模拟账户
+    LIVE = "Live"             # 实盘: 真实 API 发单到 7496 端口
+
+    @property
+    def label(self) -> str:
+        """中文显示名 (状态栏 / 连接状态)。"""
+        return {
+            "Paper": "本地模拟",
+            "IBKRPaper": "IBKR模拟盘",
+            "Live": "实盘",
+        }[self.value]
+
+    @property
+    def uses_ibkr_engine(self) -> bool:
+        """是否走真实 IBKR 引擎 (真实下单)。仅本地模拟用 PaperEngine。"""
+        return self is not TradingMode.PAPER
+
+    @property
+    def is_live_port(self) -> bool:
+        """是否连实盘端口 (7496)。两种模拟都连 7497。"""
+        return self is TradingMode.LIVE
 
 
 class InstrumentType(Enum):

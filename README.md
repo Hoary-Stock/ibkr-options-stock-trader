@@ -19,9 +19,15 @@
 
 | 程序 | 启动方式 | clientId | 入口 | 桌面快捷方式 |
 |------|---------|----------|------|------------|
-| 期权点价 GUI | `start.bat` (`pythonw main.py`) | 10 | `main.py` | "IBKR 点价交易" |
-| 正股点价 client | `start_stock.bat` (`pythonw stock_trader.py`) | 11 | `stock_trader.py` | "IBKR 正股交易" |
+| 期权点价 GUI (Gateway, 新版) | `start_gateway.bat` (`pythonw main_gw.py`) | 10 | `main_gw.py` | **"IBKR 点价交易"** |
+| 期权点价 GUI (TWS, 旧版) | `start.bat` (`pythonw main.py`) | 10 | `main.py` | — |
+| 正股点价 client (Gateway, 新版) | `start_stock_gateway.bat` (`pythonw stock_trader_gw.py`) | 11 | `stock_trader_gw.py` | **"IBKR 正股交易"** |
+| 正股点价 client (TWS, 旧版) | `start_stock.bat` (`pythonw stock_trader.py`) | 11 | `stock_trader.py` | — |
 | 期权组合分析器 | `start_combo.bat` (`pythonw combo_analyzer.py`) | 12 | `combo_analyzer.py` | — |
+
+> 两个桌面快捷方式现已指向 **Gateway 新版**(`main_gw.py` / `stock_trader_gw.py`,需先登录 IB Gateway:
+> 4001 实盘 / 4002 模拟)。旧 TWS 版仍可用 `start.bat` / `start_stock.bat` 手动启动,新旧文件名独立、
+> 互不杀进程,可同时运行对比。
 
 - 用 `pythonw` 启动(无控制台窗口)。`stdout`/`stderr` 自动重定向到 `logs/app_YYYY-MM-DD.log`
   (正股为 `logs/stock_app_YYYY-MM-DD.log`)。
@@ -38,8 +44,10 @@
 
 ```
 ibkr_trader/
-├── main.py                 # 期权 GUI 入口 (clientId=10, 日志重定向, 杀旧实例, 启动 QApplication)
-├── stock_trader.py         # 正股 client 入口 (clientId=11, 点价梯+K线+正股持仓, 自带窗口类)
+├── main.py                 # 期权 GUI 入口 — TWS 旧版 (clientId=10, 日志重定向, 杀旧实例, 启动 QApplication)
+├── main_gw.py              # 期权 GUI 入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 MainWindow, 标题加[GW])
+├── stock_trader.py         # 正股 client 入口 — TWS 旧版 (clientId=11, 点价梯+K线+正股持仓, 自带窗口类)
+├── stock_trader_gw.py     # 正股 client 入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 StockTraderWindow)
 ├── combo_analyzer.py       # 期权组合分析器入口 (clientId=12, 组合历史价合成 + 组合原子交易)
 ├── start_combo.bat         # 组合分析器启动脚本
 ├── combo_positions.json    # 自动生成: 组合持仓分组 (IBKR 不保留分组, 本地持久化)
@@ -49,8 +57,10 @@ ibkr_trader/
 ├── models.py               # 纯数据模型 (dataclass + Enum), 无 Qt/IBKR 依赖
 ├── config.py               # 全部常量 (连接/费率/颜色/tick/图表/交易时段)
 ├── single_instance.py      # 启动辅助: 杀掉同脚本的旧进程以释放 clientId
-├── start.bat               # 期权 GUI 启动脚本
-├── start_stock.bat         # 正股 client 启动脚本
+├── start.bat               # 期权 GUI 启动脚本 (TWS 旧版)
+├── start_gateway.bat       # 期权 GUI 启动脚本 (Gateway 新版)
+├── start_stock.bat         # 正股 client 启动脚本 (TWS 旧版)
+├── start_stock_gateway.bat # 正股 client 启动脚本 (Gateway 新版)
 ├── check_spx_options.py    # 独立诊断脚本: 探测 SPX 期权合约/交易时段
 ├── check_option_history.py # 独立诊断脚本: 检测账户是否有「期权历史数据」权限 (clientId=99)
 ├── app.ico / app_icon.png  # 期权 GUI 图标
@@ -66,7 +76,8 @@ ibkr_trader/
     ├── price_ladder.py      # 点价梯 (5 列深度摆盘 + 点击下单 + 持仓摘要)  ★核心
     ├── position_panel.py    # 持仓面板 (期权 + 正股/ETF, P/L + 今日盈亏)
     ├── order_panel.py       # 委托面板 (挂单/历史, 撤单, 拒单标红)
-    ├── account_bar.py       # 账户摘要条 (净值/现金/购买力/盈亏)
+    ├── account_bar.py       # 账户摘要条 (净值/现金/购买力/盈亏 + 各币种现金)
+    ├── currency_balance.py  # 各币种现金余额条 (EUR/USD/..., 期权GUI+正股复用)
     ├── option_calculator.py # 期权理论价计算器 (Black-Scholes, 右下角, 随实时IV+时间刷新)
     ├── currency_dialog.py   # 外汇兑换对话框 (USD ↔ HKD/CNH/EUR/...)
     ├── quantity_selector.py # 数量选择小部件 (1–100 张)
@@ -182,8 +193,10 @@ ibkr_trader/
   `_run_wrapper`(后台跑 `app.run()`)。
 - 合约:`search_symbols`、`get_con_id`、`request_option_chain`、`resolve_option_con_id`、
   `_make_underlying_contract`/`_make_stock_contract`/`_make_option_contract`。
-- 行情订阅:`subscribe_option_tick`、`subscribe_stock_tick`、`unsubscribe_tick`、`get_tick`、
+- 行情订阅:`subscribe_option_tick`(流式)、`snapshot_option_tick`(一次性快照, 配 `tickSnapshotEnd`
+  自动清理, 不占常驻线)、`subscribe_stock_tick`、`unsubscribe_tick`、`get_tick`、
   `subscribe_market_depth`/`unsubscribe_market_depth`、`request_historical_data`/`cancel_historical_data`。
+  错误 300(cancelMktData 找不到 tickerId, 多见于快照已自动取消)静默处理, 不再弹状态栏。
 - 账户/持仓/盈亏:`request_account_summary`、`request_positions`、`request_pnl`、
   `request_pnl_single`(每仓位今日盈亏)及各自 `cancel_*`。
 - **下单**:`place_limit_order`、`place_market_order`、`place_stock_order`、`place_forex_order`、
@@ -217,11 +230,12 @@ ibkr_trader/
 | 文件 | 角色与要点 |
 |------|-----------|
 | `symbol_bar.py` (300) | 代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
-| `option_chain.py` (489) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab);ATM 行高亮;受 `MAX_SIMULTANEOUS_STREAMS` 限制订阅数。 |
+| `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。 |
 | `price_ladder.py` (1121) ★ | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 按 penny-pilot(<$3=0.01,≥$3=0.05)及 `TICK_SIZE_OVERRIDES`(SPX 0.05/0.10)。 |
-| `position_panel.py` (318) | 持仓表;支持期权(引擎)+ 正股/ETF(`portfolio_position_received`);显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
+| `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
 | `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。 |
-| `account_bar.py` (192) | 账户摘要条;净值/现金/购买力/盈亏;每 `ACCOUNT_REFRESH_MS` (3s) 刷新。 |
+| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);每 `ACCOUNT_REFRESH_MS` (3s) 刷新账户摘要 + `request_currency_balances()`。 |
+| `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;期权 GUI 嵌在 `AccountBar`、正股 client 放顶栏。 |
 | `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·求标的价」**:可任意改各参数甚至**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「在该到期时间下、期权要值目标价、标的需到的价位」,并对比当前标的算需变动金额/百分比(↑绿/↓红);换合约时自动用实时值播种一次,「↺ 用实时值填充」可手动重置;Put 目标价超 `K·e^(-rT)` 显示「无解」。正股伪合约两列均显示「仅期权适用」。 |
 | `currency_dialog.py` (180) | 外汇兑换对话框,走 `place_forex_order`(`FOREX_PAIRS`)。 |
 | `quantity_selector.py` (31) | 1–100 张数量微调器,emit `quantity_changed`。 |
@@ -272,6 +286,29 @@ ibkr_trader/
 > ⚠️ 「计算组合历史价」依赖账户的**期权历史数据权限**(与实时/快照行情是**独立订阅**);
 > 是否具备可用 `check_option_history.py` 实测。无权限时改用「▶ 录制当日」(实时累积, 零历史权限)。
 > 本程序只发组合单、从不单腿下单;但无法阻止用户在别的 GUI 里单腿操作这些合约。
+
+---
+
+### 4.9 Gateway 版入口 `main_gw.py` (新版本, 缓解 TWS 崩溃)
+
+**为什么有这个**:TWS(Trader Workstation)是重型 Java GUI,长跑易卡顿/崩溃。本项目典型用法是
+期权 GUI(clientId=10)+ 正股 GUI(clientId=11)同开,各自加载期权链时每个到期日 tab 订 ~62 行
+行情,**合计逼近甚至超过账户 ~100 行的行情上限**,叠加 TWS 自身的界面渲染负担 → 崩溃高发。
+
+**新版怎么做的**(全部由环境变量 `IBKR_USE_GATEWAY=1` 驱动,在 `config.py` 导入时求值):
+- **连 IB Gateway**(纯 API 网关,几乎无界面、内存约为 TWS 一半)而非 TWS:端口
+  `4001`(live)/ `4002`(paper)。
+- **收紧行情订阅**:`MAX_SIMULTANEOUS_STREAMS` 95→45、`CHAIN_STRIKES_AROUND_ATM` 15→10
+  (期权链显示/订阅 ATM±10=21 档),使期权+正股两个 GUI 合计稳在 100 行以内。
+- **与旧版完全隔离**:入口文件名独立(`main_gw.py`)→ `kill_previous_instances` 只杀本脚本旧
+  进程,**不会动正在运行的 `main.py`**;日志写 `logs/app_gw_*.log`;窗口标题加 `[GW 新版]`。
+  旧版 `start.bat`/`main.py` 不设环境变量 → 行为与之前**字节级一致**(TWS + 95/15)。
+
+**启动**:先开并登录 **IB Gateway**(API → Socket Port 确认 4001/4002、勾选 Enable
+ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「IBKR模拟盘」即连 4002
+模拟账户测试。注意:同一账户 TWS 与 Gateway 通常二选一登录(同账户重复登录会互踢)。
+
+**回退**:有任何问题直接用旧 `start.bat`(TWS)即可,新版无需卸载、互不影响。
 
 ---
 
@@ -339,8 +376,10 @@ ibkr_trader/
 | 行情订阅 | 与 Gateway 共享同一账户的行情权限 | 同上,权限取决于账户订阅,而非用哪个宿主 |
 
 **对本项目的含义:**
-- 当前 `config.py` 默认连 **TWS 7496(live)/7497(paper)**;若改用 Gateway,只需把端口改成
-  **4002(live)/4001(paper)**,其余代码(`IBKRApp`、下单、回调)一字不改。
+- 当前 `config.py` 默认连 **TWS 7496(live)/7497(paper)**;若改用 Gateway,端口为
+  **4001(live)/4002(paper)** (IB Gateway 出厂默认),其余代码(`IBKRApp`、下单、回调)一字不改。
+  现在已内置开关:用 `start_gateway.bat` / `main_gw.py` 启动即设环境变量 `IBKR_USE_GATEWAY=1`,
+  自动切到 Gateway 端口(详见 §4.9)。
 - **行情数据包**与用 TWS 还是 Gateway **无关**——取决于账户购买的行情订阅(本项目已购美股快照)。
 - **同一时刻**对一个账户,TWS 与 Gateway **通常二选一登录**(同账户重复登录会互踢);但**同一个宿主**
   下可以让**多个 client(不同 clientId)并行**——本项目正是用一个 TWS 同时接 clientId=10(期权)
@@ -354,6 +393,81 @@ ibkr_trader/
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-19** — **双击持仓/委托的合约 → 跳到该标的 + 加载到点价梯**。委托面板 `order_panel` 新增
+  `option_selected` 信号(双击行,COMBO 跳过)+ `_row_options` 行映射;`_on_option_selected` 增加:若合约属于
+  另一标的则切换标的并重载期权链(`symbol_bar.set_symbol`),再把合约载入点价梯+计算器(持仓面板原本就有双击跳转)。
+  (`widgets/order_panel.py`, `widgets/symbol_bar.py`, `main_window.py`)
+- **2026-06-19** — **实盘↔模拟切换时盈亏/净值显示按各自账户独立**。`account_bar.stop()`(断开/切换时调用)把
+  今日盈亏/未实现/总资产/现金/购买力清回「--」,避免残留上一个账户的数字;重连后由新账户(模拟连 4002 → 模拟账户,
+  实盘连 4001 → 实盘账户)的 reqPnL/reqPnLSingle 重新填充,数据本就按连接的账户独立。(`widgets/account_bar.py`)
+- **2026-06-19** — **修复热切换后模式下拉/标的框卡死**。切换模式时 `set_switching(True)` 禁用了下拉+标的输入框,
+  重连完成后从未复位 → 切到模拟/实盘后无法再改标的、无法再切回(实盘新连正常因为没走切换)。修复:
+  `_on_connected` / `_on_disconnected` 开头调 `set_switching(False)` 复位。(`main_window.py`)
+- **2026-06-18** — **桌面快捷方式连带自动起 IBC 网关**。新增 `start_full_options.bat` / `start_full_stock.bat`:
+  netstat 查 4001 没监听则先用 IBC(`C:\IBC\StartGateway_live.bat`)起实盘 Gateway, 再开交易程序;桌面
+  「IBKR 点价交易/正股交易」改指这俩(图标保留)。IBC 用 `ReadOnlyApi=no`(修早先 code 321 只读拒单)、
+  `AutoRestartTime=05:00 AM`(一周内免重复 2FA)。launcher 起实盘(4001)+模拟(4002)两网关后 **轮询等 4001
+  就绪(最多~3分钟, 控制台显示进度, 超时 pause 不闪退)再开程序** —— 修"程序先于网关启动→连不上(502)像闪退"。
+  两网关都在线 → 顶栏「实盘⇄IBKR模拟盘」秒切。(`start_full_options.bat`, `start_full_stock.bat`, 桌面 .lnk, `C:\IBC\*`)
+- **2026-06-18** — **今日盈亏修好: dailyPnL 不可用时用 已实现+未实现 兜底**。日志实测: 本账户 reqPnL 的
+  `dailyPnL` **常年返回 DBL_MAX(不可用)**→ 被转 NaN → 显示「--」; 但同一回调的 `unrealizedPnL`/
+  `realizedPnL` **有效**(实测 realized=-168.79、unrealized=+16.67)。改法: `update_daily_pnl` 在 dailyPnL 为
+  NaN 时取 `realizedPnL + unrealizedPnL`(IBKR 的 realizedPnL 已含手续费), dailyPnL 可用时仍优先用它。
+  今日盈亏由「--」变为 ≈ -152。**同时撤回了之前两版错误尝试**(本地扣费 / 现金流+市值自算误显示 +$45931)。
+  (`ibkr_engine.py`, `widgets/account_bar.py`)
+- **2026-06-18** — **真正成交播放提示音**。新增 `sound_alerts.play_fill(side)`(后台线程播放,不卡 GUI):
+  优先放 `sounds/BUY.(wav|mp3)` / `sounds/SELL.(wav|mp3)`(可用 GPT-SoVITS 生成),回退 `sounds/FILL.*`,
+  再回退 winsound 蜂鸣(买升调/卖降调)。期权 GUI 与正股 client 均接 `execution_received`(仅真实引擎成交,
+  本地模拟不响)。语音文件放 `sounds/` 即生效,无需改代码。**已用训练好的御坂美琴 misaka v3 模型生成
+  `sounds/BUY.wav`(日语「買い」)/`SELL.wav`(日语「売り」)**(脚本 `GPT-SoVITS-Training/.../gen_fill_voices2.py`,
+  走 inference_webui;api_v2 不支持 v3)。(`sound_alerts.py`, `sounds/`, `main_window.py`, `stock_trader.py`)
+- **2026-06-18** — **修今日/未实现盈亏闪 0 + 重连后盈亏归 0**。① `request_pnl` 改**幂等**(reqPnL 是流式
+  订阅,`account_summary_end` 每 3 秒会调它,原来每次 cancel+重订 → 重订瞬间初值不稳 → 闪 0;现已订阅则直接
+  返回)。② **未实现盈亏单一来源**:reqPnL 流接管后,账户摘要里每 3 秒推来的 `UnrealizedPnL`(常为 0/陈旧)
+  不再覆盖(`_unrealized_from_stream` 标志;断开时重置以便重连后再作初始回退)。③ 持仓面板 API 期权持仓在
+  `reqPnLSingle` 到达前显示「--」而非误导性的 $0.00(新增 `has_pnl` 行标志)。(`ibkr_engine.py`,
+  `widgets/account_bar.py`, `widgets/position_panel.py`)
+- **2026-06-18** — **持仓一律以 IBKR API 为准 + 撤单类无害响应不再误报**(修"撤单弹拒单框 / 凭空多一个持仓 / 数目不对")。
+  ① 错误 **161 / 10147 / 10148**(撤单时订单已不可撤或找不到 —— 多半已成交/已撤)在 `error()` 里静默返回:
+  不弹框、不标 ERROR、不写拒单日志(以前会把刚成交的单误显示成"已拒绝")。② **真实引擎 `positions` 属性
+  改为返回空**,`_on_execution` 不再本地累加持仓 —— 持仓唯一真相来自 `reqPositions`(`_ibkr_positions`):
+  持仓面板用 `portfolio_position_received` + `reqPnLSingle` 渲染(不依赖逐合约行情,Gateway 快照模式也准),
+  点价梯摘要改用新方法 `get_position()`,`get_position_qty()` 只读 API。平仓后 reqPositions 推 0 → 自动消失、
+  不留残影,也不再有幻影持仓/数目错。模拟引擎 `PaperEngine` 仍用本地撮合持仓(无 API 可用)。
+  (`ibkr_engine.py`, `paper_engine.py`, `widgets/price_ladder.py`)
+- **2026-06-18** — **期权链报价改一次性快照 + 新增「🔄 刷新报价」按钮(修 Gateway 下整条链/TSLA 无数据)**。
+  根因:Gateway 行情线收紧到 45,期权链原本对每个行权价持续流式订阅 → 线不够 → 全 "—"(TSLA 尤甚)。
+  改为:引擎新增 `snapshot_option_tick`(`reqMktData snapshot=True`,IBKR 推一次 bid/ask/last/vol 后自动
+  取消,**不占常驻线**)+ `tickSnapshotEnd` 清理映射;期权链切 Tab / 点按钮各拉一次快照,显示定时器只读
+  缓存不发请求(无持续压力)。顺带:错误 **300**(cancelMktData 找不到 tickerId,快照自动取消后常见)
+  改为静默 + 清理,不再刷状态栏。`PaperEngine` 加 `snapshot_option_tick` 委托。
+  (`ibkr_engine.py`, `paper_engine.py`, `widgets/option_chain.py`)
+- **2026-06-18** — **正股 client 补上 Gateway 版入口 + 两个桌面快捷方式改指 Gateway 新版**。新增
+  `stock_trader_gw.py`(设 `IBKR_USE_GATEWAY=1`、独立文件名故不杀运行中的 `stock_trader.py`、日志写
+  `stock_app_gw_*.log`、标题加 [GW])与 `start_stock_gateway.bat`,与 `main_gw.py` 对称。桌面
+  「IBKR 点价交易」→ `main_gw.py`、「IBKR 正股交易」→ `stock_trader_gw.py`(图标/工作目录不变)。
+  旧 TWS 版入口与 bat 全部保留。(`stock_trader_gw.py`, `start_stock_gateway.bat`, 桌面 .lnk)
+- **2026-06-18** — **期权 GUI + 正股 client 都新增「各币种现金余额」显示**。引擎用 `reqAccountSummary
+  "$LEDGER:ALL"` 拿到每个币种的 `CashBalance`(新信号 `currency_balance_updated`/`currency_balances_end`、
+  方法 `request/cancel_currency_balances`,独立于普通账户摘要订阅);新增复用控件
+  `widgets/currency_balance.py`(`CurrencyBalanceBar`,显示 `币种: EUR €414.00  USD $0.00`,非零排前、
+  含 0 也显示)。期权 GUI 内嵌进 `AccountBar`(随 3s 刷新),正股 client 放顶栏(连接时请求);
+  `PaperEngine` 给出模拟 USD 余额以保持接口一致。直接定位"有欧元没美元"导致买美元期权被拒的根因。
+  (`ibkr_engine.py`, `paper_engine.py`, `widgets/currency_balance.py`, `widgets/account_bar.py`,
+  `main_window.py`, `stock_trader.py`)
+- **2026-06-18** — **新增 Gateway 版入口 `main_gw.py` + `start_gateway.bat`(解决 TWS 频繁崩溃)**。
+  根因诊断:TWS 是重型 Java GUI,期权 GUI(10)+正股 GUI(11)各订 ~62 行行情、合计超 ~100 行账户
+  上限,叠加界面渲染易卡死/崩溃。新版改动:① `config.py` 加 `USE_GATEWAY`(环境变量
+  `IBKR_USE_GATEWAY=1`)开关,开则连 IB Gateway(4001 live / 4002 paper)且收紧订阅
+  (`MAX_SIMULTANEOUS_STREAMS` 95→45, `CHAIN_STRIKES_AROUND_ATM` 15→10,两个 GUI 合计 <100 行);
+  ② `ibkr_engine.py` 端口选择按 `USE_GATEWAY` 路由;③ `option_chain.py` 用 `CHAIN_STRIKES_AROUND_ATM`;
+  ④ 新入口 `main_gw.py` 文件名独立 → `kill_previous_instances` **不会杀运行中的 `main.py`(旧版)**,
+  新旧可并存对比;日志写 `app_gw_*.log`,窗口标题加 `[GW 新版]`。**旧版完全不受影响**
+  (`start.bat`/`main.py` 不设环境变量 → TWS + 95/15,字节级行为不变)。
+  **顺带修 bug**:`config.py` 的 GW 端口常量原先写反(paper=4001/live=4002),已按 IB 默认改正
+  (live=4001/paper=4002);README §7 自相矛盾的端口说明一并修正。
+  (`config.py`, `ibkr_engine.py`, `combo_analyzer.py`, `widgets/option_chain.py`, `main_gw.py`,
+  `start_gateway.bat`)
 - **2026-06-18** — 组合分析器加**连接模式下拉**(IBKR模拟盘 7497 默认 / 实盘 7496):此前写死 LIVE
   会直连实盘真钱;改为默认连模拟盘, 可端到端测试组合下单而不动真钱, 选实盘弹确认。(`combo_analyzer.py`)
 - **2026-06-18** — **新增「IBKR模拟盘」模式,可连模拟账户真实测试下单**。原「Paper」是本地撮合、不发单;
@@ -396,8 +510,9 @@ ibkr_trader/
   (随每笔成交跳动),模型 `undPrice`(每几秒才更新)仅作回退;刷新间隔 700ms→300ms。
   解决理论价随标的变动反应迟钝的问题。(`widgets/option_calculator.py`, `config.py`)
 - **2026-06-18** — **模拟模式今日盈亏/未实现盈亏/净值计入手续费**:`_calc_unrealized_pnl` 改用 `net_pnl`
-  (= 毛利 − 未平仓持仓累计佣金),修复模拟模式今日盈亏漏算开仓手续费的问题。真实模式不变
-  (IBKR 的 dailyPnL 已含佣金:avgCost 含佣金、已平仓佣金入 realized,故不可再本地扣除以免重复)。
+  (= 毛利 − 未平仓持仓累计佣金),修复模拟模式今日盈亏漏算开仓手续费的问题。~~真实模式不变
+  (IBKR 的 dailyPnL 已含佣金...)~~ **← 此结论后被实盘实测推翻:reqPnL dailyPnL 未含手续费,
+  见上方今日盈亏扣费那条。**
   (`paper_engine.py`)
 - **2026-06-18** — **窗口自由缩放 + 子面板按比例联动 + 尺寸记忆**:三层 splitter 加 `setStretchFactor`
   (主竖向 1:1、下方横向 4:5、右侧竖向 5:2) 使面板随窗口等比联动;`setChildrenCollapsible(False)`

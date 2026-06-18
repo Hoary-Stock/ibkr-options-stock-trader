@@ -12,6 +12,7 @@ from config import (
     COLOR_GREEN, COLOR_RED, COLOR_ACCENT, COLOR_BORDER,
     ACCOUNT_REFRESH_MS,
 )
+from widgets.currency_balance import CurrencyBalanceBar
 
 
 class AccountBar(QWidget):
@@ -31,6 +32,13 @@ class AccountBar(QWidget):
         self._realized_pnl = 0.0
         self._daily_pnl = 0.0
         self._account_name = ""
+        # reqPnL 流是否已给出未实现盈亏。一旦给出, 账户摘要里(每3秒重订、常推0/陈旧值)
+        # 的 UnrealizedPnL 就不再覆盖显示 —— 避免未实现盈亏闪 0。
+        self._unrealized_from_stream = False
+        # 今日盈亏改用引擎自算值 (今日成交现金流 + 持仓市值 − 手续费), 不依赖 IBKR dailyPnL
+        # (其常为 -- / 未含费)。computed_daily_pnl 信号送来 (已扣费总额, 今日手续费)。
+        self._daily_computed = None     # 自算今日盈亏 (已扣费)
+        self._today_commission = 0.0    # 今日累计手续费 (仅用于标注)
 
         self._build_ui()
 
@@ -93,6 +101,12 @@ class AccountBar(QWidget):
         self.daily_pnl_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
         layout.addWidget(self.daily_pnl_label)
 
+        layout.addWidget(self._make_sep())
+
+        # Per-currency cash balances (EUR/USD/...)
+        self.currency_bar = CurrencyBalanceBar()
+        layout.addWidget(self.currency_bar)
+
         layout.addStretch()
 
         # Forex button
@@ -134,6 +148,29 @@ class AccountBar(QWidget):
     def stop(self):
         """Stop periodic refresh."""
         self._refresh_timer.stop()
+        # Clear per-currency balances so a disconnect / account switch doesn't
+        # leave a stale EUR/USD reading on screen.
+        self.currency_bar.clear_balances()
+        # 让重连后账户摘要的未实现盈亏可再次作初始回退, 直到新的 reqPnL 流接管。
+        self._unrealized_from_stream = False
+        # 重连会重新拉取当日成交/手续费重算, 先清零避免叠加旧会话的值。
+        self._today_commission = 0.0
+        self._daily_computed = None
+        # 断开/切换账户时把盈亏与净值显示清回 "--",避免实盘↔模拟切换时残留上一个账户的数字
+        # (今日盈亏/净值/现金等按各自账户独立显示)。
+        for lab, txt in (
+            (self.daily_pnl_label, "今日盈亏: --"),
+            (self.unrealized_label, "未实现盈亏: --"),
+            (self.net_liq_label, "总资产: --"),
+            (self.cash_label, "可用资金: --"),
+            (self.bp_label, "购买力: --"),
+        ):
+            lab.setText(txt)
+            lab.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
+
+    def on_currency_balance(self, currency: str, cash: float):
+        """Forward a per-currency cash balance to the embedded display."""
+        self.currency_bar.on_balance(currency, cash)
 
     def update_account(self, tag: str, value: str, currency: str, account: str):
         """Handle account_summary_updated signal."""
@@ -156,31 +193,43 @@ class AccountBar(QWidget):
             self._buying_power = val
             self.bp_label.setText(f"购买力: ${val:,.2f}")
         elif tag == "UnrealizedPnL":
-            self._unrealized_pnl = val
-            color = COLOR_GREEN if val >= 0 else COLOR_RED
-            sign = "+" if val >= 0 else ""
-            self.unrealized_label.setText(f"未实现盈亏: {sign}${val:,.2f}")
-            self.unrealized_label.setStyleSheet(
-                f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
-            )
+            # 仅作初始回退: reqPnL 流一旦接管就不再用账户摘要的值 (它每3秒重订、
+            # 常推 0 或陈旧值, 会把好值闪没)。
+            if not self._unrealized_from_stream:
+                self._unrealized_pnl = val
+                color = COLOR_GREEN if val >= 0 else COLOR_RED
+                sign = "+" if val >= 0 else ""
+                self.unrealized_label.setText(f"未实现盈亏: {sign}${val:,.2f}")
+                self.unrealized_label.setStyleSheet(
+                    f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
+                )
         elif tag == "RealizedPnL":
             self._realized_pnl = val
 
+    def on_computed_daily(self, total: float, commission: float):
+        """已弃用: 自算今日盈亏会在成交/持仓与账户不匹配时严重出错(曾误显示巨额盈利)。
+        今日盈亏改回直接用 IBKR 的 dailyPnL(由 update_daily_pnl 驱动)。"""
+        return
+
     def update_daily_pnl(self, daily: float, unrealized: float, realized: float):
-        """Handle pnl_updated signal.
-        NaN 字段表示 IBKR 本次未提供该值 (原 DBL_MAX), 跳过以保留上一次的好值,
-        避免今日盈亏 / 未实现盈亏闪烁成无效值。"""
-        if not math.isnan(daily):
-            self._daily_pnl = daily
-            color = COLOR_GREEN if daily >= 0 else COLOR_RED
-            sign = "+" if daily >= 0 else ""
-            self.daily_pnl_label.setText(f"今日盈亏: {sign}${daily:,.2f}")
+        """Handle pnl_updated signal. 今日盈亏 = IBKR reqPnL 的 dailyPnL;
+        **实测本账户 dailyPnL 常年不可用(DBL_MAX→NaN), 故用 已实现+未实现 兜底**
+        (IBKR 的 realizedPnL 已含手续费)。NaN 时保留上一次好值, 避免闪烁/归 0。"""
+        eff_daily = daily
+        if math.isnan(eff_daily) and not math.isnan(realized):
+            eff_daily = realized + (0.0 if math.isnan(unrealized) else unrealized)
+        if not math.isnan(eff_daily):
+            self._daily_pnl = eff_daily
+            color = COLOR_GREEN if eff_daily >= 0 else COLOR_RED
+            sign = "+" if eff_daily >= 0 else ""
+            self.daily_pnl_label.setText(f"今日盈亏: {sign}${eff_daily:,.2f}")
             self.daily_pnl_label.setStyleSheet(
                 f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
             )
 
-        # Also update unrealized from PnL stream
+        # Also update unrealized from PnL stream (权威来源, 接管后账户摘要不再覆盖)
         if not math.isnan(unrealized):
+            self._unrealized_from_stream = True
             self._unrealized_pnl = unrealized
             u_color = COLOR_GREEN if unrealized >= 0 else COLOR_RED
             u_sign = "+" if unrealized >= 0 else ""
@@ -190,9 +239,11 @@ class AccountBar(QWidget):
             )
 
     def _refresh(self):
-        """Periodically re-request account summary."""
+        """Periodically re-request account summary + per-currency balances."""
         if self._engine:
             self._engine.request_account_summary()
+            if hasattr(self._engine, "request_currency_balances"):
+                self._engine.request_currency_balances()
 
     def cleanup(self):
         self._refresh_timer.stop()

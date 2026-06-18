@@ -34,9 +34,12 @@ class PaperSignalBridge(QObject):
     # Match new IBKR bridge signals
     account_summary_updated = pyqtSignal(str, str, str, str)
     account_summary_end = pyqtSignal()
+    currency_balance_updated = pyqtSignal(str, float)  # currency, cash
+    currency_balances_end = pyqtSignal()
     portfolio_position_received = pyqtSignal(object)
     portfolio_positions_end = pyqtSignal()
     pnl_updated = pyqtSignal(float, float, float)
+    computed_daily_pnl = pyqtSignal(float, float)  # 自算今日盈亏(已扣费), 今日手续费
     depth_updated = pyqtSignal(int, int, int, int, float, int)
     open_order_received = pyqtSignal(int, object, str, int, float, str, str)
     order_rejected = pyqtSignal(int, int, str)
@@ -102,6 +105,9 @@ class PaperEngine:
     def subscribe_option_tick(self, option):
         return self.ibkr.subscribe_option_tick(option)
 
+    def snapshot_option_tick(self, option):
+        return self.ibkr.snapshot_option_tick(option)
+
     def unsubscribe_tick(self, req_id):
         return self.ibkr.unsubscribe_tick(req_id)
 
@@ -155,6 +161,16 @@ class PaperEngine:
     def cancel_account_summary(self):
         pass  # No-op for paper
 
+    def request_currency_balances(self):
+        """本地模拟无多币种, 把现金近似为单一 USD 余额。"""
+        total_cash = (self._starting_capital + self._realized_pnl
+                      - self._calc_cost_basis())
+        self.bridge.currency_balance_updated.emit("USD", total_cash)
+        self.bridge.currency_balances_end.emit()
+
+    def cancel_currency_balances(self):
+        pass  # No-op for paper
+
     def request_positions(self):
         pass  # Paper positions tracked internally
 
@@ -162,11 +178,12 @@ class PaperEngine:
         pass
 
     def request_pnl(self, account=""):
-        """Emit simulated PnL."""
+        """Emit simulated PnL. 今日盈亏(已含模拟手续费)同时走 computed_daily_pnl,
+        与真实引擎口径一致 (account_bar 的今日盈亏由 on_computed_daily 驱动)。"""
         unrealized = self._calc_unrealized_pnl()
-        self.bridge.pnl_updated.emit(
-            unrealized + self._realized_pnl, unrealized, self._realized_pnl
-        )
+        daily = unrealized + self._realized_pnl
+        self.bridge.pnl_updated.emit(daily, unrealized, self._realized_pnl)
+        self.bridge.computed_daily_pnl.emit(daily, 0.0)
 
     def cancel_pnl(self):
         pass
@@ -436,6 +453,10 @@ class PaperEngine:
         """Combo orders not supported in paper mode."""
         self.bridge.error_received.emit(-1, -1, "模拟模式不支持组合订单")
         return -1
+
+    def get_position(self, option_key: str):
+        """单个持仓 (供点价梯摘要)。模拟引擎用本地撮合持仓。"""
+        return self._positions.get(option_key)
 
     def get_position_qty(self, option_key: str) -> int:
         """Get current position quantity for an option key."""

@@ -18,10 +18,10 @@ class SymbolBar(QWidget):
     """Top toolbar with symbol search, mode switch, connection status."""
 
     symbol_changed = pyqtSignal(str)
-    mode_changed = pyqtSignal(str)  # "Paper" or "Live"
+    mode_changed = pyqtSignal(str)  # TradingMode.value: "Paper"/"IBKRPaper"/"Live"
     connect_clicked = pyqtSignal()
     disconnect_clicked = pyqtSignal()
-    reconnect_requested = pyqtSignal(str)  # mode text — hot switch while connected
+    reconnect_requested = pyqtSignal(str)  # mode value — hot switch while connected
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,11 +97,12 @@ class SymbolBar(QWidget):
 
         layout.addSpacing(20)
 
-        # Mode selector
+        # Mode selector — 三种模式, item 文本为中文, data 为 TradingMode.value
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Paper", "Live"])
-        self.mode_combo.setMinimumWidth(80)
-        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+        for mode in (TradingMode.PAPER, TradingMode.IBKR_PAPER, TradingMode.LIVE):
+            self.mode_combo.addItem(mode.label, mode.value)
+        self.mode_combo.setMinimumWidth(110)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         layout.addWidget(QLabel("模式:"))
         layout.addWidget(self.mode_combo)
 
@@ -223,23 +224,24 @@ class SymbolBar(QWidget):
 
     # ── Mode / Connection ─────────────────────────────────────────────
 
-    def _on_mode_changed(self, mode_text):
+    def _on_mode_changed(self, _index=0):
+        mode_value = self.mode_combo.currentData()  # "Paper"/"IBKRPaper"/"Live"
         if self._connected:
-            if mode_text == "Live":
+            if mode_value == TradingMode.LIVE.value:
                 reply = QMessageBox.question(
                     self, "切换到实盘",
-                    "确认切换到实盘模式？\n将断开当前连接并重新连接到实盘端口。",
+                    "确认切换到实盘模式？\n将断开当前连接并重新连接到实盘端口 (真实资金)。",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
                     self.mode_combo.blockSignals(True)
-                    self.mode_combo.setCurrentText("Paper")
+                    self.mode_combo.setCurrentIndex(0)  # 退回本地模拟
                     self.mode_combo.blockSignals(False)
                     return
-            self.reconnect_requested.emit(mode_text)
+            self.reconnect_requested.emit(mode_value)
         else:
-            self.mode_changed.emit(mode_text)
+            self.mode_changed.emit(mode_value)
 
     def _on_connect_clicked(self):
         if self.connect_btn.text() == "连接":
@@ -250,8 +252,7 @@ class SymbolBar(QWidget):
     def set_connected(self, connected: bool, mode: TradingMode = TradingMode.PAPER):
         self._connected = connected
         if connected:
-            mode_text = "模拟" if mode == TradingMode.PAPER else "实盘"
-            self.status_label.setText(f"● 已连接 ({mode_text})")
+            self.status_label.setText(f"● 已连接 ({mode.label})")
             self.status_label.setStyleSheet(f"color: {COLOR_GREEN}; font-weight: bold;")
             self.connect_btn.setText("断开")
             self.connect_btn.setStyleSheet(f"""
@@ -293,8 +294,15 @@ class SymbolBar(QWidget):
     def set_current_option(self, text: str):
         self.current_symbol_label.setText(text)
 
+    def set_symbol(self, symbol: str):
+        """外部跳转标的时同步输入框显示 (不触发搜索弹窗)。"""
+        self.symbol_input.blockSignals(True)
+        self.symbol_input.setText(symbol)
+        self.symbol_input.blockSignals(False)
+        self.symbol_popup.hide()
+
     def get_symbol(self) -> str:
         return self.symbol_input.text().strip().upper()
 
     def get_mode(self) -> TradingMode:
-        return TradingMode.PAPER if self.mode_combo.currentText() == "Paper" else TradingMode.LIVE
+        return TradingMode(self.mode_combo.currentData())

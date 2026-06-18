@@ -14,11 +14,13 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
+from ibapi.execution import ExecutionFilter
 
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 from config import (
     IBKR_HOST, IBKR_PAPER_PORT, IBKR_LIVE_PORT,
+    IBKR_GW_PAPER_PORT, IBKR_GW_LIVE_PORT, USE_GATEWAY,
     IBKR_CLIENT_ID, MARKET_DATA_TYPE, IGNORED_ERROR_CODES,
     DATA_CONNECTION_ERROR_CODES,
     COMMISSION_PER_CONTRACT, COMMISSION_MIN, DEPTH_ROWS,
@@ -63,9 +65,14 @@ class IBKRSignalBridge(QObject):
     # New signals for account, portfolio, depth, pnl
     account_summary_updated = pyqtSignal(str, str, str, str)  # tag, value, currency, account
     account_summary_end = pyqtSignal()
+    # Per-currency cash balances (reqAccountSummary "$LEDGER:ALL")
+    currency_balance_updated = pyqtSignal(str, float)  # currency, cash
+    currency_balances_end = pyqtSignal()
     portfolio_position_received = pyqtSignal(object)  # PortfolioPosition
     portfolio_positions_end = pyqtSignal()
     pnl_updated = pyqtSignal(float, float, float)  # dailyPnL, unrealizedPnL, realizedPnL
+    daily_commission_updated = pyqtSignal(float)   # 今日累计手续费 (USD)
+    computed_daily_pnl = pyqtSignal(float, float)  # 自算今日总盈亏(已扣费), 今日手续费
     depth_updated = pyqtSignal(int, int, int, int, float, int)  # reqId, position, operation, side, price, size
 
     # Historical data signals
@@ -119,6 +126,8 @@ class IBKRApp(EWrapper, EClient):
 
         # Account summary tracking
         self._account_summary_req_id: int | None = None
+        # Per-currency cash ledger tracking ("$LEDGER:ALL")
+        self._ledger_req_id: int | None = None
 
         # PnL tracking
         self._pnl_req_id: int | None = None
@@ -128,6 +137,17 @@ class IBKRApp(EWrapper, EClient):
 
         # Account name (discovered from accountSummary)
         self._account_name: str = ""
+
+        # 自算「今日期权交易总盈亏」(不依赖 IBKR 的 dailyPnL —— 它常为 -- / 未含费)。
+        # 今日盈亏 = 今日成交现金流 + 当前持仓市值 − 今日手续费, 全部按 execId/conId 去重、跨日清零。
+        #   _exec_cf:  execId -> 现金流 (卖 +price*qty*mult, 买 -price*qty*mult)
+        #   _posval:   conId  -> 持仓市值 (来自 reqPnLSingle 的 value, 平仓即移除)
+        #   _comm_by_execid: execId -> 手续费 (commissionReport)
+        # 对当日开平的仓 (0DTE 日内) 精确; 隔夜持仓卖出当天会略偏 (无昨日买入现金流)。
+        self._pnl_day = None
+        self._exec_cf: dict[str, float] = {}
+        self._posval: dict[int, float] = {}
+        self._comm_by_execid: dict[str, float] = {}
 
         # One-time market data warning flag
         self._mkt_data_warned: bool = False
@@ -175,6 +195,12 @@ class IBKRApp(EWrapper, EClient):
             if advancedOrderRejectJson:
                 print(f"[ORDER REJECT] {advancedOrderRejectJson}", flush=True)
 
+        # 161 / 10147 / 10148: 撤单类无害响应 —— 订单已不可撤 (多半已成交或已撤) 或
+        # 找不到。**不是拒单**: 不弹框、不标 ERROR、不写拒单日志 (否则会把刚成交的单
+        # 误显示成"已拒绝")。上面那行 [ORDER ERROR] 已在 app 日志留痕供排查。
+        if errorCode in (161, 10147, 10148):
+            return
+
         # Market data subscription info — show one-time warning then suppress
         if errorCode == 10167:
             if not self._mkt_data_warned:
@@ -205,6 +231,14 @@ class IBKRApp(EWrapper, EClient):
         # 10189: "tick-by-tick data is not supported" (no live subscription)
         # Silently ignore — reqMktData fallback already active
         if errorCode == 10189:
+            return
+
+        # 300: "Can't find EId with tickerId" — cancelMktData on a line that's
+        # already gone (e.g. a snapshot IBKR auto-cancelled, or a double
+        # cancel). Harmless; clean up tracking and don't spam the status bar.
+        if errorCode == 300:
+            self._tick_req_to_key.pop(reqId, None)
+            self._active_mkt_data_reqs.discard(reqId)
             return
 
         # Error 200 on a tick/market-data subscription — contract not found.
@@ -297,6 +331,12 @@ class IBKRApp(EWrapper, EClient):
 
     def tickString(self, reqId, tickType, value):
         pass
+
+    def tickSnapshotEnd(self, reqId):
+        """One-shot snapshot delivered — IBKR已自动取消该订阅, 清掉本地映射。
+        tick 数据保留在 _tick_data[key] 供 GUI 轮询显示。"""
+        self._tick_req_to_key.pop(reqId, None)
+        self._active_mkt_data_reqs.discard(reqId)
 
     def tickGeneric(self, reqId, tickType, value):
         pass
@@ -426,33 +466,77 @@ class IBKRApp(EWrapper, EClient):
         )
 
     def execDetails(self, reqId, contract, execution):
+        # 累计今日成交现金流 (卖 +, 买 −; 含合约乘数), 用于自算今日盈亏。历史回放(reqId≥0)
+        # 与实时成交(reqId=-1)都计入, 按 execId 去重。
+        self._reset_pnl_if_new_day()
+        try:
+            mult = float(contract.multiplier) if contract.multiplier else 100.0
+        except (ValueError, TypeError):
+            mult = 100.0
+        shares = float(execution.shares)
+        price = float(execution.price)
+        sign = 1.0 if execution.side == "SLD" else -1.0   # 卖出进现金 / 买入出现金
+        self._exec_cf[execution.execId] = sign * price * shares * mult
+        self._emit_computed_daily()
+
+        # reqId >= 0 → reqExecutions 的当日历史回放: 不触发成交音/持仓事件, 否则启动时会把
+        # 今天每笔成交的提示音全播一遍。实时成交由 IBKR 以 reqId = -1 推送。
+        if reqId is not None and reqId >= 0:
+            return
         self.bridge.execution_received.emit(
-            execution.orderId,
-            execution.side,
-            float(execution.shares),
-            float(execution.price),
+            execution.orderId, execution.side, shares, price,
         )
 
-    def commissionReport(self, commissionReport):
-        """Handle real commission data from IBKR.
+    def execDetailsEnd(self, reqId):
+        # 当日历史成交拉取完毕 → 推一次自算今日盈亏 (即便今天无成交, 也给出 0 基线)
+        self._emit_computed_daily()
 
-        This arrives after execDetails for each fill.
-        We store it so the engine can update position commissions.
-        """
-        exec_id = commissionReport.execId
+    def commissionReport(self, commissionReport):
+        """累计今日手续费 (按 execId 去重)。每笔成交后到达;`reqExecutions` 连接时也会
+        补发当日历史成交的 commissionReport。汇总后并入自算今日盈亏。"""
         commission = float(commissionReport.commission)
-        if commission < 1e9:  # IBKR sends 1.7976931e+308 for unknown
-            self._last_commission = (exec_id, commission)
-            print(f"[COMMISSION] execId={exec_id} commission=${commission:.2f} "
-                  f"currency={commissionReport.currency}", flush=True)
+        if commission >= 1e9:  # IBKR sends 1.7976931e+308 for unknown
+            return
+        self._reset_pnl_if_new_day()
+        self._comm_by_execid[commissionReport.execId] = commission
+        self._emit_computed_daily()
+
+    # ── 自算今日盈亏 helpers ───────────────────────────────────────────
+
+    def _reset_pnl_if_new_day(self):
+        today = datetime.now().date()
+        if self._pnl_day != today:
+            self._pnl_day = today
+            self._exec_cf.clear()
+            self._posval.clear()
+            self._comm_by_execid.clear()
+
+    def _emit_computed_daily(self):
+        """今日盈亏 = 今日成交现金流 + 当前持仓市值 − 今日手续费 (已扣费)。"""
+        cashflow = sum(self._exec_cf.values())
+        open_val = sum(self._posval.values())
+        comm = sum(self._comm_by_execid.values())
+        total = cashflow + open_val - comm
+        self.bridge.computed_daily_pnl.emit(total, comm)
 
     # ── Account Summary Callbacks ────────────────────────────────────
 
     def accountSummary(self, reqId, account, tag, value, currency):
         self._account_name = account
+        # Ledger request → per-currency cash balances (separate subscription)
+        if reqId == self._ledger_req_id:
+            if tag == "CashBalance" and currency and currency != "BASE":
+                try:
+                    self.bridge.currency_balance_updated.emit(currency, float(value))
+                except (ValueError, TypeError):
+                    pass
+            return
         self.bridge.account_summary_updated.emit(tag, value, currency, account)
 
     def accountSummaryEnd(self, reqId):
+        if reqId == self._ledger_req_id:
+            self.bridge.currency_balances_end.emit()
+            return
         self.bridge.account_summary_end.emit()
 
     # ── Position Callbacks ────────────────────────────────────────────
@@ -473,15 +557,22 @@ class IBKRApp(EWrapper, EClient):
         # For options, IBKR returns avgCost already multiplied by multiplier
         if pp.sec_type == "OPT" and pp.multiplier > 1:
             pp.avg_price = float(avgCost) / pp.multiplier
+        # 平仓 → 从自算盈亏的持仓市值里移除, 避免残留旧市值
+        if pos == 0:
+            self._posval.pop(contract.conId, None)
+            self._emit_computed_daily()
         self.bridge.portfolio_position_received.emit(pp)
 
     def positionEnd(self):
+        self._emit_computed_daily()  # 初始持仓快照完成 → 给出 0 基线 (即便空仓)
         self.bridge.portfolio_positions_end.emit()
 
     # ── PnL Callbacks ─────────────────────────────────────────────────
 
     def pnl(self, reqId, dailyPnL, unrealizedPnL, realizedPnL):
-        # IBKR 对尚未算出的字段推 DBL_MAX (~1.8e308) → 转 NaN, GUI 保留上一次的好值
+        # IBKR 对尚未算出的字段推 DBL_MAX (~1.8e308) → 转 NaN, GUI 保留上一次的好值。
+        # 实测本账户 dailyPnL 常年 DBL_MAX(不可用), 但 unrealized/realized 有效 →
+        # GUI 用 realized+unrealized 兜底算今日盈亏 (见 account_bar.update_daily_pnl)。
         def _clean(v):
             v = float(v)
             return float("nan") if abs(v) > 1e300 else v
@@ -500,6 +591,16 @@ class IBKRApp(EWrapper, EClient):
         def _clean(v):
             v = float(v)
             return float("nan") if abs(v) > 1e300 else v
+
+        # 持仓市值并入自算今日盈亏 (平仓 pos=0 即移除)
+        v_val = float(value)
+        if abs(v_val) < 1e300:
+            self._reset_pnl_if_new_day()
+            if pos == 0:
+                self._posval.pop(con_id, None)
+            else:
+                self._posval[con_id] = v_val
+            self._emit_computed_daily()
 
         self.bridge.pnl_single_updated.emit(
             con_id, float(pos), _clean(dailyPnL),
@@ -584,6 +685,13 @@ class IBKREngine:
         self._orders: dict[int, OrderInfo] = {}
         self._positions: dict[str, PositionInfo] = {}  # key -> PositionInfo
 
+        # Real IBKR positions streamed from reqPositions() — the authoritative
+        # account holdings, including option positions opened in a PRIOR session
+        # (before this process started). _positions above only tracks fills seen
+        # this session, so without this the 平仓 button can't close a position
+        # left over from before a crash/restart. Keyed by position_key.
+        self._ibkr_positions: dict[str, PortfolioPosition] = {}
+
         # Order IDs the user asked to cancel (suppress reject popup for these)
         self._user_cancel_ids: set[int] = set()
 
@@ -602,6 +710,7 @@ class IBKREngine:
         self.bridge.execution_received.connect(self._on_execution)
         self.bridge.open_order_received.connect(self._on_open_order)
         self.bridge.error_received.connect(self._on_order_error)
+        self.bridge.portfolio_position_received.connect(self._on_portfolio_position)
 
     @property
     def is_connected(self) -> bool:
@@ -617,7 +726,29 @@ class IBKREngine:
 
     @property
     def positions(self) -> dict[str, PositionInfo]:
-        return self._positions
+        """真实引擎下**故意返回空** —— 持仓一律走 IBKR API。
+
+        持仓面板改由 `portfolio_position_received`(reqPositions)+ `reqPnLSingle`
+        的真实盈亏渲染(不依赖逐合约行情订阅,Gateway 快照模式下也准);本地按成交
+        累加曾导致幻影持仓/数目对不上,已彻底弃用。点价梯持仓摘要用 `get_position()`
+        (它对当前合约有实时行情)。模拟引擎 `PaperEngine.positions` 仍用本地撮合持仓。
+        """
+        return {}
+
+    def get_position(self, option_key: str) -> "PositionInfo | None":
+        """按合约 key 取单个持仓 (供点价梯摘要), **以 IBKR API 为准**。
+        从 `_ibkr_positions`(reqPositions 真实持仓)构造 PositionInfo;
+        `current_price` 由调用方用实时行情填入后再读 net_pnl。"""
+        pp = self._ibkr_positions.get(option_key)
+        if not pp or pp.sec_type != "OPT" or pp.quantity <= 0:
+            return None
+        opt = OptionInfo(
+            symbol=pp.symbol, expiry=pp.expiry,
+            strike=pp.strike, right=pp.right, con_id=pp.con_id,
+        )
+        return PositionInfo(
+            option=opt, quantity=int(pp.quantity), avg_price=pp.avg_price,
+        )
 
     @property
     def orders(self) -> dict[int, OrderInfo]:
@@ -633,7 +764,12 @@ class IBKREngine:
         self._mode = mode
         if client_id is not None:
             self._client_id = client_id
-        port = IBKR_PAPER_PORT if mode == TradingMode.PAPER else IBKR_LIVE_PORT
+        # 实盘 → live 端口; 两种模拟 (本地 / IBKR模拟盘) → paper 端口。
+        # USE_GATEWAY=1 时走 IB Gateway (4002/4001), 否则 TWS (7496/7497)。
+        if USE_GATEWAY:
+            port = IBKR_GW_LIVE_PORT if mode.is_live_port else IBKR_GW_PAPER_PORT
+        else:
+            port = IBKR_LIVE_PORT if mode.is_live_port else IBKR_PAPER_PORT
 
         # Retry with fallback ids on error 326 (zombie connection / double
         # launch). +10 steps avoid colliding with the other GUI's base id.
@@ -690,6 +826,13 @@ class IBKREngine:
 
         # Fetch existing open orders (from previous session or TWS-placed)
         self._app.reqOpenOrders()
+
+        # 拉当日已成交 → 触发 commissionReport, 补齐今日累计手续费 (供今日盈亏扣费),
+        # 这样重启后也能算上重启前的手续费, 不只本会话。
+        try:
+            self._app.reqExecutions(self._app.next_req_id(), ExecutionFilter())
+        except Exception:
+            pass
 
         # Start heartbeat monitoring
         self._start_heartbeat()
@@ -756,6 +899,7 @@ class IBKREngine:
         """Disconnect from TWS."""
         self._stop_heartbeat()
         self.cancel_account_summary()
+        self.cancel_currency_balances()
         self.cancel_pnl()
         for con_id in list(self._pnl_single_by_conid):
             self.cancel_pnl_single(con_id)
@@ -784,6 +928,7 @@ class IBKREngine:
         time.sleep(1.5)  # Socket cleanup
         self._orders.clear()
         self._positions.clear()
+        self._ibkr_positions.clear()
         return self.connect(mode)
 
     # ── Symbol Search ──────────────────────────────────────────────────
@@ -913,6 +1058,26 @@ class IBKREngine:
         # 正股伪合约无 IV 概念, 保持空 generic tick。
         generic_ticks = "" if option.right == "STK" else "106"
         self._app.reqMktData(req_id, contract, generic_ticks, False, False, [])
+        return req_id
+
+    def snapshot_option_tick(self, option: OptionInfo) -> int:
+        """One-shot 快照报价 (snapshot=True): IBKR 推一次 bid/ask/last/vol 后
+        自动取消, **不占常驻行情线**。数据落到 _tick_data[key], GUI 轮询显示。
+        适合 Gateway 下行情线紧张时按需刷新整条期权链 (用美股快照数据包)。
+        返回 reqId。"""
+        if option.right == "STK":
+            contract = self._make_underlying_contract(option.symbol)
+        else:
+            contract = self._make_option_contract(
+                option.symbol, option.expiry, option.strike, option.right,
+                self._trading_class_for(option.symbol, option.expiry),
+            )
+        req_id = self._app.next_req_id()
+        key = option.to_ibkr_key()
+        self._app._tick_req_to_key[req_id] = key
+        self._app._active_mkt_data_reqs.add(req_id)
+        # snapshot=True 时 IBKR 不接受 generic tick 列表, 必须留空; 快照含 vol。
+        self._app.reqMktData(req_id, contract, "", True, False, [])
         return req_id
 
     def subscribe_stock_tick(self, symbol: str) -> int:
@@ -1076,6 +1241,28 @@ class IBKREngine:
                 pass
             self._app._account_summary_req_id = None
 
+    def request_currency_balances(self):
+        """Subscribe to per-currency cash balances via "$LEDGER:ALL".
+
+        Streams a CashBalance row per held currency (USD/EUR/...). Separate
+        subscription from request_account_summary so the two don't clash.
+        """
+        if not self._app or not self._connected:
+            return
+        self.cancel_currency_balances()
+        req_id = self._app.next_req_id()
+        self._app._ledger_req_id = req_id
+        self._app.reqAccountSummary(req_id, "All", "$LEDGER:ALL")
+
+    def cancel_currency_balances(self):
+        """Cancel the per-currency ledger subscription."""
+        if self._app and self._app._ledger_req_id is not None:
+            try:
+                self._app.cancelAccountSummary(self._app._ledger_req_id)
+            except Exception:
+                pass
+            self._app._ledger_req_id = None
+
     # ── Positions ─────────────────────────────────────────────────────
 
     def request_positions(self):
@@ -1095,16 +1282,24 @@ class IBKREngine:
     # ── PnL ───────────────────────────────────────────────────────────
 
     def request_pnl(self, account: str = ""):
-        """Request daily P&L updates."""
+        """Subscribe to account daily/unrealized P&L (reqPnL).
+
+        **幂等**: reqPnL 是流式订阅, 订一次后 IBKR 持续推送。`account_summary_end`
+        每 3 秒会调一次本方法, 若每次都 cancel+重订, 重订瞬间的初值不稳会让今日/未实现
+        盈亏闪成 0。所以已订阅 (`_pnl_req_id` 非空) 时直接返回, 不再 churn。
+        """
         if not self._app or not self._connected:
             return
+        if self._app._pnl_req_id is not None:
+            return  # 已在流式订阅中, 不重复订
         if not account:
             account = self._app._account_name
         if not account:
+            print("[PNL] request_pnl skipped: 账户名未就绪", flush=True)
             return  # Need account name first
-        self.cancel_pnl()
         req_id = self._app.next_req_id()
         self._app._pnl_req_id = req_id
+        print(f"[PNL] reqPnL 订阅: account={account} reqId={req_id}", flush=True)
         self._app.reqPnL(req_id, account, "")
 
     def cancel_pnl(self):
@@ -1338,11 +1533,11 @@ class IBKREngine:
                        outside_rth: bool = False) -> int:
         """Close entire position with a market sell order. Returns orderId or -1."""
         key = option.to_ibkr_key()
-        pos = self._positions.get(key)
-        if not pos or pos.quantity <= 0:
+        qty = self.get_position_qty(key)
+        if qty <= 0:
             self.bridge.error_received.emit(-1, -1, "无持仓可平")
             return -1
-        return self.place_market_order(option, OrderAction.SELL, pos.quantity,
+        return self.place_market_order(option, OrderAction.SELL, qty,
                                        outside_rth=outside_rth)
 
     def place_forex_order(self, base: str, quote: str, action: str, amount: float):
@@ -1516,49 +1711,32 @@ class IBKREngine:
         elif "error" in status_lower or "inactive" in status_lower:
             order.status = OrderStatus.ERROR
 
+    def _on_portfolio_position(self, pp: PortfolioPosition):
+        """Track the real IBKR option holdings streamed by reqPositions().
+
+        These are the authoritative account positions — crucially they include
+        option positions opened in a prior session (before this process
+        started). _positions only knows about fills seen this session, so this
+        is what lets close_position() / get_position_qty() act on a holding
+        left over from before a crash/restart.
+        """
+        if pp.sec_type != "OPT":
+            return  # stocks/ETFs handled by the panel + stock_trader
+        key = pp.position_key
+        if abs(pp.quantity) > 0:
+            self._ibkr_positions[key] = pp
+        else:
+            self._ibkr_positions.pop(key, None)
+
     def _on_execution(self, order_id: int, side: str,
                       qty: float, price: float):
-        """Handle execution report — update positions."""
-        order = self._orders.get(order_id)
-        if order is None:
-            return
+        """成交回报 —— **不再在本地累加持仓**。
 
-        # Stock fills: skip local tracking (PositionInfo math assumes the
-        # option ×100 multiplier; reqPositions streams the real position)
-        if order.option.right == "STK":
-            self.bridge.position_changed.emit()
-            return
-
-        key = order.option.to_ibkr_key()
-        action_sign = 1 if side == "BOT" or order.action == OrderAction.BUY else -1
-        fill_qty = int(qty) * action_sign
-
-        # Calculate commission for this fill
-        fill_commission = max(COMMISSION_PER_CONTRACT * int(qty), COMMISSION_MIN)
-
-        if key in self._positions:
-            pos = self._positions[key]
-            old_qty = pos.quantity
-            new_qty = old_qty + fill_qty
-
-            if new_qty == 0:
-                del self._positions[key]
-            else:
-                if action_sign > 0 and old_qty >= 0:
-                    # Adding to long position
-                    total_cost = pos.avg_price * old_qty + price * int(qty)
-                    pos.avg_price = total_cost / new_qty
-                pos.quantity = new_qty
-                pos.total_commission += fill_commission
-        else:
-            if fill_qty != 0:
-                self._positions[key] = PositionInfo(
-                    option=order.option,
-                    quantity=fill_qty,
-                    avg_price=price,
-                    total_commission=fill_commission,
-                )
-
+        持仓的唯一真相来自 IBKR API (reqPositions → `_ibkr_positions`,见
+        `positions` 属性)。本地按成交累加曾导致撤单竞态/重复回报下出现幻影持仓、
+        数目对不上。这里只发 `position_changed` 触发界面刷新 —— 真实数量随后由
+        `position()` 回调推来 (亚秒级)。
+        """
         self.bridge.position_changed.emit()
 
     # ── Contract Helpers ──────────────────────────────────────────────
@@ -1738,6 +1916,10 @@ class IBKREngine:
         return order_id
 
     def get_position_qty(self, option_key: str) -> int:
-        """Get current position quantity for an option key."""
-        pos = self._positions.get(option_key)
-        return pos.quantity if pos else 0
+        """持仓数量 **以 IBKR API (reqPositions) 为准**。
+
+        只读 `_ibkr_positions`(真实账户持仓),不再用本地成交跟踪 —— 后者会因
+        撤单竞态/重复回报产生幻影、数目对不上。平仓/撤单类无害响应不影响此处。
+        """
+        pp = self._ibkr_positions.get(option_key)
+        return int(pp.quantity) if pp and pp.quantity > 0 else 0

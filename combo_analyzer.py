@@ -42,7 +42,16 @@ from config import (
     IBKR_COMBO_CLIENT_ID, CHART_TIMEFRAMES, DEFAULT_SYMBOLS,
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_GREEN, COLOR_RED, COLOR_ACCENT, COLOR_BORDER,
+    IBKR_LIVE_PORT, IBKR_PAPER_PORT, IBKR_GW_LIVE_PORT, IBKR_GW_PAPER_PORT,
+    USE_GATEWAY,
 )
+
+
+def _display_port(is_live: bool) -> int:
+    """连接端口 (仅用于状态栏显示); 跟随 USE_GATEWAY 在 TWS/Gateway 间切换。"""
+    if USE_GATEWAY:
+        return IBKR_GW_LIVE_PORT if is_live else IBKR_GW_PAPER_PORT
+    return IBKR_LIVE_PORT if is_live else IBKR_PAPER_PORT
 from models import TradingMode, OptionInfo, ComboLegInfo
 from ibkr_engine import IBKREngine
 from single_instance import kill_previous_instances
@@ -458,8 +467,8 @@ class ComboAnalyzerWindow(QMainWindow):
             try:
                 ok = self.engine.connect(mode, client_id=IBKR_COMBO_CLIENT_ID)
                 if not ok:
-                    port = 7496 if mode.is_live_port else 7497
-                    self._status.emit(f"连接失败 — 确认 {mode.label} TWS 已登录并监听 {port}")
+                    port = _display_port(mode.is_live_port)
+                    self._status.emit(f"连接失败 — 确认 {mode.label} TWS/Gateway 已登录并监听 {port}")
                     self._combo_error.emit("")  # 仅用于复位按钮
             except Exception as e:
                 self._status.emit(f"连接异常: {e}")
@@ -477,7 +486,7 @@ class ComboAnalyzerWindow(QMainWindow):
         for g in self._groups:
             self._subscribe_group_legs(g)
         label = getattr(self, "_mode", TradingMode.IBKR_PAPER).label
-        port = 7496 if getattr(self, "_mode", TradingMode.IBKR_PAPER).is_live_port else 7497
+        port = _display_port(getattr(self, "_mode", TradingMode.IBKR_PAPER).is_live_port)
         self.setWindowTitle(f"IBKR 期权组合分析器 — {label}")
         self.statusBar().showMessage(
             f"已连接 {label} (端口 {port}, clientId=12) — 点击「加载期权链」"

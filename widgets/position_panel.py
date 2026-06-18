@@ -14,7 +14,7 @@ from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush
 
 from config import COLOR_GREEN, COLOR_RED, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT, COLOR_BG_DARK, COLOR_BORDER
-from models import PositionInfo, PortfolioPosition
+from models import PositionInfo, PortfolioPosition, OptionInfo
 
 
 class PositionPanel(QWidget):
@@ -189,6 +189,7 @@ class PositionPanel(QWidget):
                 "pnl_pct": pos.net_pnl_pct,
                 "commission": pos.total_commission,
                 "daily": None,  # engine-tracked options: no daily PnL feed
+                "has_pnl": True,  # 本地撮合持仓盈亏即时可算
                 "option": pos.option,
                 "key": key,
             }
@@ -216,6 +217,7 @@ class PositionPanel(QWidget):
                 "pnl_pct": pp.pnl_pct,
                 "commission": 0,  # IBKR portfolio positions don't track commission locally
                 "daily": pp.daily_pnl if pp.has_pnl_data else None,
+                "has_pnl": pp.has_pnl_data,  # API 持仓: reqPnLSingle 到达前显示"--"而非 0
                 "option": None,
                 "key": key,
             }
@@ -243,8 +245,11 @@ class PositionPanel(QWidget):
             # Avg price
             self._set_cell(row_idx, 3, f"${data['avg_price']:.2f}", COLOR_TEXT)
 
-            # Portfolio rows before PnL data arrives — show "--", not $0.00
-            if data["sec_type"] != "OPT" and data["current_price"] <= 0:
+            # 盈亏数据未到达前 — 显示 "--" 而非误导性的 $0.00 (含 API 期权持仓在
+            # reqPnLSingle 到达前; 以及正股/ETF 行情未到时)
+            if not data.get("has_pnl", True) or (
+                data["sec_type"] != "OPT" and data["current_price"] <= 0
+            ):
                 for col in (4, 5, 6, 7, 8):
                     self._set_cell(row_idx, col, "--", COLOR_TEXT_DIM)
                 self.table.setRowHeight(row_idx, 28)
@@ -325,7 +330,17 @@ class PositionPanel(QWidget):
 
         for key, pp in self._portfolio_positions.items():
             if key not in {r["key"] for r in rows_data}:
-                rows_data.append({"option": None, "sec_type": pp.sec_type, "key": key})
+                # Build an OptionInfo so double-clicking an option held from a
+                # prior session (only known via reqPositions) opens the ladder
+                # and lets the user close it. Stocks/ETFs stay None (handled
+                # by the dedicated stock trader).
+                opt = None
+                if pp.sec_type == "OPT":
+                    opt = OptionInfo(
+                        symbol=pp.symbol, expiry=pp.expiry,
+                        strike=pp.strike, right=pp.right, con_id=pp.con_id,
+                    )
+                rows_data.append({"option": opt, "sec_type": pp.sec_type, "key": key})
 
         # Apply same filter
         if self._current_filter == "期权":

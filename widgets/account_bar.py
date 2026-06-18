@@ -1,5 +1,7 @@
 """Account summary bar — displays portfolio value, cash, buying power, P&L."""
 
+import math
+
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QPushButton, QFrame,
 )
@@ -165,23 +167,27 @@ class AccountBar(QWidget):
             self._realized_pnl = val
 
     def update_daily_pnl(self, daily: float, unrealized: float, realized: float):
-        """Handle pnl_updated signal."""
-        self._daily_pnl = daily
-        color = COLOR_GREEN if daily >= 0 else COLOR_RED
-        sign = "+" if daily >= 0 else ""
-        self.daily_pnl_label.setText(f"今日盈亏: {sign}${daily:,.2f}")
-        self.daily_pnl_label.setStyleSheet(
-            f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
-        )
+        """Handle pnl_updated signal.
+        NaN 字段表示 IBKR 本次未提供该值 (原 DBL_MAX), 跳过以保留上一次的好值,
+        避免今日盈亏 / 未实现盈亏闪烁成无效值。"""
+        if not math.isnan(daily):
+            self._daily_pnl = daily
+            color = COLOR_GREEN if daily >= 0 else COLOR_RED
+            sign = "+" if daily >= 0 else ""
+            self.daily_pnl_label.setText(f"今日盈亏: {sign}${daily:,.2f}")
+            self.daily_pnl_label.setStyleSheet(
+                f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
+            )
 
         # Also update unrealized from PnL stream
-        self._unrealized_pnl = unrealized
-        u_color = COLOR_GREEN if unrealized >= 0 else COLOR_RED
-        u_sign = "+" if unrealized >= 0 else ""
-        self.unrealized_label.setText(f"未实现盈亏: {u_sign}${unrealized:,.2f}")
-        self.unrealized_label.setStyleSheet(
-            f"color: {u_color}; font-size: 12px; font-weight: bold; border: none;"
-        )
+        if not math.isnan(unrealized):
+            self._unrealized_pnl = unrealized
+            u_color = COLOR_GREEN if unrealized >= 0 else COLOR_RED
+            u_sign = "+" if unrealized >= 0 else ""
+            self.unrealized_label.setText(f"未实现盈亏: {u_sign}${unrealized:,.2f}")
+            self.unrealized_label.setStyleSheet(
+                f"color: {u_color}; font-size: 12px; font-weight: bold; border: none;"
+            )
 
     def _refresh(self):
         """Periodically re-request account summary."""

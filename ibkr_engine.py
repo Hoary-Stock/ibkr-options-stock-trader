@@ -481,8 +481,12 @@ class IBKRApp(EWrapper, EClient):
     # ── PnL Callbacks ─────────────────────────────────────────────────
 
     def pnl(self, reqId, dailyPnL, unrealizedPnL, realizedPnL):
+        # IBKR 对尚未算出的字段推 DBL_MAX (~1.8e308) → 转 NaN, GUI 保留上一次的好值
+        def _clean(v):
+            v = float(v)
+            return float("nan") if abs(v) > 1e300 else v
         self.bridge.pnl_updated.emit(
-            float(dailyPnL), float(unrealizedPnL), float(realizedPnL)
+            _clean(dailyPnL), _clean(unrealizedPnL), _clean(realizedPnL)
         )
 
     def pnlSingle(self, reqId, pos, dailyPnL, unrealizedPnL,
@@ -491,10 +495,11 @@ class IBKRApp(EWrapper, EClient):
         if con_id is None:
             return
 
-        # IBKR sends DBL_MAX for unset fields
+        # IBKR 对尚未算出的字段推 DBL_MAX (~1.8e308)。这些字段是「本次无效」,
+        # 而非真的 0 —— 转成 NaN, 让 GUI 保留上一次的好值, 避免盈亏闪烁成 0。
         def _clean(v):
             v = float(v)
-            return 0.0 if abs(v) > 1e300 else v
+            return float("nan") if abs(v) > 1e300 else v
 
         self.bridge.pnl_single_updated.emit(
             con_id, float(pos), _clean(dailyPnL),

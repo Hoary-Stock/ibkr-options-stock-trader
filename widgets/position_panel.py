@@ -4,6 +4,8 @@ Supports option positions (from engine) and IBKR portfolio positions
 (stocks/ETFs via portfolio_position_received signal).
 """
 
+import math
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QLabel, QComboBox,
@@ -124,17 +126,26 @@ class PositionPanel(QWidget):
 
     def on_pnl_single(self, con_id: int, qty: float, daily_pnl: float,
                       unrealized_pnl: float, value: float):
-        """Handle reqPnLSingle update — fill in market data for the position."""
+        """Handle reqPnLSingle update — fill in market data for the position.
+        NaN 字段表示 IBKR 本次未提供该值 (原 DBL_MAX), 跳过以保留上一次的好值,
+        避免未实现盈亏 / 今日盈亏偶尔闪烁成 0。"""
         for pp in self._portfolio_positions.values():
             if pp.con_id == con_id:
-                pp.daily_pnl = daily_pnl
-                pp.unrealized_pnl = unrealized_pnl
-                pp.market_value = value
-                if pp.quantity and pp.multiplier:
-                    pp.market_price = abs(
-                        value / (pp.quantity * pp.multiplier)
-                    )
-                pp.has_pnl_data = True
+                got_any = False
+                if not math.isnan(daily_pnl):
+                    pp.daily_pnl = daily_pnl
+                    got_any = True
+                if not math.isnan(unrealized_pnl):
+                    pp.unrealized_pnl = unrealized_pnl
+                    got_any = True
+                if not math.isnan(value):
+                    pp.market_value = value
+                    if pp.quantity and pp.multiplier:
+                        pp.market_price = abs(
+                            value / (pp.quantity * pp.multiplier)
+                        )
+                if got_any:
+                    pp.has_pnl_data = True
                 break
 
     def on_portfolio_positions_end(self):

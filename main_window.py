@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QTabWidget, QMessageBox, QStatusBar,
     QPushButton, QLabel, QApplication,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent, QSettings
 
 from config import (
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT,
@@ -137,8 +137,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IBKR 点价交易")
-        self.setMinimumSize(1200, 800)
+        # 较小的最小尺寸 → 窗口可上下左右自由缩放; 实际大小由 _restore_layout 恢复
+        self.setMinimumSize(900, 600)
         self.resize(1400, 900)
+
+        # 记忆窗口大小与各 splitter 分割位置 (跨会话持久化)
+        self._settings = QSettings("MoneyTrader", "ibkr_options_gui")
 
         # Engines
         self.ibkr_engine = IBKREngine()
@@ -166,6 +170,9 @@ class MainWindow(QMainWindow):
         self._session_timer.timeout.connect(self._update_session_indicator)
         self._session_timer.start(10_000)
         self._update_session_indicator()
+
+        # 恢复上次的窗口大小与各分割位置 (若有)
+        self._restore_layout()
 
     def _build_ui(self):
         central = QWidget()
@@ -249,12 +256,24 @@ class MainWindow(QMainWindow):
         self.calculator = OptionCalculator()
         self.right_splitter.addWidget(self.calculator)
         self.right_splitter.setSizes([520, 300])
+        # 右侧竖向: 持仓/委托 Tab 主要吸收增长, 计算器小幅跟随
+        self.right_splitter.setStretchFactor(0, 5)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setChildrenCollapsible(False)
         self.bottom_splitter.addWidget(self.right_splitter)
 
         self.bottom_splitter.setSizes([380, 500])
+        # 下方横向: 点价梯与右侧面板按 4:5 比例联动缩放
+        self.bottom_splitter.setStretchFactor(0, 4)
+        self.bottom_splitter.setStretchFactor(1, 5)
+        self.bottom_splitter.setChildrenCollapsible(False)
         self.main_splitter.addWidget(self.bottom_splitter)
 
         self.main_splitter.setSizes([400, 400])
+        # 主竖向: 期权链与下方区域等比例联动缩放
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setChildrenCollapsible(False)
         main_layout.addWidget(self.main_splitter)
 
     def _connect_signals(self):
@@ -751,6 +770,9 @@ class MainWindow(QMainWindow):
             self.bottom_splitter.insertWidget(0, placeholder)
 
         self.bottom_splitter.setSizes([500, 380])
+        # insertWidget 会把新 index0 的 stretch 重置, 重新设回比例联动
+        self.bottom_splitter.setStretchFactor(0, 4)
+        self.bottom_splitter.setStretchFactor(1, 5)
         self._ladder_window.show()
 
     def _on_reattach_ladder(self):
@@ -777,6 +799,9 @@ class MainWindow(QMainWindow):
         self.price_ladder.setParent(None)
         self.bottom_splitter.insertWidget(0, self.price_ladder)
         self.bottom_splitter.setSizes([380, 500])
+        # 重新设回 stretch (insertWidget 重置了 index0 的 stretch factor)
+        self.bottom_splitter.setStretchFactor(0, 4)
+        self.bottom_splitter.setStretchFactor(1, 5)
 
         # Reset state
         self.price_ladder.detach_btn.setText("弹出")
@@ -898,6 +923,32 @@ class MainWindow(QMainWindow):
 
     # ── Cleanup ───────────────────────────────────────────────────────
 
+    # ── Layout persistence ────────────────────────────────────────────
+
+    def _layout_splitters(self):
+        """(name, splitter) 对, 用于保存/恢复各分割位置。"""
+        return (
+            ("main", self.main_splitter),
+            ("bottom", self.bottom_splitter),
+            ("right", self.right_splitter),
+        )
+
+    def _restore_layout(self):
+        """恢复上次会话的窗口几何与各 splitter 分割位置 (首次运行则用默认值)。"""
+        geo = self._settings.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        for name, splitter in self._layout_splitters():
+            state = self._settings.value(f"splitter/{name}")
+            if state is not None:
+                splitter.restoreState(state)
+
+    def _save_layout(self):
+        """保存当前窗口几何与各 splitter 分割位置。"""
+        self._settings.setValue("geometry", self.saveGeometry())
+        for name, splitter in self._layout_splitters():
+            self._settings.setValue(f"splitter/{name}", splitter.saveState())
+
     def closeEvent(self, event):
         # Stop session timer
         self._session_timer.stop()
@@ -905,6 +956,9 @@ class MainWindow(QMainWindow):
         # Reattach ladder if detached (cleans up embedded chart too)
         if self._ladder_detached:
             self._on_reattach_ladder()
+
+        # Persist window size + splitter positions (ladder is reattached by now)
+        self._save_layout()
 
         # Close all chart windows
         for chart in list(self._chart_windows):

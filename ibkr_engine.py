@@ -1003,6 +1003,58 @@ class IBKREngine:
                 pass
             self._app._hist_data.pop(req_id, None)
 
+    def request_option_historical_data(
+        self, symbol: str, expiry: str, strike: float, right: str,
+        bar_size: str, duration: str, what_to_show: str = "TRADES",
+        timeout: float = 30, end_date_time: str = "",
+    ) -> list[dict]:
+        """期权合约历史 K 线 (阻塞)。返回 bars: [{date, open, high, low, close, volume, ...}]。
+        date 为 epoch 秒字符串 (formatDate=2), 便于多腿按时间戳对齐与绘图。
+        what_to_show: TRADES / MIDPOINT / BID / ASK (期权流动性差时 MIDPOINT 更连续)。
+        组合分析器为每条腿调用本方法, 再把各腿 close 按时间合成组合价。"""
+        if not self._app or not self._connected:
+            raise RuntimeError("Not connected")
+
+        contract = self._make_option_contract(
+            symbol, expiry, strike, right,
+            self._trading_class_for(symbol, expiry),
+        )
+        req_id = self._app.next_req_id()
+        self._app._hist_data[req_id] = {
+            "bars": [], "event": threading.Event(), "error": None,
+        }
+        self._app.reqHistoricalData(
+            reqId=req_id,
+            contract=contract,
+            endDateTime=end_date_time,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=0,
+            formatDate=2,           # epoch seconds — easy cross-leg alignment
+            keepUpToDate=False,
+            chartOptions=[],
+        )
+
+        state = self._app._hist_data[req_id]
+        label = f"{symbol} {expiry} {strike:g}{right}"
+        if not state["event"].wait(timeout=timeout):
+            try:
+                self._app.cancelHistoricalData(req_id)
+            except Exception:
+                pass
+            self._app._hist_data.pop(req_id, None)
+            raise RuntimeError(f"Timeout requesting historical data: {label}")
+
+        if state["error"]:
+            code, msg = state["error"]
+            self._app._hist_data.pop(req_id, None)
+            raise RuntimeError(f"Historical data error {label}: code={code} {msg}")
+
+        bars = state["bars"]
+        self._app._hist_data.pop(req_id, None)
+        return bars
+
     # ── Account Summary ──────────────────────────────────────────────
 
     def request_account_summary(self):

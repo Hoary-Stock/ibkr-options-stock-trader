@@ -8,6 +8,7 @@ IBKR_GW_PAPER_PORT = 4001
 IBKR_GW_LIVE_PORT = 4002
 IBKR_CLIENT_ID = 10        # Options GUI (avoid collision with tradebot=1,2)
 IBKR_STOCK_CLIENT_ID = 11  # Stock trader client (stock_trader.py)
+IBKR_COMBO_CLIENT_ID = 12  # Combo analyzer (combo_analyzer.py)
 
 # ── Market Data ──────────────────────────────────────────────────────
 MARKET_DATA_TYPE = 1  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen

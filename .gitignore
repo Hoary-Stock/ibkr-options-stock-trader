@@ -5,8 +5,9 @@ __pycache__/
 .venv/
 venv/
 
-# 运行时生成 (日志 / 拒单记录)
+# 运行时生成 (日志 / 拒单记录 / 组合持仓分组)
 logs/
+combo_positions.json
 
 # 编辑器 / OS
 .vscode/

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时生成 (日志 / 拒单记录)
+logs/
+
+# 编辑器 / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

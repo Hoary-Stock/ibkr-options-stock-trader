@@ -122,9 +122,9 @@ class ComboAnalyzerWindow(QMainWindow):
         self._rebuild_params()
         self._refresh_positions_table()
 
-        # 实时刷新组合持仓的现价/盈亏
+        # 实时刷新: 当前组合各腿最新价 + 已有组合持仓的现价/盈亏
         self._pos_timer = QTimer(self)
-        self._pos_timer.timeout.connect(self._refresh_positions_live)
+        self._pos_timer.timeout.connect(self._periodic_refresh)
         self._pos_timer.start(1000)
 
         # 当日组合价录制定时器 (默认停止)
@@ -893,6 +893,52 @@ class ComboAnalyzerWindow(QMainWindow):
             cl.addWidget(add_btn)
             self.pos_table.setCellWidget(i, 6, cell)
         self._refresh_positions_live()
+
+    def _periodic_refresh(self):
+        self._refresh_legs_live()
+        self._refresh_positions_live()
+
+    def _refresh_legs_live(self):
+        """连接后, 持续把当前组合各腿的实时盘口中价填进腿表「最新价」列,
+        并实时显示组合净价 —— 不必先点「计算」或「录制」。"""
+        if self._recording or not self.engine.is_connected:
+            return  # 录制时由 _record_sample 负责
+        legs = self._gather_legs()
+        if not legs or any(not l["strike"] or not l["expiry"] for l in legs):
+            return
+        symbol = self.symbol_input.currentText().strip().upper()
+        prices, complete = [], True
+        for i, l in enumerate(legs):
+            opt = OptionInfo(symbol=symbol, expiry=l["expiry"],
+                             strike=l["strike"], right=l["right"])
+            key = opt.to_ibkr_key()
+            if key not in self._subscribed_keys:
+                try:
+                    self.engine.subscribe_option_tick(opt)
+                    self._subscribed_keys.add(key)
+                except Exception:
+                    pass
+            tick = self.engine.get_tick(key) or {}
+            bid = tick.get("bid", 0) or 0
+            ask = tick.get("ask", 0) or 0
+            last = tick.get("last", 0) or 0
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+            prices.append(mid)
+            if i < self.legs_table.rowCount():
+                self.legs_table.setItem(
+                    i, 4, QTableWidgetItem(f"{mid:.2f}" if mid > 0 else "等待行情…")
+                )
+            if mid <= 0:
+                complete = False
+        if complete:
+            net = combo_price_from_prices(legs, prices)
+            kind = "净借记 (买入成本)" if net > 0 else "净贷记 (收取权利金)"
+            color = COLOR_RED if net > 0 else COLOR_GREEN
+            self.summary_label.setText(
+                f"当前组合净价: <span style='color:{color}'>${abs(net):.2f}</span> / 组  ({kind})"
+            )
+            if self.limit_spin.value() == 0:
+                self.limit_spin.setValue(round(net, 2))
 
     def _refresh_positions_live(self):
         for i, g in enumerate(self._groups):

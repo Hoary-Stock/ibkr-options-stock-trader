@@ -12,6 +12,7 @@
 import os
 import sys
 import json
+import time
 import threading
 from datetime import datetime
 
@@ -91,6 +92,12 @@ class ComboAnalyzerWindow(QMainWindow):
         self._plot_widget = None       # 延迟创建 (pyqtgraph)
         self._curve = None
 
+        # 实时录制当日组合价 (用各腿实时盘口合成, 不依赖历史行情权限)
+        self._recording = False
+        self._record_series: list[dict] = []
+        self._record_legs: list[dict] = []
+        self._record_symbol = ""
+
         # 组合持仓 (原子组, 只整组平仓/加仓; 持久化以便重启恢复 —— IBKR 不保留组合分组)
         self._groups_file = os.path.join(_APP_DIR, "combo_positions.json")
         self._groups: list[dict] = self._load_groups()
@@ -119,6 +126,10 @@ class ComboAnalyzerWindow(QMainWindow):
         self._pos_timer = QTimer(self)
         self._pos_timer.timeout.connect(self._refresh_positions_live)
         self._pos_timer.start(1000)
+
+        # 当日组合价录制定时器 (默认停止)
+        self._record_timer = QTimer(self)
+        self._record_timer.timeout.connect(self._record_sample)
 
         self.statusBar().showMessage("就绪 — 点击「连接」后加载期权链")
 
@@ -227,6 +238,14 @@ class ComboAnalyzerWindow(QMainWindow):
         self.compute_btn.clicked.connect(self._on_compute)
         self.compute_btn.setEnabled(False)
         ctrl2.addWidget(self.compute_btn)
+
+        self.record_btn = QPushButton("▶ 录制当日")
+        self.record_btn.setToolTip(
+            "用各腿实时盘口中价每隔几秒合成组合净价, 累积成当日曲线。\n"
+            "不依赖历史行情权限 — 只要有实时行情即可。"
+        )
+        self.record_btn.clicked.connect(self._toggle_record)
+        ctrl2.addWidget(self.record_btn)
         ctrl2.addStretch(1)
         root.addLayout(ctrl2)
 
@@ -569,6 +588,67 @@ class ComboAnalyzerWindow(QMainWindow):
         if msg:
             self.statusBar().showMessage(f"计算失败: {msg}")
 
+    # ── 实时录制当日组合价 (零历史权限) ──────────────────────────────────
+
+    def _toggle_record(self):
+        if self._recording:
+            self._record_timer.stop()
+            self._recording = False
+            self.record_btn.setText("▶ 录制当日")
+            self.statusBar().showMessage(
+                f"已停止录制 — 当日已采集 {len(self._record_series)} 个点"
+            )
+            return
+        if not self.engine.is_connected:
+            self.statusBar().showMessage("未连接")
+            return
+        legs = self._gather_legs()
+        if not legs or any(not l["strike"] or not l["expiry"] for l in legs):
+            self.statusBar().showMessage("请先填好各腿行权价与到期 (可点「自动填行权价」)")
+            return
+        self._record_symbol = self.symbol_input.currentText().strip().upper()
+        self._record_legs = [dict(l) for l in legs]
+        self._record_series = []
+        # 订阅各腿实时行情
+        for l in self._record_legs:
+            opt = OptionInfo(symbol=self._record_symbol, expiry=l["expiry"],
+                             strike=l["strike"], right=l["right"])
+            key = opt.to_ibkr_key()
+            if key not in self._subscribed_keys:
+                try:
+                    self.engine.subscribe_option_tick(opt)
+                    self._subscribed_keys.add(key)
+                except Exception:
+                    pass
+        self._recording = True
+        self.record_btn.setText("■ 停止录制")
+        self.statusBar().showMessage("录制当日组合价中... (每 2 秒采样一次)")
+        self._record_timer.start(2000)
+
+    def _record_sample(self):
+        """采样一次: 各腿实时盘口中价 → 组合净价, 追加并实时画出。"""
+        prices = []
+        for l in self._record_legs:
+            opt = OptionInfo(symbol=self._record_symbol, expiry=l["expiry"],
+                             strike=l["strike"], right=l["right"])
+            tick = self.engine.get_tick(opt.to_ibkr_key()) or {}
+            bid = tick.get("bid", 0) or 0
+            ask = tick.get("ask", 0) or 0
+            last = tick.get("last", 0) or 0
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+            if mid <= 0:
+                return  # 某腿暂无报价 — 跳过本次采样
+            prices.append(mid)
+        net = combo_price_from_prices(self._record_legs, prices)
+        self._record_series.append({"date": str(time.time()), "price": net})
+        self._plot_series(self._record_series)
+        kind = "净借记" if net > 0 else "净贷记"
+        color = COLOR_RED if net > 0 else COLOR_GREEN
+        self.summary_label.setText(
+            f"当日实时组合净价: <span style='color:{color}'>${abs(net):.2f}</span> / 组 "
+            f"({kind}, {len(self._record_series)} 点)"
+        )
+
     # ── 绘图 (pyqtgraph 延迟导入) ─────────────────────────────────────────
 
     def _ensure_plot(self):
@@ -860,6 +940,7 @@ class ComboAnalyzerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._pos_timer.stop()
+        self._record_timer.stop()
         self._save_groups()
         if self.engine.is_connected:
             self.engine.disconnect()

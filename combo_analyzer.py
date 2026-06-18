@@ -180,6 +180,15 @@ class ComboAnalyzerWindow(QMainWindow):
         self.symbol_input.setMinimumWidth(110)
         top.addWidget(self.symbol_input)
 
+        # 模式: 组合下单只能走真实 IBKR 引擎 (本地模拟不支持组合), 故仅 IBKR模拟盘 / 实盘。
+        # 默认 IBKR模拟盘 (7497), 测试下单不动真钱。
+        top.addWidget(QLabel("模式:"))
+        self.mode_combo = QComboBox()
+        for mode in (TradingMode.IBKR_PAPER, TradingMode.LIVE):
+            self.mode_combo.addItem(mode.label, mode.value)
+        self.mode_combo.setMinimumWidth(110)
+        top.addWidget(self.mode_combo)
+
         self.connect_btn = QPushButton("连接")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
         top.addWidget(self.connect_btn)
@@ -432,14 +441,25 @@ class ComboAnalyzerWindow(QMainWindow):
         if self.engine.is_connected:
             self.engine.disconnect()
             return
+        mode = TradingMode(self.mode_combo.currentData())
+        if mode is TradingMode.LIVE:
+            if QMessageBox.question(
+                self, "切换到实盘",
+                "确认连接【实盘】(端口 7496, 真实资金)?\n组合下单将动用真钱。",
+                QMessageBox.Ok | QMessageBox.Cancel,
+            ) != QMessageBox.Ok:
+                return
+        self._mode = mode
         self.connect_btn.setEnabled(False)
-        self.statusBar().showMessage("连接中...")
+        self.mode_combo.setEnabled(False)
+        self.statusBar().showMessage(f"连接中... ({mode.label})")
 
         def do_connect():
             try:
-                ok = self.engine.connect(TradingMode.LIVE, client_id=IBKR_COMBO_CLIENT_ID)
+                ok = self.engine.connect(mode, client_id=IBKR_COMBO_CLIENT_ID)
                 if not ok:
-                    self._status.emit("连接失败 — 检查 TWS 是否运行")
+                    port = 7496 if mode.is_live_port else 7497
+                    self._status.emit(f"连接失败 — 确认 {mode.label} TWS 已登录并监听 {port}")
                     self._combo_error.emit("")  # 仅用于复位按钮
             except Exception as e:
                 self._status.emit(f"连接异常: {e}")
@@ -456,11 +476,17 @@ class ComboAnalyzerWindow(QMainWindow):
         # 恢复已有组合持仓的各腿行情订阅 (重启后实时盈亏可用)
         for g in self._groups:
             self._subscribe_group_legs(g)
-        self.statusBar().showMessage("已连接 (clientId=12) — 点击「加载期权链」")
+        label = getattr(self, "_mode", TradingMode.IBKR_PAPER).label
+        port = 7496 if getattr(self, "_mode", TradingMode.IBKR_PAPER).is_live_port else 7497
+        self.setWindowTitle(f"IBKR 期权组合分析器 — {label}")
+        self.statusBar().showMessage(
+            f"已连接 {label} (端口 {port}, clientId=12) — 点击「加载期权链」"
+        )
 
     def _on_disconnected(self):
         self.connect_btn.setText("连接")
         self.connect_btn.setEnabled(True)
+        self.mode_combo.setEnabled(True)
         self.load_chain_btn.setEnabled(False)
         self.compute_btn.setEnabled(False)
         self.today_btn.setEnabled(False)
@@ -601,6 +627,8 @@ class ComboAnalyzerWindow(QMainWindow):
         self.compute_btn.setEnabled(self.engine.is_connected)
         self.today_btn.setEnabled(self.engine.is_connected)
         self.connect_btn.setEnabled(True)
+        if not self.engine.is_connected:
+            self.mode_combo.setEnabled(True)   # 连接失败时恢复模式选择
         if msg:
             self.statusBar().showMessage(f"计算失败: {msg}")
 

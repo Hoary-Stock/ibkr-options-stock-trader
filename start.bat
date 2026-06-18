@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start "" python main.py
+start "" pythonw main.py

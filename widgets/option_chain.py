@@ -41,6 +41,12 @@ class OptionChainWidget(QWidget):
         self._range_buckets: dict[str, list[str]] = {}  # range_name -> [expirations]
         self._active_range: str = ""
 
+        # Cached brushes — reused every refresh instead of allocating a new
+        # QBrush/QColor per cell per second.
+        self._brush_text = QBrush(QColor(COLOR_TEXT))
+        self._brush_bid = QBrush(QColor(COLOR_GREEN))
+        self._brush_ask = QBrush(QColor(COLOR_RED))
+
         self._build_ui()
 
         # Refresh timer
@@ -420,23 +426,38 @@ class OptionChainWidget(QWidget):
                 bid = tick.get("bid", 0)
                 ask = tick.get("ask", 0)
                 last = tick.get("last", 0)
+                volume = tick.get("volume", 0)
 
                 if right == "C":
                     cols = (0, 1, 2)  # bid, ask, last
+                    vol_col = 3
                 else:
                     cols = (5, 6, 7)  # bid, ask, last
+                    vol_col = 8
 
                 for ci, val in zip(cols, (bid, ask, last)):
                     item = table.item(row, ci)
                     if item and val > 0:
-                        item.setText(f"{val:.2f}")
-                        item.setForeground(QBrush(QColor(COLOR_TEXT)))
+                        text = f"{val:.2f}"
+                        if item.text() != text:   # skip unchanged cells (no repaint)
+                            item.setText(text)
+                            # Color code: green bid, red ask, default for last.
+                            # Only set when text changes — the cached brushes
+                            # avoid per-tick QBrush/QColor allocation.
+                            if ci in (0, 5):    # bid
+                                item.setForeground(self._brush_bid)
+                            elif ci in (1, 6):  # ask
+                                item.setForeground(self._brush_ask)
+                            else:
+                                item.setForeground(self._brush_text)
 
-                        # Color code: green bid, red ask
-                        if ci in (0, 5):  # bid
-                            item.setForeground(QBrush(QColor(COLOR_GREEN)))
-                        elif ci in (1, 6):  # ask
-                            item.setForeground(QBrush(QColor(COLOR_RED)))
+                # Volume column (was never rendered before)
+                vol_item = table.item(row, vol_col)
+                if vol_item and volume > 0:
+                    vtext = str(int(volume))
+                    if vol_item.text() != vtext:
+                        vol_item.setText(vtext)
+                        vol_item.setForeground(self._brush_text)
 
                 # Update the OptionInfo
                 opt = self._options.get(key)

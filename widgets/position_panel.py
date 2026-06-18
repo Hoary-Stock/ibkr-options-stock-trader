@@ -20,14 +20,19 @@ class PositionPanel(QWidget):
 
     position_clicked = pyqtSignal(object)  # OptionInfo — double-click to open ladder
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_filter: str = "期权"):
         super().__init__(parent)
         self._engine = None
 
         # IBKR portfolio positions (stocks, ETFs, options from reqPositions)
         self._portfolio_positions: dict[str, PortfolioPosition] = {}
 
-        self._current_filter = "全部"
+        # Default filter: main app shows options only (user preference);
+        # the stock trader client passes "正股/ETF"
+        self._current_filter = default_filter
+
+        # Cached brushes — avoid allocating a QBrush/QColor per cell per second
+        self._brush_cache: dict[str, QBrush] = {}
 
         self._build_ui()
 
@@ -51,6 +56,7 @@ class PositionPanel(QWidget):
         # Filter combo
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["全部", "期权", "正股/ETF"])
+        self.filter_combo.setCurrentText(self._current_filter)
         self.filter_combo.setFixedWidth(100)
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         self.filter_combo.setStyleSheet(f"""
@@ -67,7 +73,7 @@ class PositionPanel(QWidget):
 
         layout.addLayout(top_layout)
 
-        headers = ["类型", "合约", "数量", "均价", "市价", "市值", "盈亏", "盈亏%"]
+        headers = ["类型", "合约", "数量", "均价", "市价", "市值", "今日盈亏", "盈亏(含费)", "盈亏%"]
         self.table = QTableWidget(0, len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.verticalHeader().setVisible(False)
@@ -95,9 +101,41 @@ class PositionPanel(QWidget):
         """Handle portfolio_position_received signal from IBKR."""
         key = pos.position_key
         if abs(pos.quantity) > 0:
+            # Keep PnL data already received for this position
+            old = self._portfolio_positions.get(key)
+            if old is not None and old.has_pnl_data:
+                pos.daily_pnl = old.daily_pnl
+                pos.unrealized_pnl = old.unrealized_pnl
+                pos.market_price = old.market_price
+                pos.market_value = old.market_value
+                pos.has_pnl_data = True
             self._portfolio_positions[key] = pos
+            self._subscribe_pnl_single(pos)
         else:
+            if self._engine and hasattr(self._engine, "cancel_pnl_single"):
+                self._engine.cancel_pnl_single(pos.con_id)
             self._portfolio_positions.pop(key, None)
+
+    def _subscribe_pnl_single(self, pos: PortfolioPosition):
+        """Subscribe per-position PnL (daily + unrealized + market value).
+        Returns silently if engine not ready (retried from _refresh)."""
+        if self._engine and hasattr(self._engine, "request_pnl_single"):
+            self._engine.request_pnl_single(pos.con_id)
+
+    def on_pnl_single(self, con_id: int, qty: float, daily_pnl: float,
+                      unrealized_pnl: float, value: float):
+        """Handle reqPnLSingle update — fill in market data for the position."""
+        for pp in self._portfolio_positions.values():
+            if pp.con_id == con_id:
+                pp.daily_pnl = daily_pnl
+                pp.unrealized_pnl = unrealized_pnl
+                pp.market_value = value
+                if pp.quantity and pp.multiplier:
+                    pp.market_price = abs(
+                        value / (pp.quantity * pp.multiplier)
+                    )
+                pp.has_pnl_data = True
+                break
 
     def on_portfolio_positions_end(self):
         """Called when position snapshot is complete."""
@@ -136,8 +174,10 @@ class PositionPanel(QWidget):
                 "avg_price": pos.avg_price,
                 "current_price": pos.current_price,
                 "market_value": pos.market_value,
-                "pnl": pos.unrealized_pnl,
-                "pnl_pct": pos.pnl_pct,
+                "pnl": pos.net_pnl,
+                "pnl_pct": pos.net_pnl_pct,
+                "commission": pos.total_commission,
+                "daily": None,  # engine-tracked options: no daily PnL feed
                 "option": pos.option,
                 "key": key,
             }
@@ -149,6 +189,10 @@ class PositionPanel(QWidget):
             if key in seen_keys:
                 continue  # Avoid double-counting options
 
+            # Retry PnL subscription (account name may arrive after positions)
+            if not pp.has_pnl_data:
+                self._subscribe_pnl_single(pp)
+
             row = {
                 "type": pp.instrument_type,
                 "sec_type": pp.sec_type,
@@ -159,6 +203,8 @@ class PositionPanel(QWidget):
                 "market_value": pp.market_value,
                 "pnl": pp.unrealized_pnl,
                 "pnl_pct": pp.pnl_pct,
+                "commission": 0,  # IBKR portfolio positions don't track commission locally
+                "daily": pp.daily_pnl if pp.has_pnl_data else None,
                 "option": None,
                 "key": key,
             }
@@ -186,6 +232,13 @@ class PositionPanel(QWidget):
             # Avg price
             self._set_cell(row_idx, 3, f"${data['avg_price']:.2f}", COLOR_TEXT)
 
+            # Portfolio rows before PnL data arrives — show "--", not $0.00
+            if data["sec_type"] != "OPT" and data["current_price"] <= 0:
+                for col in (4, 5, 6, 7, 8):
+                    self._set_cell(row_idx, col, "--", COLOR_TEXT_DIM)
+                self.table.setRowHeight(row_idx, 28)
+                continue
+
             # Current price
             self._set_cell(row_idx, 4, f"${data['current_price']:.2f}", COLOR_TEXT)
 
@@ -193,17 +246,31 @@ class PositionPanel(QWidget):
             mv = data["market_value"]
             self._set_cell(row_idx, 5, f"${mv:,.2f}", COLOR_TEXT)
 
-            # P/L
+            # Daily P/L (from reqPnLSingle; options tracked locally have none)
+            daily = data.get("daily")
+            if daily is None:
+                self._set_cell(row_idx, 6, "--", COLOR_TEXT_DIM)
+            else:
+                d_color = COLOR_GREEN if daily >= 0 else COLOR_RED
+                d_str = f"+${daily:.2f}" if daily >= 0 else f"-${abs(daily):.2f}"
+                self._set_cell(row_idx, 6, d_str, d_color)
+
+            # P/L (net of commissions for engine-tracked positions)
             pnl = data["pnl"]
             total_pnl += pnl
             pnl_color = COLOR_GREEN if pnl >= 0 else COLOR_RED
-            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-            self._set_cell(row_idx, 6, pnl_str, pnl_color)
+            comm = data.get("commission", 0)
+            if comm > 0:
+                pnl_str = (f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}")
+                pnl_str += f" (费${comm:.2f})"
+            else:
+                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            self._set_cell(row_idx, 7, pnl_str, pnl_color)
 
             # P/L %
             pct = data["pnl_pct"]
             pct_color = COLOR_GREEN if pct >= 0 else COLOR_RED
-            self._set_cell(row_idx, 7, f"{pct:+.1f}%", pct_color)
+            self._set_cell(row_idx, 8, f"{pct:+.1f}%", pct_color)
 
             self.table.setRowHeight(row_idx, 28)
 
@@ -216,14 +283,24 @@ class PositionPanel(QWidget):
         count = len(rows_data)
         self.title.setText(f"持仓 ({count})")
 
+    def _brush(self, color: str) -> QBrush:
+        b = self._brush_cache.get(color)
+        if b is None:
+            b = QBrush(QColor(color))
+            self._brush_cache[color] = b
+        return b
+
     def _set_cell(self, row, col, text, color):
         item = self.table.item(row, col)
         if item is None:
             item = QTableWidgetItem()
             item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, col, item)
-        item.setText(text)
-        item.setForeground(QBrush(QColor(color)))
+        # Skip redundant setText (avoids needless cell repaint for static
+        # columns like name/qty/avg that don't change between ticks).
+        if item.text() != text:
+            item.setText(text)
+        item.setForeground(self._brush(color))
 
     def _on_double_click(self, index):
         if not self._engine:

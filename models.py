@@ -50,7 +50,9 @@ class OptionInfo:
 
     @property
     def display_name(self) -> str:
-        """e.g. 'SPY 260516 C 585'"""
+        """e.g. 'SPY 260516 C 585'; stock pseudo-contracts show the symbol."""
+        if self.right == "STK":
+            return f"{self.symbol} (正股)"
         strike_str = f"{int(self.strike)}" if self.strike == int(self.strike) else f"{self.strike:g}"
         return f"{self.symbol} {self.expiry[2:]} {self.right} {strike_str}"
 
@@ -61,7 +63,11 @@ class OptionInfo:
         return self.last
 
     def to_ibkr_key(self) -> str:
-        """Unique key for tick subscription tracking."""
+        """Unique key for tick subscription tracking.
+        Stock pseudo-contracts share the '__stock__' key space so the
+        price ladder and underlying subscriptions see the same data."""
+        if self.right == "STK":
+            return f"__stock__{self.symbol}"
         return f"{self.symbol}_{self.expiry}_{self.right}_{self.strike}"
 
 
@@ -80,6 +86,7 @@ class OrderInfo:
     commission: float = 0.0
     create_time: datetime = field(default_factory=datetime.now)
     fill_time: datetime | None = None
+    error_msg: str = ""   # IBKR rejection reason (set when status == ERROR)
 
     @property
     def display_action(self) -> str:
@@ -92,7 +99,7 @@ class OrderInfo:
             OrderStatus.SUBMITTED: "已提交",
             OrderStatus.FILLED: "已成交",
             OrderStatus.CANCELLED: "已撤单",
-            OrderStatus.ERROR: "错误",
+            OrderStatus.ERROR: "已拒绝",
         }
         return status_map.get(self.status, self.status.value)
 
@@ -104,16 +111,30 @@ class PositionInfo:
     quantity: int          # Positive = long, negative = short
     avg_price: float       # Average entry price
     current_price: float = 0.0
+    total_commission: float = 0.0  # Accumulated commissions (entry + exit)
 
     @property
     def unrealized_pnl(self) -> float:
         return (self.current_price - self.avg_price) * self.quantity * 100
 
     @property
+    def net_pnl(self) -> float:
+        """Unrealized P&L minus accumulated commissions."""
+        return self.unrealized_pnl - self.total_commission
+
+    @property
     def pnl_pct(self) -> float:
         if self.avg_price <= 0:
             return 0.0
         return (self.current_price - self.avg_price) / self.avg_price * 100
+
+    @property
+    def net_pnl_pct(self) -> float:
+        """Net P&L percentage including commissions."""
+        cost = self.cost_basis
+        if cost <= 0:
+            return 0.0
+        return self.net_pnl / cost * 100
 
     @property
     def market_value(self) -> float:
@@ -153,6 +174,8 @@ class PortfolioPosition:
     market_value: float = 0.0
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    daily_pnl: float = 0.0     # Today's PnL (from reqPnLSingle)
+    has_pnl_data: bool = False  # True once reqPnLSingle data arrived
     currency: str = "USD"
     multiplier: float = 1.0
 
@@ -182,6 +205,22 @@ class PortfolioPosition:
         """Return display type string."""
         type_map = {"OPT": "期权", "STK": "正股", "ETF": "ETF"}
         return type_map.get(self.sec_type, self.sec_type)
+
+
+@dataclass
+class ComboLegInfo:
+    """Represents a single leg in a combo/spread order."""
+    con_id: int
+    symbol: str
+    expiry: str
+    strike: float
+    right: str        # "C" or "P"
+    action: str       # "BUY" or "SELL"
+    ratio: int = 1
+    exchange: str = "SMART"
+    bid: float = 0.0
+    ask: float = 0.0
+    last: float = 0.0
 
 
 @dataclass

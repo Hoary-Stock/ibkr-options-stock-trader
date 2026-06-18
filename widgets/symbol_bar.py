@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
     QLabel, QPushButton, QComboBox, QMessageBox, QAbstractItemView,
 )
-from PyQt5.QtCore import pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import pyqtSignal, Qt, QTimer, QEvent
 from PyQt5.QtGui import QFont
 
 from config import (
@@ -49,6 +49,9 @@ class SymbolBar(QWidget):
         self.symbol_input.setMaximumWidth(180)
         self.symbol_input.textChanged.connect(self._on_text_changed)
         self.symbol_input.returnPressed.connect(self._on_enter_pressed)
+        # Hide search popup when the input loses focus (stale async results
+        # would otherwise pop up the window while the user is trading)
+        self.symbol_input.installEventFilter(self)
         self.symbol_input.setStyleSheet(f"""
             QLineEdit {{
                 background-color: {COLOR_BG_DARK};
@@ -171,11 +174,22 @@ class SymbolBar(QWidget):
         """Handle search results from IBKR API."""
         self._show_popup(results)
 
+    def eventFilter(self, obj, event):
+        if obj is self.symbol_input and event.type() == QEvent.FocusOut:
+            # Small delay so a click on a popup item still registers
+            QTimer.singleShot(150, self.symbol_popup.hide)
+        return super().eventFilter(obj, event)
+
     def _show_popup(self, results: list):
         """Show popup with search results. results: list of (symbol, secType, description)."""
         self.symbol_popup.clear()
         if not results:
             self.symbol_popup.hide()
+            return
+
+        # Results arrive async from IBKR (sometimes seconds later) — only
+        # show if the user is still in the search box
+        if not self.symbol_input.hasFocus():
             return
 
         for symbol, sec_type, desc in results:

@@ -19,11 +19,20 @@ class OrderPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._engine = None
+        self._last_sig = None          # skip rebuild when order state unchanged
+        self._brush_cache: dict[str, QBrush] = {}
         self._build_ui()
 
         self._refresh_timer = QTimer()
         self._refresh_timer.timeout.connect(self._refresh)
         self._refresh_timer.start(1000)
+
+    def _brush(self, color: str) -> QBrush:
+        b = self._brush_cache.get(color)
+        if b is None:
+            b = QBrush(QColor(color))
+            self._brush_cache[color] = b
+        return b
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -60,6 +69,18 @@ class OrderPanel(QWidget):
         sorted_orders = sorted(orders.values(),
                                key=lambda o: o.create_time, reverse=True)[:50]
 
+        # Skip the (expensive) rebuild when nothing visible changed — avoids
+        # recreating cancel buttons and re-painting cells every second while
+        # idle. Signature covers every field the table renders.
+        sig = tuple(
+            (o.order_id, o.option.display_name, o.action, o.quantity,
+             o.limit_price, o.status, o.error_msg)
+            for o in sorted_orders
+        )
+        if sig == self._last_sig:
+            return
+        self._last_sig = sig
+
         self.table.setRowCount(len(sorted_orders))
 
         pending_count = 0
@@ -83,9 +104,12 @@ class OrderPanel(QWidget):
             # Price
             self._set_cell(row, 4, f"${order.limit_price:.2f}", COLOR_TEXT)
 
-            # Status
+            # Status (rejection reason shown as tooltip)
             status_color = self._status_color(order.status)
             self._set_cell(row, 5, order.display_status, status_color)
+            self.table.item(row, 5).setToolTip(
+                order.error_msg if order.status == OrderStatus.ERROR else ""
+            )
 
             # Cancel button
             if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
@@ -120,7 +144,7 @@ class OrderPanel(QWidget):
             item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, col, item)
         item.setText(text)
-        item.setForeground(QBrush(QColor(color)))
+        item.setForeground(self._brush(color))
 
     def _status_color(self, status: OrderStatus) -> str:
         return {

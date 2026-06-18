@@ -39,6 +39,8 @@ class PaperSignalBridge(QObject):
     pnl_updated = pyqtSignal(float, float, float)
     depth_updated = pyqtSignal(int, int, int, int, float, int)
     open_order_received = pyqtSignal(int, object, str, int, float, str, str)
+    order_rejected = pyqtSignal(int, int, str)
+    pnl_single_updated = pyqtSignal(int, float, float, float, float)
 
 
 class PaperEngine:
@@ -84,6 +86,13 @@ class PaperEngine:
         with self._order_lock:
             self._next_order_id += 1
             return self._next_order_id
+
+    # Per-position PnL — delegate to IBKR engine (real account data)
+    def request_pnl_single(self, con_id: int) -> int:
+        return self.ibkr.request_pnl_single(con_id)
+
+    def cancel_pnl_single(self, con_id: int):
+        self.ibkr.cancel_pnl_single(con_id)
 
     # ── Delegate market data to IBKR engine ───────────────────────────
 
@@ -378,8 +387,9 @@ class PaperEngine:
             new_qty = old_qty + qty_change
 
             if new_qty == 0:
-                # Closing position: record realized P&L
+                # Closing position: record realized P&L (minus commissions)
                 self._realized_pnl += (fill_price - pos.avg_price) * old_qty * 100
+                self._realized_pnl -= pos.total_commission + order.commission
                 del self._positions[key]
             elif new_qty < 0:
                 # Should not happen (short sell blocked), but handle gracefully
@@ -393,12 +403,14 @@ class PaperEngine:
                     closed_qty = abs(qty_change)
                     self._realized_pnl += (fill_price - pos.avg_price) * closed_qty * 100
                 pos.quantity = new_qty
+                pos.total_commission += order.commission
         else:
             if qty_change > 0:
                 self._positions[key] = PositionInfo(
                     option=order.option,
                     quantity=qty_change,
                     avg_price=fill_price,
+                    total_commission=order.commission,
                 )
 
         self.bridge.position_changed.emit()
@@ -408,6 +420,19 @@ class PaperEngine:
         for order in list(self._orders.values()):
             if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
                 self._try_fill(order)
+
+    def resolve_option_con_id(self, symbol: str, expiry: str,
+                               strike: float, right: str) -> int:
+        """Delegate to IBKR engine for contract resolution."""
+        return self.ibkr.resolve_option_con_id(symbol, expiry, strike, right)
+
+    def place_combo_order(self, symbol: str, legs: list,
+                          action: str, quantity: int,
+                          limit_price: float,
+                          outside_rth: bool = False) -> int:
+        """Combo orders not supported in paper mode."""
+        self.bridge.error_received.emit(-1, -1, "模拟模式不支持组合订单")
+        return -1
 
     def get_position_qty(self, option_key: str) -> int:
         """Get current position quantity for an option key."""

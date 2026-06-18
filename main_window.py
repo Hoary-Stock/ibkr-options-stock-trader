@@ -6,15 +6,16 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QMessageBox, QStatusBar,
-    QPushButton, QLabel,
+    QPushButton, QLabel, QApplication,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent
 
 from config import (
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT,
     COLOR_BORDER, COLOR_ACCENT, COLOR_GREEN, COLOR_RED,
     SPX_SESSION_GTH_START, SPX_SESSION_GTH_END,
     SPX_SESSION_RTH_START, SPX_SESSION_RTH_END,
+    DATA_CONNECTION_ERROR_CODES,
 )
 from models import OptionInfo, OrderAction, TradingMode
 from ibkr_engine import IBKREngine
@@ -26,7 +27,8 @@ from widgets.position_panel import PositionPanel
 from widgets.order_panel import OrderPanel
 from widgets.account_bar import AccountBar
 from widgets.currency_dialog import CurrencyExchangeDialog
-from widgets.chart_window import ChartWindow
+# ChartWindow is imported lazily (first chart open) — it pulls in
+# numpy + pyqtgraph (~25MB), which shouldn't load at startup
 
 
 DARK_STYLESHEET = f"""
@@ -144,7 +146,13 @@ class MainWindow(QMainWindow):
 
         self._current_symbol = "SPY"
         self._current_option: OptionInfo | None = None
-        self._chart_windows: list[ChartWindow] = []
+        self._chart_windows: list = []  # list[ChartWindow]
+        self._strategy_windows: list = []
+
+        # Detachable price ladder state
+        self._ladder_detached = False
+        self._ladder_window: QMainWindow | None = None
+        self._embedded_chart = None  # ChartWindow | None
 
         self._build_ui()
         self._connect_signals()
@@ -181,6 +189,17 @@ class MainWindow(QMainWindow):
         )
         self._chart_btn.clicked.connect(self._on_open_chart)
         top_bar_layout.addWidget(self._chart_btn)
+
+        self._strategy_btn = QPushButton("策略组合")
+        self._strategy_btn.setFixedHeight(30)
+        self._strategy_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BG_PANEL}; color: {COLOR_ACCENT}; "
+            f"border: 1px solid {COLOR_BORDER}; padding: 2px 12px; border-radius: 3px; "
+            f"font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_ACCENT}; color: {COLOR_BG}; }}"
+        )
+        self._strategy_btn.clicked.connect(self._on_open_strategy)
+        top_bar_layout.addWidget(self._strategy_btn)
 
         # Session indicator (shows current market session for SPX options)
         self._session_label = QLabel("--")
@@ -254,6 +273,9 @@ class MainWindow(QMainWindow):
         # Price ladder -> cancel all
         self.price_ladder.cancel_all_requested.connect(self._on_cancel_all_requested)
 
+        # Price ladder -> detach
+        self.price_ladder.detach_requested.connect(self._on_detach_ladder)
+
         # Price ladder -> contract search
         self.price_ladder.contract_searched.connect(self._on_contract_searched)
         self._search_validated.connect(self._load_validated_contract)
@@ -271,6 +293,10 @@ class MainWindow(QMainWindow):
         self.ibkr_engine.bridge.connected.connect(self._on_connected)
         self.ibkr_engine.bridge.disconnected.connect(self._on_disconnected)
         self.ibkr_engine.bridge.error_received.connect(self._on_error)
+        self.ibkr_engine.bridge.order_rejected.connect(self._on_order_rejected)
+        self.ibkr_engine.bridge.pnl_single_updated.connect(
+            self.position_panel.on_pnl_single
+        )
 
         # IBKR account/portfolio signals
         self.ibkr_engine.bridge.account_summary_updated.connect(self.account_bar.update_account)
@@ -324,6 +350,7 @@ class MainWindow(QMainWindow):
         self.order_panel.set_engine(self._active_engine)
         self.account_bar.set_engine(self._active_engine)
 
+        self.statusBar().setStyleSheet("")
         self.statusBar().showMessage(f"已连接 ({mode.value})")
 
         # Request account data
@@ -337,6 +364,9 @@ class MainWindow(QMainWindow):
     def _on_disconnected(self):
         self.symbol_bar.set_connected(False)
         self.account_bar.stop()
+        self.statusBar().setStyleSheet(
+            f"QStatusBar {{ color: {COLOR_RED}; }}"
+        )
         self.statusBar().showMessage("已断开连接")
 
     def _on_account_summary_end(self):
@@ -625,10 +655,12 @@ class MainWindow(QMainWindow):
     # ── Chart Window ─────────────────────────────────────────────────
 
     def _on_open_chart(self):
-        """Open a K-line chart window for the current symbol."""
+        """Open a K-line chart window for the current symbol (lazy import)."""
         if not self.ibkr_engine.is_connected:
             QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
             return
+
+        from widgets.chart_window import ChartWindow
 
         chart = ChartWindow(
             engine=self.ibkr_engine,
@@ -639,6 +671,118 @@ class MainWindow(QMainWindow):
         chart.destroyed.connect(lambda: self._chart_windows.remove(chart)
                                 if chart in self._chart_windows else None)
         chart.show_and_load()
+
+    # ── Strategy Window ─────────────────────────────────────────────
+
+    def _on_open_strategy(self):
+        """Open a strategy builder window (lazy import)."""
+        if not self.ibkr_engine.is_connected:
+            QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
+            return
+
+        from widgets.strategy_window import StrategyWindow
+
+        win = StrategyWindow(
+            engine=self._active_engine,
+            symbol=self._current_symbol,
+            parent=None,
+        )
+        self._strategy_windows.append(win)
+        win.destroyed.connect(
+            lambda: self._strategy_windows.remove(win)
+            if win in self._strategy_windows else None
+        )
+        win.show_and_load()
+
+    # ── Detachable Price Ladder ──────────────────────────────────────
+
+    def _on_detach_ladder(self):
+        """Pop out price ladder into a standalone window; replace its spot with a chart."""
+        if self._ladder_detached:
+            return
+
+        self._ladder_detached = True
+        self.price_ladder.detach_btn.setText("已弹出")
+        self.price_ladder.detach_btn.setEnabled(False)
+
+        # Remove price ladder from splitter (keep the widget alive)
+        self.price_ladder.setParent(None)
+
+        # Create standalone window for the price ladder
+        self._ladder_window = QMainWindow(None)
+        self._ladder_window.setWindowTitle("点价交易")
+        self._ladder_window.setMinimumSize(420, 600)
+        self._ladder_window.resize(440, 800)
+        self._ladder_window.setCentralWidget(self.price_ladder)
+        self._ladder_window.setStyleSheet(DARK_STYLESHEET)
+        self._ladder_window.installEventFilter(self)
+
+        # Create an embedded chart in the vacated splitter spot
+        if self.ibkr_engine.is_connected:
+            from widgets.chart_window import ChartWindow
+            self._embedded_chart = ChartWindow(
+                engine=self.ibkr_engine,
+                symbol=self._current_symbol,
+                parent=None,
+            )
+            # Embed ChartWindow directly in splitter (QMainWindow is a QWidget)
+            self._embedded_chart.setWindowFlags(Qt.Widget)
+            self.bottom_splitter.insertWidget(0, self._embedded_chart)
+            self._embedded_chart.show_and_load()
+        else:
+            # No connection — show placeholder
+            placeholder = QLabel("连接 IBKR 后显示K线图")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-size: 14px; background-color: {COLOR_BG_DARK};"
+            )
+            placeholder.setObjectName("chart_placeholder")
+            self.bottom_splitter.insertWidget(0, placeholder)
+
+        self.bottom_splitter.setSizes([500, 380])
+        self._ladder_window.show()
+
+    def _on_reattach_ladder(self):
+        """Return the price ladder to its original splitter position and remove the chart."""
+        if not self._ladder_detached:
+            return
+
+        # Clean up embedded chart
+        if self._embedded_chart:
+            self._embedded_chart.cleanup()
+            self._embedded_chart.setParent(None)
+            self._embedded_chart.deleteLater()
+            self._embedded_chart = None
+        else:
+            # Remove placeholder if present
+            for i in range(self.bottom_splitter.count()):
+                w = self.bottom_splitter.widget(i)
+                if w and w.objectName() == "chart_placeholder":
+                    w.setParent(None)
+                    w.deleteLater()
+                    break
+
+        # Reparent price ladder back into the splitter
+        self.price_ladder.setParent(None)
+        self.bottom_splitter.insertWidget(0, self.price_ladder)
+        self.bottom_splitter.setSizes([380, 500])
+
+        # Reset state
+        self.price_ladder.detach_btn.setText("弹出")
+        self.price_ladder.detach_btn.setEnabled(True)
+        self._ladder_detached = False
+
+        if self._ladder_window:
+            self._ladder_window.removeEventFilter(self)
+            self._ladder_window.deleteLater()
+            self._ladder_window = None
+
+    def eventFilter(self, obj, event):
+        """Catch the ladder window being closed to trigger reattach."""
+        if obj is self._ladder_window and event.type() == QEvent.Close:
+            self._on_reattach_ladder()
+            return True  # Consume the close event (we handle cleanup)
+        return super().eventFilter(obj, event)
 
     # ── Session Indicator ────────────────────────────────────────────
 
@@ -692,10 +836,54 @@ class MainWindow(QMainWindow):
     # ── Error Handling ────────────────────────────────────────────────
 
     def _on_error(self, req_id: int, code: int, msg: str):
+        # Data connection errors — show specific warning in status bar
+        if code in DATA_CONNECTION_ERROR_CODES:
+            # 2104/2106 are recovery messages ("connection is OK")
+            if code in (2104, 2106):
+                self.statusBar().showMessage(f"行情数据连接已恢复")
+                self.statusBar().setStyleSheet("")
+            else:
+                self.statusBar().showMessage(f"⚠ 行情数据连接异常 [{code}]: {msg}")
+                self.statusBar().setStyleSheet(
+                    f"QStatusBar {{ color: {COLOR_RED}; }}"
+                )
+            return
+
+        # Heartbeat tick timeout (code=-2, synthetic from heartbeat)
+        if code == -2:
+            self.statusBar().showMessage(f"⚠ {msg}")
+            self.statusBar().setStyleSheet(
+                f"QStatusBar {{ color: #ff9800; }}"  # orange warning
+            )
+            return
+
+        # General errors — reset status bar style
+        self.statusBar().setStyleSheet("")
         self.statusBar().showMessage(f"错误 [{code}]: {msg}")
+
         # Reset "验证中" state in price ladder on search error
         if "验证中" in self.price_ladder.contract_label.text():
             self.price_ladder.contract_label.setText("选择期权以开始")
+
+    def _on_order_rejected(self, order_id: int, code: int, msg: str):
+        """Order rejected/cancelled by IBKR — show the reason prominently."""
+        order = self.ibkr_engine.orders.get(order_id)
+        desc = ""
+        if order:
+            desc = (f"{order.display_action} {order.quantity}张 "
+                    f"{order.option.display_name} @ ${order.limit_price:.2f}\n\n")
+
+        self.statusBar().setStyleSheet(f"QStatusBar {{ color: {COLOR_RED}; }}")
+        self.statusBar().showMessage(f"⚠ 订单 #{order_id} 被拒绝 [{code}]: {msg}")
+
+        # Non-modal popup — doesn't block further trading clicks
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(f"订单被拒绝 #{order_id}")
+        box.setText(f"{desc}IBKR 拒绝原因 [{code}]:\n{msg}")
+        box.setWindowModality(Qt.NonModal)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.show()
 
     # ── Cleanup ───────────────────────────────────────────────────────
 
@@ -703,11 +891,21 @@ class MainWindow(QMainWindow):
         # Stop session timer
         self._session_timer.stop()
 
+        # Reattach ladder if detached (cleans up embedded chart too)
+        if self._ladder_detached:
+            self._on_reattach_ladder()
+
         # Close all chart windows
         for chart in list(self._chart_windows):
             chart.cleanup()
             chart.close()
         self._chart_windows.clear()
+
+        # Close all strategy windows
+        for sw in list(self._strategy_windows):
+            sw.cleanup()
+            sw.close()
+        self._strategy_windows.clear()
 
         self.account_bar.cleanup()
         self.option_chain.cleanup()

@@ -6,7 +6,8 @@ IBKR_PAPER_PORT = 7497
 IBKR_LIVE_PORT = 7496
 IBKR_GW_PAPER_PORT = 4001
 IBKR_GW_LIVE_PORT = 4002
-IBKR_CLIENT_ID = 10  # Avoid collision with tradebot (clientId=1,2)
+IBKR_CLIENT_ID = 10        # Options GUI (avoid collision with tradebot=1,2)
+IBKR_STOCK_CLIENT_ID = 11  # Stock trader client (stock_trader.py)
 
 # ── Market Data ──────────────────────────────────────────────────────
 MARKET_DATA_TYPE = 1  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
@@ -17,7 +18,7 @@ MAX_SIMULTANEOUS_STREAMS = 95  # IBKR limit ~100, leave headroom
 TICK_SIZE_SMALL = 0.01   # For options priced < $3
 TICK_SIZE_LARGE = 0.05   # For options priced >= $3
 TICK_THRESHOLD = 3.0     # Price threshold for tick size switch
-LADDER_ROWS = 25         # Number of price levels to display
+LADDER_ROWS = 201        # Price levels (±100 from center; $2.00 at $0.01 tick)
 
 # Non-Penny-Pilot overrides (index options like SPX)
 TICK_SIZE_OVERRIDES = {
@@ -37,8 +38,10 @@ ACCOUNT_REFRESH_MS = 3000  # Account summary refresh interval
 PAPER_STARTING_CAPITAL = 10000.0
 
 # ── Commission (IBKR Pro Fixed) ──────────────────────────────────────
-COMMISSION_PER_CONTRACT = 0.65  # USD per contract per side
+COMMISSION_PER_CONTRACT = 0.65  # USD per contract per side (options)
 COMMISSION_MIN = 1.00           # Minimum per order
+STOCK_COMMISSION_PER_SHARE = 0.005  # USD per share (stocks, IBKR Pro Fixed)
+STOCK_COMMISSION_MIN = 1.00         # Minimum per stock order
 
 # ── Colors (Dark Theme) ─────────────────────────────────────────────
 COLOR_BG = "#1a1a2e"
@@ -74,14 +77,31 @@ FOREX_PAIRS = [
 ]
 
 # ── Ignored IBKR Error Codes ────────────────────────────────────────
+# Only truly harmless informational codes.
+# Data-connection codes (2100, 2103-2108) are handled specially in
+# IBKRApp.error() — they get logged and surfaced to the GUI.
+# 10167 is also handled separately (one-time delayed-data warning).
 IGNORED_ERROR_CODES = {
-    2100, 2103, 2104, 2105, 2106, 2107, 2108, 2119,
-    2150, 2157, 2158, 2168, 2169,
-    10167, 10090, 10089, 10168,
+    2119,                          # Market data farm connection restored (info)
+    2150, 2157, 2158, 2168, 2169,  # Account / permission info
+    10090, 10089, 10168,           # Market data subscription info
+    2176,  # Fractional share size trimmed (ibapi 9.81 < server v163) —
+           # harmless: only fractional volume decimals are dropped
+}
+
+# Data-connection error codes — surfaced as warnings, not silenced
+DATA_CONNECTION_ERROR_CODES = {
+    2100,  # API client has been unsubscribed from account data
+    2103,  # Market data farm connection is broken
+    2104,  # Market data farm connection is OK (recovery)
+    2105,  # HMDS data farm connection is broken
+    2106,  # HMDS data farm connection is OK (recovery)
+    2107,  # HMDS data farm connection is inactive
+    2108,  # Market data farm connection is inactive
 }
 
 # ── Index Symbols (secType=IND, not STK) ────────────────────────────
-INDEX_SYMBOLS = {"SPX", "NDX", "RUT", "VIX", "DJX"}
+INDEX_SYMBOLS = {"SPX", "XSP", "NDX", "RUT", "VIX", "DJX"}
 
 # ── Default Symbols ──────────────────────────────────────────────────
 DEFAULT_SYMBOLS = ["SPY", "SPX", "QQQ", "IWM", "AAPL", "TSLA", "NVDA", "AMZN", "META"]

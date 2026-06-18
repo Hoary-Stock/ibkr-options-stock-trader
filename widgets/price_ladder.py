@@ -50,6 +50,32 @@ def parse_option_string(text: str) -> OptionInfo | None:
     return OptionInfo(symbol=symbol, expiry=expiry, strike=strike, right=right)
 
 
+# Shared, immutable paint resources for the depth bars. Built once on first
+# paint (after QApplication exists) instead of allocating new QColor/QFont
+# objects on every paintEvent across ~400 depth-bar widgets.
+_DEPTH_PALETTE: dict = {}
+
+
+def _depth_palette() -> dict:
+    if not _DEPTH_PALETTE:
+        _DEPTH_PALETTE.update({
+            "bg_dark":        QColor(COLOR_BG_DARK),
+            "bid_hl_bg":      QColor("#1a3a2a"),
+            "ask_hl_bg":      QColor("#3a1a1a"),
+            "bid_bar":        QColor(COLOR_DEPTH_BID),
+            "ask_bar":        QColor(COLOR_DEPTH_ASK),
+            "bid_bar_hl":     QColor("#2a8a4a"),
+            "ask_bar_hl":     QColor("#8a2a2a"),
+            "border":         QColor(COLOR_BORDER),
+            "bid_text":       QColor(COLOR_GREEN),
+            "ask_text":       QColor(COLOR_RED),
+            "bid_text_hl":    QColor("#00ff88"),
+            "ask_text_hl":    QColor("#ff6666"),
+            "font":           QFont("Segoe UI", 10),
+        })
+    return _DEPTH_PALETTE
+
+
 class DepthBarWidget(QWidget):
     """Custom widget that paints a proportional colored bar behind size text.
     Clickable — bid side click = BUY, ask side click = SELL.
@@ -67,6 +93,9 @@ class DepthBarWidget(QWidget):
         self.setMinimumWidth(60)
         self.setCursor(Qt.PointingHandCursor)
         self._highlighted = False  # True when this is at the current bid/ask level
+        # Prevent Qt from erasing to parent background before paintEvent.
+        # Without this, highlighted (green/red) bars flash dark on every repaint.
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -84,12 +113,19 @@ class DepthBarWidget(QWidget):
         text = str(size) if size > 0 else ""
         if self._size == size and self._max_size == max_size:
             return  # No change — skip repaint
+        # Skip repaint for empty bars when only max_size changed —
+        # they look identical (no bar, no text) regardless of max_size.
+        if self._size == 0 and size == 0:
+            self._max_size = max_size
+            return
         self._size = size
         self._max_size = max_size
         self._text = text
         self.update()
 
     def paintEvent(self, event):
+        pal = _depth_palette()
+        is_bid = self._side == "bid"
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w = self.width()
@@ -97,9 +133,9 @@ class DepthBarWidget(QWidget):
 
         # Background (brighter tint when highlighted = at current bid/ask level)
         if self._highlighted:
-            bg = QColor("#1a3a2a") if self._side == "bid" else QColor("#3a1a1a")
+            bg = pal["bid_hl_bg"] if is_bid else pal["ask_hl_bg"]
         else:
-            bg = QColor(COLOR_BG_DARK)
+            bg = pal["bg_dark"]
         painter.fillRect(0, 0, w, h, bg)
 
         # Depth bar (brighter when highlighted)
@@ -107,26 +143,25 @@ class DepthBarWidget(QWidget):
             ratio = min(self._size / self._max_size, 1.0)
             bar_w = int(w * ratio)
 
-            if self._side == "bid":
-                bar_color = QColor("#2a8a4a") if self._highlighted else QColor(COLOR_DEPTH_BID)
+            if is_bid:
+                bar_color = pal["bid_bar_hl"] if self._highlighted else pal["bid_bar"]
                 painter.fillRect(w - bar_w, 0, bar_w, h, bar_color)
             else:
-                bar_color = QColor("#8a2a2a") if self._highlighted else QColor(COLOR_DEPTH_ASK)
+                bar_color = pal["ask_bar_hl"] if self._highlighted else pal["ask_bar"]
                 painter.fillRect(0, 0, bar_w, h, bar_color)
 
         # Cell border
-        painter.setPen(QColor(COLOR_BORDER))
+        painter.setPen(pal["border"])
         painter.drawRect(0, 0, w - 1, h - 1)
 
         # Text (brighter when highlighted)
         if self._text:
-            if self._side == "bid":
-                pen_color = QColor("#00ff88") if self._highlighted else QColor(COLOR_GREEN)
+            if is_bid:
+                pen_color = pal["bid_text_hl"] if self._highlighted else pal["bid_text"]
             else:
-                pen_color = QColor("#ff6666") if self._highlighted else QColor(COLOR_RED)
+                pen_color = pal["ask_text_hl"] if self._highlighted else pal["ask_text"]
             painter.setPen(pen_color)
-            font = QFont("Segoe UI", 10)
-            painter.setFont(font)
+            painter.setFont(pal["font"])
             painter.drawText(0, 0, w, h, Qt.AlignCenter, self._text)
 
         painter.end()
@@ -270,6 +305,7 @@ class PriceLadder(QWidget):
     market_order_requested = pyqtSignal(object, str)   # OptionInfo, "BUY"/"SELL"
     close_position_requested = pyqtSignal(object)      # OptionInfo
     cancel_all_requested = pyqtSignal()
+    detach_requested = pyqtSignal()                    # Detach into standalone window
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -282,6 +318,13 @@ class PriceLadder(QWidget):
         self._depth_bids: list[tuple[float, int]] = []  # [(price, size), ...] sorted desc
         self._depth_asks: list[tuple[float, int]] = []  # [(price, size), ...] sorted asc
         self._depth_available = False
+
+        # Own tick subscription for the currently displayed option
+        self._tick_req_id: int | None = None
+
+        # Cache last known valid bid/ask to survive momentary data gaps
+        self._last_bid = 0.0
+        self._last_ask = 0.0
 
         self._build_ui()
 
@@ -315,6 +358,24 @@ class PriceLadder(QWidget):
         """)
         title_layout.addWidget(self.title_tab)
         title_layout.addStretch()
+
+        self.detach_btn = QPushButton("弹出")
+        self.detach_btn.setFixedSize(48, 26)
+        self.detach_btn.setCursor(Qt.PointingHandCursor)
+        self.detach_btn.setToolTip("弹出为独立窗口，原位置显示K线图")
+        self.detach_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_BG_PANEL};
+                color: {COLOR_ACCENT};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 3px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ background-color: {COLOR_ACCENT}; color: white; }}
+        """)
+        self.detach_btn.clicked.connect(self.detach_requested.emit)
+        title_layout.addWidget(self.detach_btn)
+
         main_layout.addLayout(title_layout)
 
         # ── Contract search bar + clear + quantity selector (- N +) ──
@@ -468,9 +529,9 @@ class PriceLadder(QWidget):
 
         self.pos_qty_label = self._make_pos_label("持有数量", "0")
         self.pos_avg_label = self._make_pos_label("平均成本价", "--")
-        self.pos_total_pnl_label = self._make_pos_label("总盈亏金额", "--")
-        self.pos_unrealized_label = self._make_pos_label("未实现盈亏", "--")
-        self.pos_today_label = self._make_pos_label("今日盈亏", "--")
+        self.pos_total_pnl_label = self._make_pos_label("净盈亏(含费)", "--")
+        self.pos_unrealized_label = self._make_pos_label("手续费", "--")
+        self.pos_today_label = self._make_pos_label("盈亏%", "--")
 
         for title_lbl, value_lbl in [
             self.pos_qty_label, self.pos_avg_label,
@@ -647,10 +708,20 @@ class PriceLadder(QWidget):
         self._depth_bids.clear()
         self._depth_asks.clear()
         self._depth_available = False
+        self._last_bid = 0.0
+        self._last_ask = 0.0
 
-        # Subscribe to market depth
         if self._engine:
+            # Cancel previous tick subscription
+            if self._tick_req_id is not None:
+                self._engine.unsubscribe_tick(self._tick_req_id)
+                self._tick_req_id = None
+
+            # Subscribe to market depth
             self._engine.subscribe_market_depth(option)
+
+            # Subscribe to tick data independently (don't rely on option chain)
+            self._tick_req_id = self._engine.subscribe_option_tick(option)
 
         self._rebuild_ladder()
 
@@ -672,9 +743,12 @@ class PriceLadder(QWidget):
         if mid <= 0:
             mid = 1.0
 
-        # Use symbol-specific tick size (SPX uses wider ticks)
+        # Use symbol-specific tick size (SPX uses wider ticks).
+        # Stocks always trade in pennies (the $3 threshold is options-only).
         sym = self._option.symbol.upper()
-        if sym in TICK_SIZE_OVERRIDES:
+        if self._option.right == "STK":
+            ts, tl = 0.01, 0.01
+        elif sym in TICK_SIZE_OVERRIDES:
             ts, tl = TICK_SIZE_OVERRIDES[sym]
         else:
             ts, tl = TICK_SIZE_SMALL, TICK_SIZE_LARGE
@@ -738,6 +812,16 @@ class PriceLadder(QWidget):
         bid = tick.get("bid", 0)
         ask = tick.get("ask", 0)
 
+        # Cache last known valid bid/ask (survive momentary data gaps)
+        if bid > 0:
+            self._last_bid = bid
+        else:
+            bid = self._last_bid
+        if ask > 0:
+            self._last_ask = ask
+        else:
+            ask = self._last_ask
+
         # Update option info
         self._option.bid = bid
         self._option.ask = ask
@@ -757,23 +841,38 @@ class PriceLadder(QWidget):
         ask_depth_map: dict[float, int] = {}
 
         if self._depth_available:
-            for p, s in self._depth_bids:
+            # Snapshot depth lists (they may be mutated by callbacks)
+            for p, s in list(self._depth_bids):
                 bid_depth_map[round(p, 2)] = s
-            for p, s in self._depth_asks:
+            for p, s in list(self._depth_asks):
                 ask_depth_map[round(p, 2)] = s
 
-        # Always show bid/ask from tick data (ensures prices are visible
-        # even without depth subscription or when depth is sparse)
+        # Determine current tick size for grid snapping
+        sym = self._option.symbol.upper()
+        if self._option.right == "STK":
+            ts, tl = 0.01, 0.01
+        elif sym in TICK_SIZE_OVERRIDES:
+            ts, tl = TICK_SIZE_OVERRIDES[sym]
+        else:
+            ts, tl = TICK_SIZE_SMALL, TICK_SIZE_LARGE
+        cur_mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
+        cur_tick = ts if cur_mid < TICK_THRESHOLD else tl
+
+        # Snap a price to the nearest tick grid point
+        def snap(price: float) -> float:
+            return round(round(price / cur_tick) * cur_tick, 2)
+
+        # Always ensure current bid/ask from tick data are visible
+        # (unconditional — overrides or fills in depth gaps)
+        # Snap to tick grid so the key matches row.price exactly.
         bid_sz = tick.get("bid_size", 0)
         ask_sz = tick.get("ask_size", 0)
         if bid > 0:
-            bid_key = round(bid, 2)
-            if bid_key not in bid_depth_map:
-                bid_depth_map[bid_key] = max(bid_sz, 1)
+            bid_key = snap(bid)
+            bid_depth_map[bid_key] = max(bid_depth_map.get(bid_key, 0), bid_sz, 1)
         if ask > 0:
-            ask_key = round(ask, 2)
-            if ask_key not in ask_depth_map:
-                ask_depth_map[ask_key] = max(ask_sz, 1)
+            ask_key = snap(ask)
+            ask_depth_map[ask_key] = max(ask_depth_map.get(ask_key, 0), ask_sz, 1)
 
         max_bid = max((s for s in bid_depth_map.values()), default=1)
         max_ask = max((s for s in ask_depth_map.values()), default=1)
@@ -782,8 +881,8 @@ class PriceLadder(QWidget):
         pos_qty = self._engine.get_position_qty(key)
         has_position = pos_qty > 0
 
-        # Update close position button
-        if has_position:
+        # Update close position button (guard to avoid redundant setStyleSheet)
+        if has_position and not self.close_pos_btn.isEnabled():
             self.close_pos_btn.setEnabled(True)
             self.close_pos_btn.setCursor(Qt.PointingHandCursor)
             self.close_pos_btn.setStyleSheet(f"""
@@ -796,7 +895,7 @@ class PriceLadder(QWidget):
                 }}
                 QPushButton:hover {{ background-color: {COLOR_BORDER}; }}
             """)
-        else:
+        elif not has_position and self.close_pos_btn.isEnabled():
             self.close_pos_btn.setEnabled(False)
             self.close_pos_btn.setCursor(Qt.ForbiddenCursor)
             self.close_pos_btn.setStyleSheet(f"""
@@ -835,13 +934,17 @@ class PriceLadder(QWidget):
         self._header_labels[0].setText(f"我的买单 {total_buy_orders}")
         self._header_labels[4].setText(f"我的卖单 {total_sell_orders}")
 
+        # Snap bid/ask to tick grid for highlight matching
+        snapped_bid = snap(bid) if bid > 0 else 0
+        snapped_ask = snap(ask) if ask > 0 else 0
+
         # Update each row
         for row in self._rows:
             p = round(row.price, 2)
 
-            # Bid/Ask highlights
-            is_bid = bid > 0 and abs(p - bid) < 0.001
-            is_ask = ask > 0 and abs(p - ask) < 0.001
+            # Bid/Ask highlights (compare against grid-snapped prices)
+            is_bid = snapped_bid > 0 and abs(p - snapped_bid) < 0.001
+            is_ask = snapped_ask > 0 and abs(p - snapped_ask) < 0.001
             row.set_bid_highlight(is_bid)
             row.set_ask_highlight(is_ask)
 
@@ -877,25 +980,32 @@ class PriceLadder(QWidget):
                 if current > 0:
                     pos.current_price = current
 
-                pnl = pos.unrealized_pnl
+                # Net P&L (including commissions)
+                net_pnl = pos.net_pnl
                 _, total_val = self.pos_total_pnl_label
-                color = COLOR_GREEN if pnl >= 0 else COLOR_RED
-                sign = "+" if pnl >= 0 else ""
-                total_val.setText(f"{sign}{pnl:.2f}")
+                color = COLOR_GREEN if net_pnl >= 0 else COLOR_RED
+                sign = "+" if net_pnl >= 0 else ""
+                total_val.setText(f"{sign}{net_pnl:.2f}")
                 total_val.setStyleSheet(
                     f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
                 )
 
-                _, unreal_val = self.pos_unrealized_label
-                unreal_val.setText(f"{sign}{pnl:.2f}")
-                unreal_val.setStyleSheet(
-                    f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
+                # Commission
+                _, comm_val = self.pos_unrealized_label
+                comm = pos.total_commission
+                comm_val.setText(f"-{comm:.2f}")
+                comm_val.setStyleSheet(
+                    f"color: {COLOR_TEXT_DIM}; font-size: 12px; font-weight: bold; border: none;"
                 )
 
-                _, today_val = self.pos_today_label
-                today_val.setText(f"{sign}{pnl:.2f}")
-                today_val.setStyleSheet(
-                    f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
+                # Net P&L percentage
+                _, pct_val = self.pos_today_label
+                pct = pos.net_pnl_pct
+                pct_color = COLOR_GREEN if pct >= 0 else COLOR_RED
+                pct_sign = "+" if pct >= 0 else ""
+                pct_val.setText(f"{pct_sign}{pct:.1f}%")
+                pct_val.setStyleSheet(
+                    f"color: {pct_color}; font-size: 12px; font-weight: bold; border: none;"
                 )
                 return
 
@@ -972,7 +1082,9 @@ class PriceLadder(QWidget):
         if self._option:
             key = self._option.to_ibkr_key()
             pos_qty = self._engine.get_position_qty(key) if self._engine else 0
-            if pos_qty <= 0:
+            # Stock positions live in the portfolio (reqPositions), not the
+            # engine's option tracking — let the window resolve the quantity
+            if pos_qty <= 0 and self._option.right != "STK":
                 return
             if not self.no_confirm_checkbox.isChecked():
                 reply = QMessageBox.question(
@@ -1031,3 +1143,6 @@ class PriceLadder(QWidget):
         self._refresh_timer.stop()
         if self._engine:
             self._engine.unsubscribe_market_depth()
+            if self._tick_req_id is not None:
+                self._engine.unsubscribe_tick(self._tick_req_id)
+                self._tick_req_id = None

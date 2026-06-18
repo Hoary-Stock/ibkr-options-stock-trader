@@ -245,7 +245,7 @@ class OptionCalculator(QWidget):
         }
 
         if self._follow_chk.isChecked():
-            und = tick.get("und_price", 0.0) or 0.0
+            und = self._live_underlying(tick)
             iv = tick.get("iv", 0.0) or 0.0
             block = self._block_spins(True)
             if und > 0:
@@ -256,6 +256,20 @@ class OptionCalculator(QWidget):
             self._block_spins(block)
 
         self._recompute()
+
+    def _live_underlying(self, opt_tick: dict) -> float:
+        """标的实时价。优先用高频的标的 tick (__stock__SYM, 随每笔成交跳动),
+        回退到期权模型计算值 undPrice (更新较慢, 故理论价此前显得迟钝)。"""
+        if self._engine is not None:
+            und_tick = self._engine.get_tick(f"__stock__{self._option.symbol}") or {}
+            last = und_tick.get("last", 0.0) or 0.0
+            bid = und_tick.get("bid", 0.0) or 0.0
+            ask = und_tick.get("ask", 0.0) or 0.0
+            if last > 0:
+                return last
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+        return opt_tick.get("und_price", 0.0) or 0.0
 
     def _recompute(self):
         if self._option is None or self._option.right not in ("C", "P"):

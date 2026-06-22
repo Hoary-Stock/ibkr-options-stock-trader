@@ -37,27 +37,46 @@ def main():
             return
         expiry = sorted(expirations)[0]                 # 最近到期
         strike = sorted(strikes)[len(strikes) // 2]     # 中位行权价 (近似 ATM)
-        print(f"测试合约: {symbol} {expiry} C {strike:g}  (当日 1 分钟 bar)\n")
+        print(f"测试合约: {symbol} {expiry} C {strike:g}\n")
 
-        for what in ("TRADES", "MIDPOINT"):
-            try:
-                bars = eng.request_option_historical_data(
-                    symbol, expiry, strike, "C",
-                    bar_size="1 min", duration="1 D",
-                    what_to_show=what, timeout=30,
-                )
-                if bars:
-                    first, last = bars[0], bars[-1]
-                    print(f"  ✓ {what:9s}: {len(bars)} 根  "
-                          f"(close {first['close']} → {last['close']})")
-                else:
-                    print(f"  ⚠ {what:9s}: 连接正常但返回 0 根 (可能无成交/无权限)")
-            except Exception as e:
-                print(f"  ✗ {what:9s}: {e}")
+        # 分别测「日线」与「盘中」, 各试 TRADES / MIDPOINT。
+        # IBKR 期权日线(EOD)历史通常比盘中更容易拿到, 故分开测才能答
+        # 「每天的有没有 / 盘中的有没有」。
+        probes = [
+            ("日线 (1 day, 跨 1 月)", "1 day", "1 M"),
+            ("盘中 (5 mins, 跨 1 周)", "5 mins", "1 W"),
+            ("盘中 (1 min, 当日)", "1 min", "1 D"),
+        ]
+        results = {}
+        for label, bar_size, duration in probes:
+            print(f"[{label}]")
+            ok_any = False
+            for what in ("TRADES", "MIDPOINT"):
+                try:
+                    bars = eng.request_option_historical_data(
+                        symbol, expiry, strike, "C",
+                        bar_size=bar_size, duration=duration,
+                        what_to_show=what, timeout=30,
+                    )
+                    if bars:
+                        first, last = bars[0], bars[-1]
+                        print(f"  ✓ {what:9s}: {len(bars)} 根  "
+                              f"(close {first['close']} → {last['close']})")
+                        ok_any = True
+                    else:
+                        print(f"  ⚠ {what:9s}: 连接正常但返回 0 根 (可能无成交/无权限)")
+                except Exception as e:
+                    print(f"  ✗ {what:9s}: {e}")
+            results[label] = ok_any
+            print()
 
-        print("\n判断:")
-        print("  • 上面有 ✓ → 有期权历史权限, 「计算组合历史价」可用 (优先用有数据的那种)")
-        print("  • 全是 ✗ (尤其 code 162/354/10197) → 无历史权限, 请用「▶ 录制当日」")
+        print("判断:")
+        daily_ok = results.get("日线 (1 day, 跨 1 月)")
+        intraday_ok = any(v for k, v in results.items() if k.startswith("盘中"))
+        print(f"  • 日线历史: {'✓ 有' if daily_ok else '✗ 无/受限'}")
+        print(f"  • 盘中历史: {'✓ 有' if intraday_ok else '✗ 无/受限'}")
+        print("  • 有 ✓ → 「计算组合历史价」/「组合K线」对应周期可用 (优先用有数据的那种)")
+        print("  • 全 ✗ (尤其 code 162/354/10197) → 该粒度无历史权限, 请用「▶ 录制当日」")
     finally:
         eng.disconnect()
         print("\n已断开。")

@@ -261,9 +261,10 @@ ibkr_trader/
   (期权合约历史 K 线,`formatDate=2` epoch 对齐),按时间戳**交集**合成
   `组合价 = Σ 各腿(BUY:+ / SELL:−)×ratio×close`,画价随时间变化的折线。
   数据类型可选 TRADES / MIDPOINT(期权流动性差时 MIDPOINT 更连续)。
-- **今日合并 K 线**:点「今日合并K线」拉各腿**当日 OHLC**(`duration=1 D`),用 `compute_combo_ohlc`
-  合并成组合**蜡烛图**(空头腿用其低/高反向贡献给组合高/低,给出价值包络),复用 `CandlestickItem`;
-  滚轮缩放 / 拖动平移(pyqtgraph 默认)。
+- **组合 K 线(蜡烛, 多周期/多天)**:点「组合K线(蜡烛)」按上方「周期」拉各腿 OHLC(周期与时间跨度
+  取自 `CHART_TIMEFRAMES`,如 1分≈1D / 5分≈1W / 1时≈1M / 4时≈1M / 日线≈1Y;**不再限当日**),
+  用 `compute_combo_ohlc` 合并成组合**蜡烛图**(空头腿用其低/高反向贡献给组合高/低,给出价值包络),
+  复用 `CandlestickItem`;x 轴 `%m-%d %H:%M` 时间刻度,滚轮缩放 / 拖动平移。
 - **当日实时录制(零历史权限)**:点「▶ 录制当日」后, 每 2 秒用各腿实时盘口中价合成组合净价、
   累积成当日曲线实时画出 —— **不调用 `reqHistoricalData`, 只要有实时行情即可**, 适合无期权历史
   权限、只看当日的场景。某腿暂无报价时跳过该次采样。
@@ -392,6 +393,11 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-22** — **组合分析器「今日合并K线」升级为多周期/多天「组合K线」**。原蜡烛图 `duration` 写死
+  `1 D`(仅当日);改为按「周期」下拉取 `CHART_TIMEFRAMES` 的 (bar_size, duration),1分/5分/1时/2时/4时/
+  日线 等都能给出**多天**组合蜡烛(如 5分≈1周、1小时≈1月)。按钮改名「组合K线(蜡烛)」,状态/摘要文案去掉
+  「今日」, 跨天时间标签带日期。x 轴时间刻度本就 `%m-%d %H:%M`、绘图通用, 无需改。依赖期权历史数据权限
+  (无权限用「▶ 录制当日」实时累积)。(`combo_analyzer.py`)
 - **2026-06-22** — **彻底删除独立正股 client**(功能已并入主 GUI「类型」切换)。删 `stock_trader.py`、
   `stock_trader_gw.py`、孤立图标 `stock_app.ico` / `stock_icon.png`、桌面「IBKR 正股交易」快捷方式;
   确认无其它模块依赖(仅 `stock_trader_gw` 引用 `stock_trader`)。README 目录树/快速开始/文件详解/日志小节同步清理。

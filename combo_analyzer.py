@@ -269,9 +269,10 @@ class ComboAnalyzerWindow(QMainWindow):
         self.record_btn.clicked.connect(self._toggle_record)
         ctrl2.addWidget(self.record_btn)
 
-        self.today_btn = QPushButton("今日合并K线")
+        self.today_btn = QPushButton("组合K线(蜡烛)")
         self.today_btn.setToolTip(
-            "只取今日: 拉各腿当日 OHLC, 合并成组合的蜡烛图。\n"
+            "按上方「周期」拉各腿 OHLC, 合并成组合的蜡烛图(1分/5分/1时/2时/4时/日线...)。\n"
+            "时间跨度随周期(如 5分钟≈1周、1小时≈1月、日线≈1年), 不再只限当日。\n"
             "滚轮缩放 / 拖动平移 / 右键菜单可自动缩放。需期权历史权限。"
         )
         self.today_btn.clicked.connect(self._on_today_kline)
@@ -653,12 +654,13 @@ class ComboAnalyzerWindow(QMainWindow):
             self.statusBar().showMessage("请先填好各腿行权价与到期 (可点「自动填行权价」)")
             return
         symbol = self.symbol_input.currentText().strip().upper()
-        bar_size, _, _ = CHART_TIMEFRAMES[self.timeframe_combo.currentText()]
-        if bar_size in ("1 day", "1 week", "1 month"):
-            bar_size = "5 mins"   # 只看今日 → 用盘中周期
+        # 按所选周期取 bar_size + 对应时间跨度 (duration), 不再写死「1 D」当日,
+        # 这样 1分/5分/1时/2时/4时 等都能给出多天的组合蜡烛图。
+        tf = self.timeframe_combo.currentText()
+        bar_size, duration, _ = CHART_TIMEFRAMES[tf]
         what = self.what_combo.currentText()
         self.today_btn.setEnabled(False)
-        self.statusBar().showMessage("拉取各腿当日 K 线并合并...")
+        self.statusBar().showMessage(f"拉取各腿 K 线并合并 ({tf}, 跨度 {duration})...")
 
         def worker():
             try:
@@ -668,12 +670,14 @@ class ComboAnalyzerWindow(QMainWindow):
                     if key not in cache:
                         cache[key] = self.engine.request_option_historical_data(
                             symbol, l["expiry"], l["strike"], l["right"],
-                            bar_size, "1 D", what_to_show=what, timeout=30,
+                            bar_size, duration, what_to_show=what, timeout=30,
                         )
                     leg_bars.append(cache[key])
                 signed = [leg_sign(l["action"]) * l["ratio"] for l in legs]
                 ohlc = compute_combo_ohlc(signed, leg_bars)
-                self._today_ready.emit({"ohlc": ohlc, "bar_size": bar_size, "what": what})
+                self._today_ready.emit({
+                    "ohlc": ohlc, "bar_size": bar_size, "what": what, "tf": tf,
+                })
             except Exception as e:
                 self._combo_error.emit(str(e))
 
@@ -684,19 +688,23 @@ class ComboAnalyzerWindow(QMainWindow):
         ohlc = data["ohlc"]
         if not ohlc:
             self.statusBar().showMessage(
-                "各腿当日 K 线无共同时间戳 — 试 MIDPOINT 数据或更大周期"
+                "各腿 K 线无共同时间戳 — 试 MIDPOINT 数据或更大周期"
             )
             self._plot_candles([])
             return
         self._plot_candles(ohlc)
         first = datetime.fromtimestamp(float(ohlc[0]["date"]))
         last = datetime.fromtimestamp(float(ohlc[-1]["date"]))
+        tf = data.get("tf", data["bar_size"])
+        # 跨度超过 1 天则带日期, 当日内只显示时分
+        span_days = (last - first).days
+        fmt = "%m-%d %H:%M" if span_days >= 1 else "%H:%M"
         self.summary_label.setText(
-            f"今日合并 K 线: {len(ohlc)} 根 (收盘净价 ${ohlc[-1]['close']:.2f})"
+            f"组合 K 线: {len(ohlc)} 根 (收盘净价 ${ohlc[-1]['close']:.2f})"
         )
         self.statusBar().showMessage(
-            f"今日合并K线: {len(ohlc)} 根 ({data['bar_size']}, {data['what']}) "
-            f"{first:%H:%M} → {last:%H:%M} — 滚轮缩放 / 拖动平移"
+            f"组合K线: {len(ohlc)} 根 ({tf}, {data['what']}) "
+            f"{first:{fmt}} → {last:{fmt}} — 滚轮缩放 / 拖动平移"
         )
 
     # ── 实时录制当日组合价 (零历史权限) ──────────────────────────────────

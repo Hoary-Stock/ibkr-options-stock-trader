@@ -487,7 +487,8 @@ class ComboAnalyzerWindow(QMainWindow):
             self._subscribe_group_legs(g)
         label = getattr(self, "_mode", TradingMode.IBKR_PAPER).label
         port = _display_port(getattr(self, "_mode", TradingMode.IBKR_PAPER).is_live_port)
-        self.setWindowTitle(f"IBKR 期权组合分析器 — {label}")
+        gw = " [GW 新版]" if USE_GATEWAY else ""
+        self.setWindowTitle(f"IBKR 期权组合分析器 — {label}{gw}")
         self.statusBar().showMessage(
             f"已连接 {label} (端口 {port}, clientId=12) — 点击「加载期权链」"
         )

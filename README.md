@@ -1,9 +1,9 @@
 # IBKR 点价交易 (ibkr_trader)
 
-基于 **PyQt5 + ibapi** 的 IBKR 点价交易桌面程序。两个独立 GUI client 并行运行于同一个 TWS：
-**期权 GUI**(`main.py`,clientId=10)与**正股 client**(`stock_trader.py`,clientId=11)。
-核心特性:Futu 风格点价梯(深度摆盘 + 点击下单)、期权 T 型报价链、多腿组合策略、K 线图、
-实时持仓与每仓位今日盈亏、真实/模拟双引擎切换。
+基于 **PyQt5 + ibapi** 的 IBKR 点价交易桌面程序。主程序 **期权点价 GUI**(`main.py`,clientId=10)
+顶栏「类型」三选一即可在**期权 / 正股 / 期货**间切换交易;另有独立的**期权组合分析器**
+(`combo_analyzer.py`,clientId=12)。核心特性:Futu 风格点价梯(深度摆盘 + 点击下单)、
+期权 T 型报价链、多腿组合策略、K 线图、实时持仓与每仓位今日盈亏、真实/模拟双引擎切换。
 
 > 项目整体背景见上层 `../CLAUDE.md`。本文件只详述 `ibkr_trader/` 目录。
 
@@ -23,20 +23,18 @@
 | 期权点价 GUI (TWS, 旧版) | `start.bat` (`pythonw main.py`) | 10 | `main.py` | — |
 | 期权组合分析器 (Gateway, 新版) | `start_combo_gateway.bat` (`pythonw combo_analyzer_gw.py`) | 12 | `combo_analyzer_gw.py` | — |
 | 期权组合分析器 (TWS, 旧版) | `start_combo.bat` (`pythonw combo_analyzer.py`) | 12 | `combo_analyzer.py` | — |
-| ~~正股点价 client~~ (**已并入主 GUI**) | 直接 `pythonw stock_trader.py` (无 bat) | 11 | `stock_trader.py` | — |
 
-> **正股/期货交易现已并入期权点价 GUI**:顶栏「类型」三选一(期权/正股/期货)即可切换,
-> 复用点价梯/持仓/委托。独立 `stock_trader.py` 仅作保留(其启动 bat `start_stock*.bat` 已删除,
-> 桌面「IBKR 正股交易」快捷方式可一并删掉)。
+> **正股/期货交易已并入期权点价 GUI**:顶栏「类型」三选一(期权/正股/期货)即可切换,
+> 复用点价梯/持仓/委托。原独立正股 client(`stock_trader.py` / `stock_trader_gw.py`)及其
+> 启动 bat、桌面「IBKR 正股交易」快捷方式**均已删除**(功能完全被主 GUI 覆盖)。
 
-> 两个桌面快捷方式现已指向 **Gateway 新版**(`main_gw.py` / `stock_trader_gw.py`,需先登录 IB Gateway:
-> 4001 实盘 / 4002 模拟)。旧 TWS 版仍可用 `start.bat` / `start_stock.bat` 手动启动,新旧文件名独立、
+> 桌面快捷方式「IBKR 点价交易」现指向 **Gateway 新版**(`main_gw.py`,需先登录 IB Gateway:
+> 4001 实盘 / 4002 模拟)。旧 TWS 版仍可用 `start.bat` 手动启动;新旧/旧版文件名独立、
 > 互不杀进程,可同时运行对比。
 
-- 用 `pythonw` 启动(无控制台窗口)。`stdout`/`stderr` 自动重定向到 `logs/app_YYYY-MM-DD.log`
-  (正股为 `logs/stock_app_YYYY-MM-DD.log`)。
+- 用 `pythonw` 启动(无控制台窗口)。`stdout`/`stderr` 自动重定向到 `logs/app_YYYY-MM-DD.log`。
 - 启动时 `single_instance.kill_previous_instances()` 会**只杀掉同一脚本的旧实例**
-  (期权 GUI 与正股 client 互不影响),从而在重连前释放 TWS 中占用的 clientId。
+  (期权 GUI / 组合分析器各自互不影响),从而在重连前释放 TWS 中占用的 clientId。
 - 前置条件:TWS 已登录并开启 API(Global Configuration → API → Enable ActiveX and Socket Clients),
   端口 7496(live)/7497(paper)。详见文末"TWS API vs Gateway"。
 - **模式三选一**(顶栏「模式」下拉):**本地模拟**(本地撮合,无需真实账户)/ **IBKR模拟盘**
@@ -50,8 +48,7 @@
 ibkr_trader/
 ├── main.py                 # 期权 GUI 入口 — TWS 旧版 (clientId=10, 日志重定向, 杀旧实例, 启动 QApplication)
 ├── main_gw.py              # 期权 GUI 入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 MainWindow, 标题加[GW])
-├── stock_trader.py         # 正股 client 入口 — TWS 旧版 (clientId=11, 点价梯+K线+正股持仓, 自带窗口类)
-├── stock_trader_gw.py     # 正股 client 入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 StockTraderWindow)
+│   # 注: 正股交易已并入主 GUI「类型」切换, 原独立 stock_trader.py / stock_trader_gw.py 已删除
 ├── combo_analyzer.py       # 期权组合分析器入口 — TWS 旧版 (clientId=12, 组合历史价合成 + 组合原子交易)
 ├── combo_analyzer_gw.py    # 期权组合分析器入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 ComboAnalyzerWindow, 标题加[GW])
 ├── start_combo.bat         # 组合分析器启动脚本 (TWS 旧版)
@@ -65,14 +62,12 @@ ibkr_trader/
 ├── single_instance.py      # 启动辅助: 杀掉同脚本的旧进程以释放 clientId
 ├── start.bat               # 期权 GUI 启动脚本 (TWS 旧版)
 ├── start_gateway.bat       # 期权 GUI 启动脚本 (Gateway 新版)
-│   # 注: 正股 client 启动 bat (start_stock*.bat) 已删除 — 正股/期货已并入主 GUI「类型」切换
 ├── check_spx_options.py    # 独立诊断脚本: 探测 SPX 期权合约/交易时段
 ├── check_option_history.py # 独立诊断脚本: 检测账户是否有「期权历史数据」权限 (clientId=99)
-├── app.ico / app_icon.png  # 期权 GUI 图标
-├── stock_app.ico / stock_icon.png # 正股 client 图标
+├── app.ico / app_icon.png  # 期权 GUI 图标 (期权 GUI + 组合分析器共用)
 ├── logs/                   # 运行日志 + 拒单日志 (自动生成)
 │   ├── app_YYYY-MM-DD.log          # 期权 GUI 控制台输出
-│   ├── stock_app_YYYY-MM-DD.log    # 正股 client 控制台输出
+│   ├── combo_app_YYYY-MM-DD.log    # 组合分析器控制台输出
 │   └── order_rejects_YYYY-MM-DD.jsonl  # 拒单详情 (每行一个 JSON)
 └── widgets/
     ├── __init__.py
@@ -151,10 +146,8 @@ ibkr_trader/
 - pythonw 下重定向 stdout/stderr 到 `logs/app_*.log`;有控制台时 `os.system("")` 开启 ANSI。
 - `kill_previous_instances(__file__)` → 高 DPI 属性 → `QApplication` → `MainWindow().show()` → `app.exec_()`。
 
-**`stock_trader.py`** (369 行) — 正股 client,**自包含主窗口**(不复用 `MainWindow`)。
-- clientId=11,与期权 GUI 并行。组装:`PriceLadder`(点价梯)+ `PositionPanel`(正股持仓今日盈亏)
-  + `OrderPanel` + `ChartWindow` Tab。
-- 日志写 `logs/stock_app_*.log`。正股下单走 `IBKREngine.place_stock_order()`。
+> 正股交易已并入主 GUI(顶栏「类型」→ 正股/期货),原独立 `stock_trader.py` / `stock_trader_gw.py`
+> 已删除;`MainWindow` 通过伪合约(`right='STK'/'FUT'`)复用点价梯/持仓/委托完成正股/期货下单。
 
 **`single_instance.py`** (61 行) — `kill_previous_instances(script_path)`:
 遍历进程,匹配 `python.exe/pythonw.exe` 且命令行运行**同名脚本、同目录**的旧实例并 `terminate()`
@@ -352,7 +345,7 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 ## 6. 日志与拒单排查
 
-- **运行日志**:`logs/app_YYYY-MM-DD.log`(期权)/`logs/stock_app_YYYY-MM-DD.log`(正股),
+- **运行日志**:`logs/app_YYYY-MM-DD.log`(期权 GUI)/`logs/combo_app_YYYY-MM-DD.log`(组合分析器),
   收纳 pythonw 下所有 `print`/traceback。
 - **拒单日志**:`logs/order_rejects_YYYY-MM-DD.jsonl`,每行一个 JSON,含
   `time/mode/order_id/contract/action/qty/order_type/limit_price/reject_code/reject_msg`
@@ -399,6 +392,10 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-22** — **彻底删除独立正股 client**(功能已并入主 GUI「类型」切换)。删 `stock_trader.py`、
+  `stock_trader_gw.py`、孤立图标 `stock_app.ico` / `stock_icon.png`、桌面「IBKR 正股交易」快捷方式;
+  确认无其它模块依赖(仅 `stock_trader_gw` 引用 `stock_trader`)。README 目录树/快速开始/文件详解/日志小节同步清理。
+  正股/期货交易统一走 `MainWindow` 伪合约(`right='STK'/'FUT'`)。(删 `stock_trader.py`, `stock_trader_gw.py`, 图标)
 - **2026-06-22** — **组合分析器加 Gateway 版入口 + 删除正股启动 bat**。新增 `combo_analyzer_gw.py`
   (设 `IBKR_USE_GATEWAY=1`、独立文件名故不杀运行中的 `combo_analyzer.py`、日志写 `combo_app_gw_*.log`、
   标题加 [GW];`ComboAnalyzerWindow` 连接后的标题按 `USE_GATEWAY` 保持 [GW] 标记)与 `start_combo_gateway.bat`,

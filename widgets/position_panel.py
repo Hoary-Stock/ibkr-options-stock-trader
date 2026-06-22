@@ -57,7 +57,7 @@ class PositionPanel(QWidget):
 
         # Filter combo
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["全部", "期权", "正股/ETF"])
+        self.filter_combo.addItems(["全部", "期权", "正股/ETF", "期货"])
         self.filter_combo.setCurrentText(self._current_filter)
         self.filter_combo.setFixedWidth(100)
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
@@ -155,6 +155,15 @@ class PositionPanel(QWidget):
     def _on_filter_changed(self, text: str):
         self._current_filter = text
 
+    def set_filter(self, text: str):
+        """外部 (切换交易品种时) 设置持仓筛选, 同步下拉显示。"""
+        if text not in ("全部", "期权", "正股/ETF", "期货"):
+            return
+        self._current_filter = text
+        self.filter_combo.blockSignals(True)
+        self.filter_combo.setCurrentText(text)
+        self.filter_combo.blockSignals(False)
+
     def _refresh(self):
         if not self._engine:
             return
@@ -228,6 +237,8 @@ class PositionPanel(QWidget):
             rows_data = [r for r in rows_data if r["sec_type"] == "OPT"]
         elif self._current_filter == "正股/ETF":
             rows_data = [r for r in rows_data if r["sec_type"] in ("STK", "ETF")]
+        elif self._current_filter == "期货":
+            rows_data = [r for r in rows_data if r["sec_type"] == "FUT"]
 
         self.table.setRowCount(len(rows_data))
         total_pnl = 0.0
@@ -340,6 +351,12 @@ class PositionPanel(QWidget):
                         symbol=pp.symbol, expiry=pp.expiry,
                         strike=pp.strike, right=pp.right, con_id=pp.con_id,
                     )
+                elif pp.sec_type in ("STK", "ETF"):
+                    opt = OptionInfo(symbol=pp.symbol, expiry="",
+                                     strike=0.0, right="STK", con_id=pp.con_id)
+                elif pp.sec_type == "FUT":
+                    opt = OptionInfo(symbol=pp.symbol, expiry=pp.expiry,
+                                     strike=0.0, right="FUT", con_id=pp.con_id)
                 rows_data.append({"option": opt, "sec_type": pp.sec_type, "key": key})
 
         # Apply same filter
@@ -347,6 +364,8 @@ class PositionPanel(QWidget):
             rows_data = [r for r in rows_data if r["sec_type"] == "OPT"]
         elif self._current_filter == "正股/ETF":
             rows_data = [r for r in rows_data if r["sec_type"] in ("STK", "ETF")]
+        elif self._current_filter == "期货":
+            rows_data = [r for r in rows_data if r["sec_type"] == "FUT"]
 
         if row < len(rows_data):
             opt = rows_data[row].get("option")

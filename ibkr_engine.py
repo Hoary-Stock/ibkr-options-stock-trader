@@ -24,7 +24,7 @@ from config import (
     IBKR_CLIENT_ID, MARKET_DATA_TYPE, IGNORED_ERROR_CODES,
     DATA_CONNECTION_ERROR_CODES,
     COMMISSION_PER_CONTRACT, COMMISSION_MIN, DEPTH_ROWS,
-    INDEX_SYMBOLS,
+    INDEX_SYMBOLS, FUTURES_SPECS,
 )
 from models import (
     OptionInfo, OrderInfo, PositionInfo, PortfolioPosition,
@@ -115,9 +115,13 @@ class IBKRApp(EWrapper, EClient):
         # Tick subscriptions: reqId -> option key
         self._tick_req_to_key: dict[int, str] = {}
         self._tick_data: dict[str, dict] = {}  # key -> {bid, ask, last}
+        # reqId -> (contract, generic_ticks) 供"未订阅实时行情"时切延迟后重订
+        self._tick_req_contract: dict[int, tuple] = {}
 
         # Active subscriptions for cleanup
         self._active_mkt_data_reqs: set[int] = set()
+        # 一次性: 收到"未订阅实时行情"错误后切换为延迟行情 (模拟盘/无期货行情时有用)
+        self._delayed_fallback_done: bool = False
 
         # Market depth tracking
         self._depth_req_id: int | None = None
@@ -169,6 +173,29 @@ class IBKRApp(EWrapper, EClient):
             self._next_order_id += 1
             return oid
 
+    def _switch_to_delayed_and_resubscribe(self):
+        """收到"未订阅实时行情"后, 一次性切到延迟行情并重订当前所有流式行情线。
+        复用各自原 reqId (cancel 后同 id 重订), 以免点价梯/链里记录的 reqId 失效。
+        已订阅实时的合约在延迟模式下仍下发实时, 只有无实时的(如模拟盘期货)才转延迟。"""
+        if self._delayed_fallback_done:
+            return
+        self._delayed_fallback_done = True
+        try:
+            self.reqMarketDataType(3)  # 3 = 延迟 (无实时订阅时给 15 分钟延迟)
+        except Exception:
+            pass
+        for req, ct in list(self._tick_req_contract.items()):
+            contract, gticks = ct
+            try:
+                self.cancelMktData(req)
+                self.reqMktData(req, contract, gticks, False, False, [])
+            except Exception:
+                pass
+        print("[INFO] 实时行情未订阅 → 已切换为延迟行情并重订", flush=True)
+        self.bridge.error_received.emit(
+            -1, 10168, "实时行情未订阅 → 已切换为延迟行情 (15分钟延迟)"
+        )
+
     # ── Connection ────────────────────────────────────────────────────
 
     def nextValidId(self, orderId: int):
@@ -209,6 +236,17 @@ class IBKRApp(EWrapper, EClient):
                 self.bridge.error_received.emit(
                     reqId, errorCode, "行情为延迟数据 (15分钟延迟)"
                 )
+            return
+
+        # 354 / 10168: 该合约无实时行情订阅 (模拟盘未共享行情, 或期货无行情包)。
+        # 一次性切换为**延迟行情**并重订当前所有行情线, 让点价梯/链至少有延迟报价。
+        # (引擎已能解析延迟 tick 66/67/68; 已订阅实时的合约仍走实时。)
+        if errorCode in (354, 10168) and reqId in self._tick_req_to_key:
+            if not self._delayed_fallback_done:
+                self._switch_to_delayed_and_resubscribe()
+            else:
+                # 已切延迟仍报 → 静默 (该合约连延迟数据也没有), 不刷状态栏
+                pass
             return
 
         if errorCode in IGNORED_ERROR_CODES:
@@ -698,7 +736,10 @@ class IBKREngine:
         # Per-position PnL subscriptions: conId -> reqId
         self._pnl_single_by_conid: dict[int, int] = {}
 
-        # API client id (default from config; stock trader overrides)
+        # API client id (default from config; stock trader overrides).
+        # _base_client_id 为"标准 id", 每次连接都从它起算重试, 避免 326 退避后
+        # 永久漂移到 20/30...; _client_id 仅记录当前实际用的 id。
+        self._base_client_id = IBKR_CLIENT_ID
         self._client_id = IBKR_CLIENT_ID
 
         # Heartbeat timer (checks reader thread + tick timeout)
@@ -763,6 +804,7 @@ class IBKREngine:
         """
         self._mode = mode
         if client_id is not None:
+            self._base_client_id = client_id
             self._client_id = client_id
         # 实盘 → live 端口; 两种模拟 (本地 / IBKR模拟盘) → paper 端口。
         # USE_GATEWAY=1 时走 IB Gateway (4002/4001), 否则 TWS (7496/7497)。
@@ -773,8 +815,8 @@ class IBKREngine:
 
         # Retry with fallback ids on error 326 (zombie connection / double
         # launch). +10 steps avoid colliding with the other GUI's base id.
-        base_id = self._client_id
-        for attempt in range(3):
+        base_id = self._base_client_id  # 始终从标准 id 起算, 不被上次 326 退避带偏
+        for attempt in range(5):
             cid = base_id + attempt * 10
             self._app = IBKRApp(self.bridge)
             try:
@@ -790,11 +832,19 @@ class IBKREngine:
             self._thread.start()
 
             if not self._app.connected_event.wait(timeout=self.CONNECT_TIMEOUT):
+                # 套接字连上但 nextValidId 迟迟不回 —— 典型是 Gateway/TWS 内部卡死
+                # (JTS 死锁) 或正忙加载持仓。客户端无法自愈, 必须重启 Gateway。
                 try:
                     self._app.disconnect()
                 except Exception:
                     pass
+                self._app = None
                 self._connected = False
+                self.bridge.error_received.emit(
+                    -1, -3,
+                    f"连接超时 (端口 {port}): Gateway/TWS 无响应 —— 可能已卡死(JTS死锁)"
+                    f"或正忙。请到任务管理器结束 Gateway 进程并重新登录后再连。",
+                )
                 return False
 
             if self._app.client_id_in_use:
@@ -803,11 +853,17 @@ class IBKREngine:
                 self.bridge.error_received.emit(
                     -1, 326, f"clientId={cid} 被占用, 尝试 {cid + 10}..."
                 )
+                # 先把被丢弃的连接从 self._app 摘掉, 这样它的 reader 线程退出时
+                # (_run_wrapper) 判定 `app is self._app` 为 False, 不会误发
+                # disconnected —— 否则该信号会晚于新连接的 connected 到达 GUI,
+                # 表现为"刚连上又断开"。
+                discarded = self._app
+                self._app = None
                 try:
-                    self._app.disconnect()
+                    discarded.disconnect()
                 except Exception:
                     pass
-                time.sleep(0.5)
+                time.sleep(1.5)  # 给 Gateway 更多时间释放该 clientId
                 continue
 
             self._client_id = cid
@@ -815,8 +871,8 @@ class IBKREngine:
         else:
             self.bridge.error_received.emit(
                 -1, 326,
-                "clientId 全部被占用 — 检查是否已开了另一个实例, "
-                "或等待 TWS 释放旧连接后重试",
+                "clientId 全部被占用 — 多半是上次连接未释放(Gateway 可能已卡死/未关干净)。"
+                "请结束多余的程序实例, 或直接重启 IB Gateway 后重连。",
             )
             self._connected = False
             return False
@@ -925,7 +981,7 @@ class IBKREngine:
     def reconnect(self, mode: TradingMode) -> bool:
         """Disconnect, clear state, and reconnect to a different port."""
         self.disconnect()
-        time.sleep(1.5)  # Socket cleanup
+        time.sleep(3.0)  # 给 Gateway/TWS 充分时间释放旧 clientId (热切换 326 主因)
         self._orders.clear()
         self._positions.clear()
         self._ibkr_positions.clear()
@@ -1039,24 +1095,31 @@ class IBKREngine:
 
     # ── Market Data Subscription ──────────────────────────────────────
 
-    def subscribe_option_tick(self, option: OptionInfo) -> int:
-        """Subscribe to streaming tick data for an option (or a stock
-        pseudo-contract with right='STK'). Returns reqId."""
+    def _quote_contract(self, option: OptionInfo) -> Contract:
+        """按伪合约类型返回行情/下单用的 IBKR Contract。
+        right='STK' → 标的, 'FUT' → 期货, 其余 ('C'/'P') → 期权。"""
         if option.right == "STK":
-            contract = self._make_underlying_contract(option.symbol)
-        else:
-            contract = self._make_option_contract(
-                option.symbol, option.expiry, option.strike, option.right,
-                self._trading_class_for(option.symbol, option.expiry),
-            )
+            return self._make_underlying_contract(option.symbol)
+        if option.right == "FUT":
+            return self._make_futures_contract(option.symbol, option.expiry)
+        return self._make_option_contract(
+            option.symbol, option.expiry, option.strike, option.right,
+            self._trading_class_for(option.symbol, option.expiry),
+        )
+
+    def subscribe_option_tick(self, option: OptionInfo) -> int:
+        """Subscribe to streaming tick data for an option (or a stock/futures
+        pseudo-contract with right='STK'/'FUT'). Returns reqId."""
+        contract = self._quote_contract(option)
         req_id = self._app.next_req_id()
         key = option.to_ibkr_key()
         self._app._tick_req_to_key[req_id] = key
         self._app._active_mkt_data_reqs.add(req_id)
         # generic tick 106 = Option Implied Volatility; 确保期权计算器拿到 IV。
         # 模型 greeks 与标的价 (tickOptionComputation tickType 13) 随期权订阅默认下发。
-        # 正股伪合约无 IV 概念, 保持空 generic tick。
-        generic_ticks = "" if option.right == "STK" else "106"
+        # 正股/期货伪合约无 IV 概念, 保持空 generic tick。
+        generic_ticks = "106" if option.right in ("C", "P") else ""
+        self._app._tick_req_contract[req_id] = (contract, generic_ticks)
         self._app.reqMktData(req_id, contract, generic_ticks, False, False, [])
         return req_id
 
@@ -1065,13 +1128,7 @@ class IBKREngine:
         自动取消, **不占常驻行情线**。数据落到 _tick_data[key], GUI 轮询显示。
         适合 Gateway 下行情线紧张时按需刷新整条期权链 (用美股快照数据包)。
         返回 reqId。"""
-        if option.right == "STK":
-            contract = self._make_underlying_contract(option.symbol)
-        else:
-            contract = self._make_option_contract(
-                option.symbol, option.expiry, option.strike, option.right,
-                self._trading_class_for(option.symbol, option.expiry),
-            )
+        contract = self._quote_contract(option)
         req_id = self._app.next_req_id()
         key = option.to_ibkr_key()
         self._app._tick_req_to_key[req_id] = key
@@ -1088,12 +1145,14 @@ class IBKREngine:
         key = f"__stock__{symbol}"
         self._app._tick_req_to_key[req_id] = key
         self._app._active_mkt_data_reqs.add(req_id)
+        self._app._tick_req_contract[req_id] = (contract, "")
         self._app.reqMktData(req_id, contract, "", False, False, [])
         return req_id
 
     def unsubscribe_tick(self, req_id: int):
         """Cancel a tick data subscription."""
         key = self._app._tick_req_to_key.pop(req_id, None)
+        self._app._tick_req_contract.pop(req_id, None)
         self._app._active_mkt_data_reqs.discard(req_id)
         try:
             self._app.cancelMktData(req_id)
@@ -1352,15 +1411,9 @@ class IBKREngine:
         if self._app._depth_not_supported:
             return
         self.unsubscribe_market_depth()
-        if option.right == "STK":
-            contract = self._make_underlying_contract(option.symbol)
-            smart_depth = True   # aggregate book across exchanges
-        else:
-            contract = self._make_option_contract(
-                option.symbol, option.expiry, option.strike, option.right,
-                self._trading_class_for(option.symbol, option.expiry),
-            )
-            smart_depth = False
+        contract = self._quote_contract(option)
+        # 正股走 SMART 聚合盘口; 期权/期货用合约自身交易所盘口 (期货深度按交易所)。
+        smart_depth = option.right == "STK"
         req_id = self._app.next_req_id()
         self._app._depth_req_id = req_id
         self._app._depth_is_smart = smart_depth
@@ -1511,6 +1564,54 @@ class IBKREngine:
 
         print(f"[STOCK ORDER] {order_type.value} {action.value} {quantity}x "
               f"{symbol} @ {price:.2f} outsideRth={outside_rth} "
+              f"orderId={order_id}", flush=True)
+        self._app.placeOrder(order_id, contract, order)
+        self.bridge.order_status_changed.emit(
+            order_id, OrderStatus.PENDING.value, 0, float(quantity), 0
+        )
+        return order_id
+
+    def place_futures_order(self, symbol: str, expiry: str, action: OrderAction,
+                            quantity: int, price: float = 0.0,
+                            order_type: OrderType = OrderType.LIMIT,
+                            outside_rth: bool = False) -> int:
+        """Place a futures order (LMT or MKT). Returns orderId.
+        Tracked with a pseudo OptionInfo (right='FUT', expiry=合约月份)."""
+        from config import (
+            FUTURES_COMMISSION_PER_CONTRACT, FUTURES_COMMISSION_MIN,
+        )
+
+        contract = self._make_futures_contract(symbol, expiry)
+
+        order = Order()
+        order.action = action.value
+        order.orderType = order_type.value
+        order.totalQuantity = quantity
+        if order_type == OrderType.LIMIT:
+            order.lmtPrice = price
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+        order.tif = "DAY"
+        order.outsideRth = outside_rth
+
+        order_id = self._app.next_order_id()
+
+        commission = max(
+            FUTURES_COMMISSION_PER_CONTRACT * quantity, FUTURES_COMMISSION_MIN
+        )
+        pseudo = OptionInfo(symbol=symbol, expiry=expiry, strike=0.0, right="FUT")
+        self._orders[order_id] = OrderInfo(
+            order_id=order_id,
+            option=pseudo,
+            action=action,
+            quantity=quantity,
+            limit_price=price,
+            order_type=order_type,
+            commission=commission,
+        )
+
+        print(f"[FUT ORDER] {order_type.value} {action.value} {quantity}x "
+              f"{symbol} {expiry} @ {price:.2f} outsideRth={outside_rth} "
               f"orderId={order_id}", flush=True)
         self._app.placeOrder(order_id, contract, order)
         self.bridge.order_status_changed.emit(
@@ -1719,14 +1820,33 @@ class IBKREngine:
         started). _positions only knows about fills seen this session, so this
         is what lets close_position() / get_position_qty() act on a holding
         left over from before a crash/restart.
+
+        正股/期货持仓也一并缓存 (键用点价梯的伪合约键 `__stock__SYM` /
+        `__fut__SYM_YYYYMM`), 使整合后的点价梯在「正股/期货」模式下的
+        持仓数量、市价平仓按钮也能从 reqPositions 取数 (与期权一致)。
         """
-        if pp.sec_type != "OPT":
-            return  # stocks/ETFs handled by the panel + stock_trader
-        key = pp.position_key
+        key = self._ladder_key_for(pp)
+        if key is None:
+            return
         if abs(pp.quantity) > 0:
             self._ibkr_positions[key] = pp
         else:
             self._ibkr_positions.pop(key, None)
+
+    @staticmethod
+    def _ladder_key_for(pp: PortfolioPosition) -> "str | None":
+        """把 reqPositions 的持仓映射到点价梯/下单用的 key (= OptionInfo.to_ibkr_key)。
+        期权用 SYM_exp_right_strike; 正股/ETF 用 __stock__SYM; 期货用
+        __fut__SYM_YYYYMM。其它类型 (CASH 等) 返回 None 不缓存。"""
+        st = pp.sec_type
+        if st == "OPT":
+            return f"{pp.symbol}_{pp.expiry}_{pp.right}_{pp.strike}"
+        if st in ("STK", "ETF"):
+            return f"__stock__{pp.symbol}"
+        if st == "FUT":
+            mon = pp.expiry[:6] if pp.expiry else ""
+            return f"__fut__{pp.symbol}_{mon}"
+        return None
 
     def _on_execution(self, order_id: int, side: str,
                       qty: float, price: float):
@@ -1780,6 +1900,71 @@ class IBKREngine:
         if trading_class:
             c.tradingClass = trading_class
         return c
+
+    @staticmethod
+    def _make_futures_contract(symbol: str, expiry: str = "") -> Contract:
+        """期货合约。symbol 为根代码 (ES/NQ/CL...), expiry 为合约月份
+        (YYYYMM 或 YYYYMMDD; 留空则匹配该根代码全部到期 → 供解析近月用)。
+        交易所/乘数取自 FUTURES_SPECS。"""
+        c = Contract()
+        c.symbol = symbol
+        c.secType = "FUT"
+        c.currency = "USD"
+        spec = FUTURES_SPECS.get(symbol.upper())
+        # 只设交易所即可唯一定位标准期货 (各根代码在其交易所乘数唯一);
+        # 不设 multiplier 以免与 IBKR 的字符串表示不完全一致 → 空结果。
+        c.exchange = spec[0] if spec else "SMART"
+        if expiry:
+            c.lastTradeDateOrContractMonth = expiry
+        return c
+
+    def resolve_futures_contracts(self, symbol: str, max_count: int = 5) -> list:
+        """解析某期货根代码的近月起若干个合约 (近月 + 之后的季月/月度), 阻塞。
+        返回 [{'expiry': 'YYYYMMDD', 'con_id': int, 'local_symbol': str,
+        'multiplier': float}], 按到期升序, 已滤掉过期合约。
+        复用 reqContractDetails + threading.Event 模式。"""
+        if not self._app or not self._connected:
+            raise RuntimeError("Not connected")
+        contract = self._make_futures_contract(symbol)
+        req_id = self._app.next_req_id()
+        self._app._contract_data[req_id] = {
+            "details": [], "event": threading.Event(), "error": None,
+        }
+        self._app.reqContractDetails(req_id, contract)
+
+        state = self._app._contract_data[req_id]
+        if not state["event"].wait(timeout=10):
+            self._app._contract_data.pop(req_id, None)
+            raise RuntimeError(f"解析期货合约超时: {symbol}")
+        if state["error"]:
+            code, msg = state["error"]
+            self._app._contract_data.pop(req_id, None)
+            raise RuntimeError(f"期货合约错误 {symbol}: code={code} {msg}")
+        details = state["details"]
+        self._app._contract_data.pop(req_id, None)
+
+        today = datetime.now().strftime("%Y%m%d")
+        out = []
+        for d in details:
+            con = d.contract
+            exp = con.lastTradeDateOrContractMonth or ""
+            # 归一到 YYYYMMDD 末日比较 (YYYYMM 视为该月末, 近似用月+末日不必精确,
+            # 用 月份>=本月 判定即可避免漏掉本月内尚未到期的合约)
+            exp8 = exp if len(exp) >= 8 else (exp + "31")[:8]
+            if exp8 < today:
+                continue
+            try:
+                mult = float(con.multiplier) if con.multiplier else 1.0
+            except (ValueError, TypeError):
+                mult = 1.0
+            out.append({
+                "expiry": exp,
+                "con_id": con.conId,
+                "local_symbol": con.localSymbol,
+                "multiplier": mult,
+            })
+        out.sort(key=lambda x: x["expiry"])
+        return out[:max_count]
 
     # ── Combo / Spread Orders ────────────────────────────────────────
 

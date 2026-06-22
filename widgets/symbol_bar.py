@@ -10,6 +10,7 @@ from PyQt5.QtGui import QFont
 from config import (
     DEFAULT_SYMBOLS, COLOR_GREEN, COLOR_RED, COLOR_ACCENT, COLOR_TEXT,
     COLOR_BG_DARK, COLOR_BORDER, COLOR_BG_PANEL, COLOR_TEXT_DIM,
+    FUTURES_SPECS, FUTURES_SYMBOLS,
 )
 from models import TradingMode
 
@@ -22,6 +23,8 @@ class SymbolBar(QWidget):
     connect_clicked = pyqtSignal()
     disconnect_clicked = pyqtSignal()
     reconnect_requested = pyqtSignal(str)  # mode value — hot switch while connected
+    instrument_changed = pyqtSignal(str)   # "OPT" / "STK" / "FUT"
+    future_expiry_changed = pyqtSignal(str)  # 合约月份 YYYYMMDD
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,6 +41,41 @@ class SymbolBar(QWidget):
     def _build_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
+
+        # ── 交易品种切换 (期权 默认 / 正股 / 期货) ──
+        layout.addWidget(QLabel("类型:"))
+        self.instrument_combo = QComboBox()
+        for label, val in (("期权", "OPT"), ("正股", "STK"), ("期货", "FUT")):
+            self.instrument_combo.addItem(label, val)
+        self.instrument_combo.setFixedWidth(72)
+        self.instrument_combo.setToolTip(
+            "交易品种: 期权(默认) / 正股 / 期货\n"
+            "切到正股/期货后, 期权链隐藏, 点价梯按该标的的正股/期货下单"
+        )
+        self.instrument_combo.currentIndexChanged.connect(self._on_instrument_changed)
+        self.instrument_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {COLOR_BG_DARK};
+                color: {COLOR_ACCENT};
+                border: 1px solid {COLOR_ACCENT};
+                padding: 4px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }}
+        """)
+        layout.addWidget(self.instrument_combo)
+
+        # 期货合约月份下拉 (仅期货模式显示)
+        self.future_expiry_combo = QComboBox()
+        self.future_expiry_combo.setFixedWidth(150)
+        self.future_expiry_combo.setToolTip("期货合约月份 (近月 + 之后的季月)")
+        self.future_expiry_combo.currentIndexChanged.connect(
+            self._on_future_expiry_changed
+        )
+        self.future_expiry_combo.hide()
+        layout.addWidget(self.future_expiry_combo)
+
+        layout.addSpacing(16)
 
         # Symbol search input
         layout.addWidget(QLabel("标的:"))
@@ -163,6 +201,15 @@ class SymbolBar(QWidget):
             self.symbol_popup.hide()
             return
 
+        # 期货模式: 用内置期货列表本地补全 (IBKR symbolSamples 不返回期货根代码)
+        if self.instrument_combo.currentData() == "FUT":
+            matches = [
+                (s, "FUT", FUTURES_SPECS[s][3])
+                for s in FUTURES_SYMBOLS if text in s
+            ]
+            self._show_popup(matches)
+            return
+
         if self._engine and self._connected:
             # Use IBKR API search
             self._engine.search_symbols(text)
@@ -249,6 +296,47 @@ class SymbolBar(QWidget):
         else:
             self.disconnect_clicked.emit()
 
+    # ── Instrument type (期权/正股/期货) ────────────────────────────────
+
+    def _on_instrument_changed(self, _index=0):
+        kind = self.instrument_combo.currentData()  # "OPT"/"STK"/"FUT"
+        # 期货合约月份下拉只在期货模式显示 (内容由外部 populate)
+        self.future_expiry_combo.setVisible(kind == "FUT")
+        self.instrument_changed.emit(kind)
+
+    def get_instrument(self) -> str:
+        return self.instrument_combo.currentData()
+
+    def set_instrument(self, kind: str):
+        """外部 (双击持仓) 同步「类型」下拉, 不触发 instrument_changed。"""
+        idx = self.instrument_combo.findData(kind)
+        if idx < 0:
+            return
+        self.instrument_combo.blockSignals(True)
+        self.instrument_combo.setCurrentIndex(idx)
+        self.instrument_combo.blockSignals(False)
+        self.future_expiry_combo.setVisible(kind == "FUT")
+
+    def _on_future_expiry_changed(self, _index=0):
+        exp = self.future_expiry_combo.currentData()
+        if exp:
+            self.future_expiry_changed.emit(exp)
+
+    def populate_future_expiries(self, items: list):
+        """填充期货合约月份下拉。items: [(显示文本, expiry YYYYMMDD)]。
+        不触发 future_expiry_changed (由调用方决定加载哪个)。"""
+        self.future_expiry_combo.blockSignals(True)
+        self.future_expiry_combo.clear()
+        for label, exp in items:
+            self.future_expiry_combo.addItem(label, exp)
+        self.future_expiry_combo.blockSignals(False)
+        self.future_expiry_combo.setVisible(
+            self.instrument_combo.currentData() == "FUT"
+        )
+
+    def current_future_expiry(self) -> str:
+        return self.future_expiry_combo.currentData() or ""
+
     def set_connected(self, connected: bool, mode: TradingMode = TradingMode.PAPER):
         self._connected = connected
         if connected:
@@ -287,6 +375,8 @@ class SymbolBar(QWidget):
         self.mode_combo.setEnabled(not switching)
         self.connect_btn.setEnabled(not switching)
         self.symbol_input.setEnabled(not switching)
+        self.instrument_combo.setEnabled(not switching)
+        self.future_expiry_combo.setEnabled(not switching)
         if switching:
             self.status_label.setText("● 切换中...")
             self.status_label.setStyleSheet(f"color: {COLOR_ACCENT}; font-weight: bold;")

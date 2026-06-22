@@ -47,6 +47,7 @@ class InstrumentType(Enum):
     OPTION = "OPT"
     STOCK = "STK"
     ETF = "ETF"
+    FUTURE = "FUT"
 
 
 class OrderType(Enum):
@@ -70,9 +71,13 @@ class OptionInfo:
 
     @property
     def display_name(self) -> str:
-        """e.g. 'SPY 260516 C 585'; stock pseudo-contracts show the symbol."""
+        """e.g. 'SPY 260516 C 585'; stock/futures pseudo-contracts show the symbol."""
         if self.right == "STK":
             return f"{self.symbol} (正股)"
+        if self.right == "FUT":
+            # 含合约月份, 便于区分近月与季月: 'ES 期货 2606'
+            mon = self.expiry[2:6] if len(self.expiry) >= 6 else self.expiry
+            return f"{self.symbol} (期货 {mon})" if mon else f"{self.symbol} (期货)"
         strike_str = f"{int(self.strike)}" if self.strike == int(self.strike) else f"{self.strike:g}"
         return f"{self.symbol} {self.expiry[2:]} {self.right} {strike_str}"
 
@@ -85,9 +90,14 @@ class OptionInfo:
     def to_ibkr_key(self) -> str:
         """Unique key for tick subscription tracking.
         Stock pseudo-contracts share the '__stock__' key space so the
-        price ladder and underlying subscriptions see the same data."""
+        price ladder and underlying subscriptions see the same data.
+        Futures use '__fut__SYM_YYYYMM' (合约月份) 以区分近月/季月,
+        且与 reqPositions 回来的合约月份对齐 (取前 6 位 = 年月)。"""
         if self.right == "STK":
             return f"__stock__{self.symbol}"
+        if self.right == "FUT":
+            mon = self.expiry[:6] if self.expiry else ""
+            return f"__fut__{self.symbol}_{mon}"
         return f"{self.symbol}_{self.expiry}_{self.right}_{self.strike}"
 
 
@@ -211,6 +221,10 @@ class PortfolioPosition:
     def position_key(self) -> str:
         if self.sec_type == "OPT":
             return f"{self.symbol}_{self.expiry}_{self.right}_{self.strike}"
+        if self.sec_type == "FUT":
+            # 含合约月份, 区分近月/季月 (与面板筛选/双击一致)
+            mon = self.expiry[:6] if self.expiry else ""
+            return f"{self.symbol}_FUT_{mon}"
         return f"{self.symbol}_{self.sec_type}"
 
     @property
@@ -223,7 +237,7 @@ class PortfolioPosition:
     @property
     def instrument_type(self) -> str:
         """Return display type string."""
-        type_map = {"OPT": "期权", "STK": "正股", "ETF": "ETF"}
+        type_map = {"OPT": "期权", "STK": "正股", "ETF": "ETF", "FUT": "期货"}
         return type_map.get(self.sec_type, self.sec_type)
 
 

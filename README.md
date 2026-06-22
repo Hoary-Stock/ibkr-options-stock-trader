@@ -229,7 +229,7 @@ ibkr_trader/
 
 | 文件 | 角色与要点 |
 |------|-----------|
-| `symbol_bar.py` (300) | 代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
+| `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
 | `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。 |
 | `price_ladder.py` (1121) ★ | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 按 penny-pilot(<$3=0.01,≥$3=0.05)及 `TICK_SIZE_OVERRIDES`(SPX 0.05/0.10)。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
@@ -338,6 +338,7 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 | 费率 | 期权 `$0.65/张`,`min $1.00`;正股 `$0.005/股`,`min $1.00`;模拟起始资金 `$10000` |
 | 时段(ET) | SPX GTH 20:15→09:15,RTH 09:30→16:15,Curb 16:15→17:00;`EXTENDED_HOURS_SYMBOLS={SPX}` |
 | 代码 | `INDEX_SYMBOLS`(secType=IND);`DEFAULT_SYMBOLS`(SPY/SPX/QQQ/...) |
+| 期货 | `FUTURES_SPECS`(根代码→交易所/乘数/tick/名称: ES/MES/NQ/MNQ/RTY/M2K/YM/MYM/CL/MCL/GC/MGC);`FUTURES_SYMBOLS`;`FUTURES_MAX_EXPIRIES=5`(月份下拉档数);`FUTURES_COMMISSION_PER_CONTRACT/MIN`。只收录 tick≥0.01 的品种(点价梯按 2 位小数网格)。 |
 | 错误码 | `IGNORED_ERROR_CODES`(静默)/`DATA_CONNECTION_ERROR_CODES`(2100/2103-2108 作警告上抛) |
 | 期权定价 | `RISK_FREE_RATE=0.045`、`DIVIDEND_YIELD=0.0`、`OPTION_MARKET_CLOSE_ET=16`、`CALCULATOR_REFRESH_MS=700`(计算器用) |
 | 图表 | `CHART_TIMEFRAMES`(1秒~月线)+ 各类颜色 |
@@ -393,6 +394,52 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-22** — **修 2107/2108 误报标红**(久存待办)。`2107/2108`「farm inactive but should be
+  available upon demand」是 IBKR 行情farm的**空闲待命**状态(取数据时自动重连),非故障;原 `_on_error`
+  把它与真断开(2100/2103/2105)一样标红"行情数据连接异常"。改为:2104/2106=正常、**2107/2108=中性提示
+  (不标红)**、仅 2100/2103/2105 标红。(`main_window.py`)
+- **2026-06-22** — **Gateway 卡死(JTS死锁)时连不上 → 给明确提示让用户重启 Gateway**。日志实测
+  `JTS-DeadlockMonitor` 死锁(`EWriter` + `usopt*` 期权行情farm线程)→ Gateway 无法再向 API 写数据、
+  clientId 也不释放,客户端**无法自愈**,必须重启 Gateway。这非本程序 bug。改:连接超时(套接字通但
+  `nextValidId` 不回)时 `connect()` 明确报"Gateway 无响应/可能卡死,请重启",并清空 `self._app`;
+  326 全占用与 `main_window` 的连接/切换失败提示也都改为提示"重启 Gateway"。**根治靠升级 IB Gateway
+  到最新稳定版**(JTS 死锁是版本 bug)+ 降低美股期权行情订阅负载。(`ibkr_engine.py`, `main_window.py`)
+- **2026-06-22** — **XSP 最小跳动改 0.01**(原 0.05/0.10 太粗)。CBOE 实测 XSP(Mini-SPX)**全系列统一
+  $0.01**(与 SPX 的 0.05/0.10 不同),`config.TICK_SIZE_OVERRIDES["XSP"]` 改为 `(0.01, 0.01)`,点价梯
+  即按 0.01 排档。(`config.py`)
+- **2026-06-22** — **修「模拟盘切回实盘连不上 / 刚连上又断开」(clientId 释放竞态)**。日志实测 326
+  「clientId in use」:热切换时旧 clientId 尚未被 Gateway 释放(它正忙加载持仓时更慢)→ 退避到 +10 重试。
+  ① **根治"刚连上又断"**:重试丢弃旧连接前先把 `self._app` 置空,使被丢弃连接的 reader 线程
+  (`_run_wrapper`)判定 `app is self._app` 为 False、**不再误发 `disconnected`**(该信号原会晚于新连接的
+  `connected` 到达 GUI → 看似连上又断)。② 释放等待加长:`reconnect` 1.5s→3s、326 重试间隔 0.5s→1.5s、
+  重试次数 3→5(10/20/30/40/50)。③ 新增 `_base_client_id`:每次连接都从**标准 id**(10)起算重试,
+  避免一次 326 退避后 `_client_id` 永久漂到 20/30。(`ibkr_engine.py`)
+- **2026-06-22** — **加「延迟行情自动回退」(修模拟盘看不到期货报价)**。根因:IBKR 行情订阅绑在实盘账户,
+  **模拟盘默认无行情**(未开"与模拟账户共享行情"),且本账户仅美股快照、无期货行情包 → 期货点价梯空白像"搜不到"。
+  改:某合约报 **354 / 10168「未订阅实时行情」**时,引擎一次性 `reqMarketDataType(3)` 切**延迟行情**并按原 reqId
+  重订当前所有行情线(已订阅实时的合约仍走实时);`IBKRApp` 加 `_tick_req_contract`(reqId→合约)与
+  `_switch_to_delayed_and_resubscribe`。正解仍是去 IBKR Client Portal 给模拟盘**开启行情共享 / 订阅期货行情**。
+  (`ibkr_engine.py`)
+- **2026-06-22** — **修「期货搜不到」**:期货模式下搜索框改用**内置期货列表本地补全**(IBKR
+  `reqMatchingSymbols`/`symbolSamples` 不返回期货根代码,之前结果被过滤成只剩 STK/IND/ETF → 期货永远搜不到);
+  切到「期货」且当前标的非期货根代码时**自动填默认 `ES`** 并加载,免去"SPY 不在列表"的困惑。
+  注:期货**实时盘口**需账户有 CME 等期货行情订阅(本账户仅美股快照),无订阅时合约能解析、能下单,但点价梯无报价。
+  (`widgets/symbol_bar.py`, `main_window.py`)
+- **2026-06-22** — **期权 GUI 顶栏加「类型」三选一(期权/正股/期货),默认期权,可切正股/期货交易**。
+  在 `SymbolBar` 顶栏最左加 `类型` 下拉(`期权`默认/`正股`/`期货`)+ 期货专用「合约月份」下拉
+  (新信号 `instrument_changed`/`future_expiry_changed`,方法 `set_instrument`/`populate_future_expiries`)。
+  **复用现有点价梯/持仓/委托面板**(沿用 `stock_trader.py` 的伪合约思路):切到正股 → 隐藏期权链、
+  用 `OptionInfo(right='STK')` 载入点价梯;切到期货 → 后台 `resolve_futures_contracts` 解析**近月 + 之后
+  几个季月**(下拉可选),用 `OptionInfo(right='FUT')` 载入。下单按品种路由:期权走 `place_limit/market_order`、
+  正股走 `place_stock_order`、期货走新增 `place_futures_order`;平仓对正股/期货用市价反向单(数量取
+  `reqPositions`)。新增 `config.FUTURES_SPECS`(ES/MES/NQ/MNQ/RTY/M2K/YM/MYM/CL/MCL/GC/MGC 的交易所/乘数/
+  tick)+ `FUTURES_COMMISSION_*`;`models` 的 `OptionInfo` 支持 `right='FUT'`(`__fut__SYM_YYYYMM` 键、
+  `(期货 YYMM)` 显示)、`PortfolioPosition` 加 `FUT→期货`;`ibkr_engine._on_portfolio_position` 把正股/期货
+  持仓也缓存进 `_ibkr_positions`(伪合约键),使点价梯持仓数量/平仓按钮在新品种下也工作(顺带修好
+  `stock_trader.py` 点价梯平仓按钮);点价梯 tick 抽成 `_tick_sizes()`、确认框数量单位按品种(张/股/手);
+  持仓面板加「期货」筛选 + `set_filter()`。`PaperEngine` 补 `place_stock_order`/`place_futures_order`(本地撮合,
+  盈亏为近似)使本地模拟也能测。(`config.py`, `models.py`, `ibkr_engine.py`, `paper_engine.py`,
+  `main_window.py`, `widgets/symbol_bar.py`, `widgets/price_ladder.py`, `widgets/position_panel.py`)
 - **2026-06-19** — **双击持仓/委托的合约 → 跳到该标的 + 加载到点价梯**。委托面板 `order_panel` 新增
   `option_selected` 信号(双击行,COMBO 跳过)+ `_row_options` 行映射;`_on_option_selected` 增加:若合约属于
   另一标的则切换标的并重载期权链(`symbol_bar.set_symbol`),再把合约载入点价梯+计算器(持仓面板原本就有双击跳转)。
@@ -534,7 +581,12 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 ### 已知问题 / 待办
 
-- [ ] **2108/2107 误报标红**(见上)——尚未改代码,仅完成分析。
+- [x] **2108/2107 误报标红** —— 已修 (2026-06-22, 见变更记录): 2107/2108 改为中性提示、不标红。
+- [ ] **期货 K 线图未支持**:`ChartWindow` 用 `_make_underlying_contract`(STK)取历史,期货根代码(ES 等)
+  按正股取会无数据/报错;期货模式下「K线图」暂不可用,待后续让图表按 FUT 合约取历史。
+- [ ] **本地模拟下正股/期货盈亏为近似**:`PaperEngine` 持仓盈亏按期权乘数(×100)估算,正股/期货数值不准,
+  仅用于下单链路测试;真实/IBKR模拟盘下持仓盈亏来自 IBKR API,准确。
+- [ ] **银 (SI) 等 tick<0.01 的期货未收录**:点价梯按 2 位小数网格,sub-cent tick 会错位,暂不收录。
 
 ---
 

@@ -309,6 +309,31 @@ class PaperEngine:
         )
         return order_id
 
+    def place_stock_order(self, symbol: str, action: OrderAction,
+                          quantity: int, price: float = 0.0,
+                          order_type: OrderType = OrderType.LIMIT,
+                          outside_rth: bool = False) -> int:
+        """本地模拟正股下单 — 复用伪合约 (right='STK') 的本地撮合。
+        注: 模拟账户盈亏按期权乘数(×100)估算, 仅用于链路测试, 非精确。"""
+        pseudo = OptionInfo(symbol=symbol, expiry="", strike=0.0, right="STK")
+        if order_type == OrderType.MARKET:
+            return self.place_market_order(pseudo, action, quantity,
+                                           outside_rth=outside_rth)
+        return self.place_limit_order(pseudo, action, quantity, price,
+                                      outside_rth=outside_rth)
+
+    def place_futures_order(self, symbol: str, expiry: str, action: OrderAction,
+                            quantity: int, price: float = 0.0,
+                            order_type: OrderType = OrderType.LIMIT,
+                            outside_rth: bool = False) -> int:
+        """本地模拟期货下单 — 复用伪合约 (right='FUT') 的本地撮合 (同上, 盈亏为近似)。"""
+        pseudo = OptionInfo(symbol=symbol, expiry=expiry, strike=0.0, right="FUT")
+        if order_type == OrderType.MARKET:
+            return self.place_market_order(pseudo, action, quantity,
+                                           outside_rth=outside_rth)
+        return self.place_limit_order(pseudo, action, quantity, price,
+                                      outside_rth=outside_rth)
+
     def cancel_order(self, order_id: int):
         """Cancel a pending order."""
         order = self._orders.get(order_id)

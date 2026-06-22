@@ -17,7 +17,8 @@ from config import (
     SPX_SESSION_RTH_START, SPX_SESSION_RTH_END,
     DATA_CONNECTION_ERROR_CODES,
 )
-from models import OptionInfo, OrderAction, TradingMode
+from config import FUTURES_SPECS, FUTURES_MAX_EXPIRIES
+from models import OptionInfo, OrderAction, OrderType, TradingMode
 from ibkr_engine import IBKREngine
 from paper_engine import PaperEngine
 from sound_alerts import play_fill
@@ -134,6 +135,7 @@ class MainWindow(QMainWindow):
     """Main application window."""
 
     _search_validated = pyqtSignal(object)  # OptionInfo — validated search result
+    _futures_resolved = pyqtSignal(object)  # (symbol, contracts) — futures resolved off-thread
 
     def __init__(self):
         super().__init__()
@@ -152,6 +154,8 @@ class MainWindow(QMainWindow):
 
         self._current_symbol = "SPY"
         self._current_option: OptionInfo | None = None
+        self._instrument = "OPT"   # "OPT"(默认) / "STK" / "FUT"
+        self._future_expiries: list = []  # 当前期货标的的合约月份 [{expiry,con_id,...}]
         self._chart_windows: list = []  # list[ChartWindow]
         self._strategy_windows: list = []
 
@@ -284,6 +288,8 @@ class MainWindow(QMainWindow):
         self.symbol_bar.symbol_changed.connect(self._on_symbol_changed)
         self.symbol_bar.mode_changed.connect(self._on_mode_changed)
         self.symbol_bar.reconnect_requested.connect(self._on_reconnect_requested)
+        self.symbol_bar.instrument_changed.connect(self._on_instrument_changed)
+        self.symbol_bar.future_expiry_changed.connect(self._on_future_expiry_changed)
 
         # Option chain -> price ladder
         self.option_chain.option_selected.connect(self._on_option_selected)
@@ -306,6 +312,7 @@ class MainWindow(QMainWindow):
         # Price ladder -> contract search
         self.price_ladder.contract_searched.connect(self._on_contract_searched)
         self._search_validated.connect(self._load_validated_contract)
+        self._futures_resolved.connect(self._apply_futures_contracts)
 
         # Position panel -> open ladder
         self.position_panel.position_clicked.connect(self._on_option_selected)
@@ -369,7 +376,8 @@ class MainWindow(QMainWindow):
             success = self.ibkr_engine.connect(mode)
             if not success:
                 self.ibkr_engine.bridge.error_received.emit(
-                    -1, -1, f"连接失败 — 请确认 TWS/Gateway 已启动"
+                    -1, -1, "连接失败 — 请确认 Gateway/TWS 已登录。若刚才还能用、"
+                    "现在连不上, 多半是 Gateway 卡死(JTS死锁), 请重启 Gateway 后再连。"
                 )
 
         threading.Thread(target=do_connect, daemon=True).start()
@@ -407,8 +415,8 @@ class MainWindow(QMainWindow):
         self.ibkr_engine.request_positions()
         self.account_bar.start()
 
-        # Auto-load option chain for current symbol
-        self._load_option_chain(self._current_symbol)
+        # 按当前交易品种加载 (期权链 / 正股伪合约 / 期货合约)
+        self._load_current_instrument()
 
     def _on_disconnected(self):
         # 复位"切换中"状态, 避免切换失败后控件卡在禁用
@@ -433,7 +441,120 @@ class MainWindow(QMainWindow):
     def _on_symbol_changed(self, symbol: str):
         self._current_symbol = symbol
         if self.ibkr_engine.is_connected:
-            self._load_option_chain(symbol)
+            self._load_current_instrument()
+
+    # ── Instrument type (期权/正股/期货) ────────────────────────────────
+
+    def _on_instrument_changed(self, kind: str):
+        """顶栏「类型」切换: 期权 / 正股 / 期货。"""
+        if kind == self._instrument:
+            return
+        self._instrument = kind
+        # 期权链仅在期权模式显示
+        self.option_chain.setVisible(kind == "OPT")
+        # 持仓筛选随品种切换
+        self.position_panel.set_filter(
+            {"OPT": "期权", "STK": "正股/ETF", "FUT": "期货"}[kind]
+        )
+        # 清空期货合约月份缓存 (重新解析)
+        if kind != "FUT":
+            self._future_expiries = []
+        # 切到期货且当前标的不是期货根代码 → 默认填一个 (ES), 避免提示"不在列表"
+        if kind == "FUT" and self._current_symbol.upper() not in FUTURES_SPECS:
+            default_fut = "ES" if "ES" in FUTURES_SPECS else next(iter(FUTURES_SPECS))
+            self._current_symbol = default_fut
+            self.symbol_bar.set_symbol(default_fut)
+        if self.ibkr_engine.is_connected:
+            self._load_current_instrument()
+
+    def _load_current_instrument(self):
+        """按当前 _instrument 加载: 期权链 / 正股伪合约 / 期货合约到点价梯。"""
+        sym = self._current_symbol
+        if self._instrument == "OPT":
+            self._load_option_chain(sym)
+        elif self._instrument == "STK":
+            self._load_stock_into_ladder(sym)
+        elif self._instrument == "FUT":
+            self._load_futures(sym)
+
+    def _load_stock_into_ladder(self, symbol: str):
+        """正股: 直接用伪合约 (right='STK') 载入点价梯 (复用 stock_trader 模式)。"""
+        from config import INDEX_SYMBOLS
+        if symbol in INDEX_SYMBOLS:
+            self.statusBar().showMessage(f"{symbol} 是指数, 不能直接交易正股")
+            return
+        pseudo = OptionInfo(symbol=symbol, expiry="", strike=0.0, right="STK")
+        self.price_ladder.set_option(pseudo)
+        self.calculator.set_option(pseudo)
+        self.symbol_bar.set_current_option(pseudo.display_name)
+        self.statusBar().showMessage(f"正股: 已加载 {symbol}")
+
+    def _load_futures(self, symbol: str):
+        """期货: 后台解析近月起若干合约 → 填充月份下拉 → 默认载入近月。"""
+        symbol = symbol.upper()
+        if symbol not in FUTURES_SPECS:
+            avail = ", ".join(FUTURES_SPECS.keys())
+            self.statusBar().showMessage(
+                f"{symbol} 不在内置期货列表; 可用: {avail}"
+            )
+            self.symbol_bar.populate_future_expiries([])
+            return
+
+        self.statusBar().showMessage(f"解析 {symbol} 期货合约...")
+
+        def do_resolve():
+            try:
+                contracts = self.ibkr_engine.resolve_futures_contracts(
+                    symbol, max_count=FUTURES_MAX_EXPIRIES
+                )
+                if not contracts:
+                    self.ibkr_engine.bridge.error_received.emit(
+                        -1, -1, f"{symbol} 无可用期货合约"
+                    )
+                    return
+                # 跳回 GUI 线程填充下拉并载入近月
+                self._futures_resolved.emit((symbol, contracts))
+            except Exception as e:
+                self.ibkr_engine.bridge.error_received.emit(-1, -1, f"期货解析失败: {e}")
+
+        threading.Thread(target=do_resolve, daemon=True).start()
+
+    def _apply_futures_contracts(self, payload):
+        """在 GUI 线程: 填充期货月份下拉, 默认载入近月。payload=(symbol, contracts)。"""
+        symbol, contracts = payload
+        # 用户可能在解析期间又切走了品种/标的 — 丢弃过期结果
+        if self._instrument != "FUT" or symbol != self._current_symbol.upper():
+            return
+        self._future_expiries = contracts
+        items = []
+        for i, c in enumerate(contracts):
+            exp = c["expiry"]
+            mon = exp[:6] if len(exp) >= 6 else exp
+            mon_disp = f"{mon[:4]}-{mon[4:6]}" if len(mon) >= 6 else mon
+            tag = " (近月)" if i == 0 else (" (季月)" if i == 1 else "")
+            items.append((f"{mon_disp}{tag}", exp))
+        self.symbol_bar.populate_future_expiries(items)
+        # 默认载入近月
+        self._load_future_contract(symbol, contracts[0]["expiry"])
+
+    def _load_future_contract(self, symbol: str, expiry: str):
+        """把指定期货合约月份载入点价梯。"""
+        con_id = 0
+        for c in self._future_expiries:
+            if c["expiry"] == expiry:
+                con_id = c.get("con_id", 0)
+                break
+        pseudo = OptionInfo(symbol=symbol, expiry=expiry, strike=0.0,
+                            right="FUT", con_id=con_id)
+        self.price_ladder.set_option(pseudo)
+        self.calculator.set_option(pseudo)
+        self.symbol_bar.set_current_option(pseudo.display_name)
+        self.statusBar().showMessage(f"期货: 已加载 {pseudo.display_name}")
+
+    def _on_future_expiry_changed(self, expiry: str):
+        """用户切换期货合约月份下拉。"""
+        if self._instrument == "FUT" and expiry:
+            self._load_future_contract(self._current_symbol, expiry)
 
     def _on_mode_changed(self, mode_value: str):
         """Handle mode change before connection."""
@@ -461,7 +582,8 @@ class MainWindow(QMainWindow):
             success = self.ibkr_engine.reconnect(mode)
             if not success:
                 self.ibkr_engine.bridge.error_received.emit(
-                    -1, -1, f"重连失败 — 请确认 TWS/Gateway 已启动 ({mode.label})"
+                    -1, -1, f"切到 {mode.label} 失败 — 若 Gateway 刚才还能用现在连不上, "
+                    "多半是 Gateway 卡死(JTS死锁)或旧连接未释放, 请重启 Gateway 后再连。"
                 )
                 self.ibkr_engine.bridge.disconnected.emit()
 
@@ -575,14 +697,40 @@ class MainWindow(QMainWindow):
 
     # ── Option Selected ───────────────────────────────────────────────
 
+    def _set_instrument_ui(self, kind: str):
+        """同步「类型」下拉 + 期权链可见性 + 持仓筛选 (不触发重新加载)。"""
+        if self._instrument != kind:
+            self._instrument = kind
+            self.symbol_bar.set_instrument(kind)
+            self.option_chain.setVisible(kind == "OPT")
+            self.position_panel.set_filter(
+                {"OPT": "期权", "STK": "正股/ETF", "FUT": "期货"}[kind]
+            )
+
     def _on_option_selected(self, option: OptionInfo):
         self._current_option = option
-        # 跳转到对应标的: 若双击的合约属于另一个标的, 切换标的并重载期权链
+        right = getattr(option, "right", "")
         sym = getattr(option, "symbol", "")
-        if (sym and getattr(option, "right", "") != "COMBO"
-                and sym != self._current_symbol):
+
+        # 正股 / 期货合约 (多来自双击对应持仓): 切到该品种模式并直接载入点价梯,
+        # 不加载期权链
+        if right in ("STK", "FUT"):
+            if sym:
+                self._current_symbol = sym
+                self.symbol_bar.set_symbol(sym)
+            self._set_instrument_ui(right)
+            self.price_ladder.set_option(option)
+            self.calculator.set_option(option)
+            self.symbol_bar.set_current_option(option.display_name)
+            self.statusBar().showMessage(f"已选择: {option.display_name}")
+            return
+
+        # 期权 (C/P): 若属于另一个标的则切换标的并重载期权链 (并切回期权模式)
+        if sym and right != "COMBO" and (sym != self._current_symbol
+                                         or self._instrument != "OPT"):
             self._current_symbol = sym
             self.symbol_bar.set_symbol(sym)
+            self._set_instrument_ui("OPT")
             if self.ibkr_engine.is_connected:
                 self._load_option_chain(sym)
         # 加载到点价梯 + 计算器 (点价交易界面就在左侧, 一直可见)
@@ -655,19 +803,44 @@ class MainWindow(QMainWindow):
 
     # ── Order Handling ────────────────────────────────────────────────
 
+    def _unit_for(self, option: OptionInfo) -> str:
+        """下单数量单位: 期货=手, 正股=股, 期权=张。"""
+        return {"FUT": "手", "STK": "股"}.get(option.right, "张")
+
+    def _place_order(self, option: OptionInfo, action: OrderAction,
+                     order_type: OrderType, price: float, qty: int,
+                     outside_rth: bool) -> int:
+        """按品种路由下单: 期权 / 正股 / 期货, 返回 orderId。"""
+        eng = self._active_engine
+        if option.right in ("C", "P"):
+            if order_type == OrderType.LIMIT:
+                return eng.place_limit_order(option, action, qty, price,
+                                             outside_rth=outside_rth)
+            return eng.place_market_order(option, action, qty,
+                                          outside_rth=outside_rth)
+        if option.right == "STK":
+            return eng.place_stock_order(option.symbol, action, qty, price,
+                                         order_type=order_type,
+                                         outside_rth=outside_rth)
+        if option.right == "FUT":
+            return eng.place_futures_order(option.symbol, option.expiry, action,
+                                           qty, price, order_type=order_type,
+                                           outside_rth=outside_rth)
+        return -1
+
     def _on_order_requested(self, option: OptionInfo, action_str: str, price: float):
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
         qty = self.price_ladder.get_quantity()
-
         outside_rth = self.price_ladder.get_outside_rth()
-        order_id = self._active_engine.place_limit_order(
-            option, action, qty, price, outside_rth=outside_rth
-        )
+
+        order_id = self._place_order(option, action, OrderType.LIMIT, price, qty,
+                                     outside_rth)
         if order_id > 0:
             action_text = "买入" if action == OrderAction.BUY else "卖出"
             rth_tag = " [盘外]" if outside_rth else ""
             self.statusBar().showMessage(
-                f"已提交: {action_text} {qty}张 {option.display_name} @ ${price:.2f}{rth_tag}"
+                f"已提交: {action_text} {qty}{self._unit_for(option)} "
+                f"{option.display_name} @ ${price:.2f}{rth_tag}"
             )
             # Switch to order tab
             self.right_tabs.setCurrentIndex(1)
@@ -678,23 +851,33 @@ class MainWindow(QMainWindow):
         qty = self.price_ladder.get_quantity()
         outside_rth = self.price_ladder.get_outside_rth()
 
-        order_id = self._active_engine.place_market_order(
-            option, action, qty, outside_rth=outside_rth
-        )
+        order_id = self._place_order(option, action, OrderType.MARKET, 0.0, qty,
+                                     outside_rth)
         if order_id > 0:
             action_text = "市价买入" if action == OrderAction.BUY else "市价卖出"
             rth_tag = " [盘外]" if outside_rth else ""
             self.statusBar().showMessage(
-                f"已提交: {action_text} {qty}张 {option.display_name}{rth_tag}"
+                f"已提交: {action_text} {qty}{self._unit_for(option)} "
+                f"{option.display_name}{rth_tag}"
             )
             self.right_tabs.setCurrentIndex(1)
 
     def _on_close_position_requested(self, option: OptionInfo):
-        """Handle close position from price ladder."""
+        """Handle close position from price ladder (期权/正股/期货)。"""
         outside_rth = self.price_ladder.get_outside_rth()
-        order_id = self._active_engine.close_position(
-            option, outside_rth=outside_rth
-        )
+
+        if option.right in ("C", "P"):
+            order_id = self._active_engine.close_position(
+                option, outside_rth=outside_rth
+            )
+        else:
+            # 正股/期货: 用市价反向单平掉 reqPositions 报来的持仓数量
+            qty = self._active_engine.get_position_qty(option.to_ibkr_key())
+            if qty <= 0:
+                self.statusBar().showMessage(f"无 {option.display_name} 多头持仓可平")
+                return
+            order_id = self._place_order(option, OrderAction.SELL,
+                                         OrderType.MARKET, 0.0, qty, outside_rth)
         if order_id > 0:
             rth_tag = " [盘外]" if outside_rth else ""
             self.statusBar().showMessage(f"已提交平仓: {option.display_name}{rth_tag}")
@@ -911,11 +1094,17 @@ class MainWindow(QMainWindow):
     def _on_error(self, req_id: int, code: int, msg: str):
         # Data connection errors — show specific warning in status bar
         if code in DATA_CONNECTION_ERROR_CODES:
-            # 2104/2106 are recovery messages ("connection is OK")
             if code in (2104, 2106):
-                self.statusBar().showMessage(f"行情数据连接已恢复")
+                # 连接正常/已恢复
+                self.statusBar().showMessage("行情数据连接正常")
+                self.statusBar().setStyleSheet("")
+            elif code in (2107, 2108):
+                # farm「inactive but should be available upon demand」=
+                # 空闲待命 (取数据时自动重连), 是 IBKR 正常状态, 不是故障 → 不标红
+                self.statusBar().showMessage(f"行情farm空闲 [{code}] (按需自动重连, 正常)")
                 self.statusBar().setStyleSheet("")
             else:
+                # 仅 2100 / 2103 / 2105 是真正的连接断开 → 标红告警
                 self.statusBar().showMessage(f"⚠ 行情数据连接异常 [{code}]: {msg}")
                 self.statusBar().setStyleSheet(
                     f"QStatusBar {{ color: {COLOR_RED}; }}"

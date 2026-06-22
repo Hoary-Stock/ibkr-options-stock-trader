@@ -26,7 +26,7 @@ from config import (
     LADDER_ROWS, COLOR_BUY, COLOR_SELL, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BUTTON_DISABLED, COLOR_BG_DARK, COLOR_BORDER, COLOR_BG,
     COLOR_BG_PANEL, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
-    COLOR_DEPTH_BID, COLOR_DEPTH_ASK, COLOR_MY_ORDER,
+    COLOR_DEPTH_BID, COLOR_DEPTH_ASK, COLOR_MY_ORDER, FUTURES_SPECS,
 )
 from models import OptionInfo, OrderAction
 
@@ -688,6 +688,30 @@ class PriceLadder(QWidget):
         """Get current quantity from the integrated spinner."""
         return self.qty_spin.value()
 
+    def _tick_sizes(self) -> tuple[float, float]:
+        """当前合约的 (小价 tick, 大价 tick)。
+        正股=penny; 期货按 FUTURES_SPECS 固定 tick; 指数期权用 overrides;
+        其余期权用 penny-pilot 0.01/0.05。"""
+        opt = self._option
+        if opt is None:
+            return TICK_SIZE_SMALL, TICK_SIZE_LARGE
+        sym = opt.symbol.upper()
+        if opt.right == "STK":
+            return 0.01, 0.01
+        if opt.right == "FUT":
+            spec = FUTURES_SPECS.get(sym)
+            t = spec[2] if spec else 0.25
+            return t, t
+        if sym in TICK_SIZE_OVERRIDES:
+            return TICK_SIZE_OVERRIDES[sym]
+        return TICK_SIZE_SMALL, TICK_SIZE_LARGE
+
+    def _unit(self) -> str:
+        """下单数量单位 (确认框文案): 期货=手, 正股=股, 期权=张。"""
+        if self._option is None:
+            return "张"
+        return {"FUT": "手", "STK": "股"}.get(self._option.right, "张")
+
     def get_outside_rth(self) -> bool:
         """Whether orders should be allowed outside regular trading hours."""
         return self.outside_rth_checkbox.isChecked()
@@ -743,15 +767,9 @@ class PriceLadder(QWidget):
         if mid <= 0:
             mid = 1.0
 
-        # Use symbol-specific tick size (SPX uses wider ticks).
+        # Use instrument-specific tick size (SPX/futures use wider ticks).
         # Stocks always trade in pennies (the $3 threshold is options-only).
-        sym = self._option.symbol.upper()
-        if self._option.right == "STK":
-            ts, tl = 0.01, 0.01
-        elif sym in TICK_SIZE_OVERRIDES:
-            ts, tl = TICK_SIZE_OVERRIDES[sym]
-        else:
-            ts, tl = TICK_SIZE_SMALL, TICK_SIZE_LARGE
+        ts, tl = self._tick_sizes()
         tick = ts if mid < TICK_THRESHOLD else tl
 
         # Generate price levels centered on mid
@@ -848,13 +866,7 @@ class PriceLadder(QWidget):
                 ask_depth_map[round(p, 2)] = s
 
         # Determine current tick size for grid snapping
-        sym = self._option.symbol.upper()
-        if self._option.right == "STK":
-            ts, tl = 0.01, 0.01
-        elif sym in TICK_SIZE_OVERRIDES:
-            ts, tl = TICK_SIZE_OVERRIDES[sym]
-        else:
-            ts, tl = TICK_SIZE_SMALL, TICK_SIZE_LARGE
+        ts, tl = self._tick_sizes()
         cur_mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
         cur_tick = ts if cur_mid < TICK_THRESHOLD else tl
 
@@ -1059,7 +1071,7 @@ class PriceLadder(QWidget):
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认市价买入",
-                    f"确认市价买入 {qty} 张\n{self._option.display_name}？",
+                    f"确认市价买入 {qty} {self._unit()}\n{self._option.display_name}？",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
@@ -1072,7 +1084,7 @@ class PriceLadder(QWidget):
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认市价卖出",
-                    f"确认市价卖出 {qty} 张\n{self._option.display_name}？",
+                    f"确认市价卖出 {qty} {self._unit()}\n{self._option.display_name}？",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
@@ -1090,7 +1102,7 @@ class PriceLadder(QWidget):
             if not self.no_confirm_checkbox.isChecked():
                 reply = QMessageBox.question(
                     self, "确认市价平仓",
-                    f"确认市价平仓 {pos_qty} 张\n{self._option.display_name}？",
+                    f"确认市价平仓 {pos_qty} {self._unit()}\n{self._option.display_name}？",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
@@ -1116,7 +1128,7 @@ class PriceLadder(QWidget):
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认买入",
-                    f"确认限价买入 {qty} 张\n"
+                    f"确认限价买入 {qty} {self._unit()}\n"
                     f"{self._option.display_name}\n"
                     f"价格: ${price:.2f}",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -1131,7 +1143,7 @@ class PriceLadder(QWidget):
                 qty = self.get_quantity()
                 reply = QMessageBox.question(
                     self, "确认卖出",
-                    f"确认限价卖出 {qty} 张\n"
+                    f"确认限价卖出 {qty} {self._unit()}\n"
                     f"{self._option.display_name}\n"
                     f"价格: ${price:.2f}",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,

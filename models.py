@@ -258,6 +258,72 @@ class ComboLegInfo:
 
 
 @dataclass
+class ConditionalOrder:
+    """本地/原生「条件单」(止盈 TP / 止损 SL)。
+
+    含义:价格到达 trigger_price 后,挂出一张 limit_price 的限价单。
+    - native=False(本地): 到价前**不发到 IBKR**,由本程序监控现价、到价才提交限价单
+      (规避「同合约不能双向挂单」201, 但只在程序运行时有效)。
+    - native=True: 立即用 IBKR 原生 STP LMT 挂到服务器(关程序也有效, 受 201 限制)。
+
+    TP(止盈): 现价 **>=** trigger 时触发(向上); SL(止损): 现价 **<=** trigger 时触发(向下)。
+    当前面向「平多」: action 固定 SELL(可后续扩展买入侧)。
+    """
+    cond_id: int
+    option: "OptionInfo"
+    kind: str                 # "TP"(止盈) / "SL"(止损)
+    action: str = "SELL"      # 平多 → 卖出
+    trigger_price: float = 0.0
+    limit_price: float = 0.0   # 触发后挂的限价 (默认 = trigger_price)
+    quantity: int = 1
+    native: bool = False       # True=IBKR 原生 STP LMT; False=本地监控
+    outside_rth: bool = False
+    armed_time: datetime = field(default_factory=datetime.now)
+
+    @property
+    def key(self) -> str:
+        return self.option.to_ibkr_key()
+
+    @property
+    def kind_label(self) -> str:
+        return "止盈" if self.kind == "TP" else "止损"
+
+    def is_triggered(self, price: float) -> bool:
+        """现价是否已达触发条件 (TP 向上 / SL 向下)。"""
+        if price <= 0:
+            return False
+        return price >= self.trigger_price if self.kind == "TP" else price <= self.trigger_price
+
+    def to_dict(self) -> dict:
+        o = self.option
+        return {
+            "cond_id": self.cond_id,
+            "symbol": o.symbol, "expiry": o.expiry, "strike": o.strike,
+            "right": o.right, "con_id": o.con_id,
+            "kind": self.kind, "action": self.action,
+            "trigger_price": self.trigger_price, "limit_price": self.limit_price,
+            "quantity": self.quantity, "native": self.native,
+            "outside_rth": self.outside_rth,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ConditionalOrder":
+        opt = OptionInfo(
+            symbol=d["symbol"], expiry=d.get("expiry", ""),
+            strike=d.get("strike", 0.0), right=d.get("right", "C"),
+            con_id=d.get("con_id", 0),
+        )
+        return ConditionalOrder(
+            cond_id=d["cond_id"], option=opt, kind=d["kind"],
+            action=d.get("action", "SELL"),
+            trigger_price=d.get("trigger_price", 0.0),
+            limit_price=d.get("limit_price", 0.0),
+            quantity=d.get("quantity", 1), native=d.get("native", False),
+            outside_rth=d.get("outside_rth", False),
+        )
+
+
+@dataclass
 class DepthRow:
     """Single row of market depth data."""
     price: float = 0.0

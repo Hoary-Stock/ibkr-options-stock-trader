@@ -57,6 +57,7 @@ ibkr_trader/
 ├── main_window.py          # 期权 GUI 主窗口 MainWindow — 组装所有 widget + 信号连线
 ├── ibkr_engine.py          # IBKR API 引擎 (EWrapper/EClient + 下单/撤单 + Qt 信号桥)  ★核心
 ├── paper_engine.py         # 模拟交易引擎 (复用 IBKR 行情, 本地撮合成交)
+├── conditional_orders.py   # 本地条件单管理器 (止盈/止损: 到价才发限价单, 持久化 conditional_orders.json)
 ├── models.py               # 纯数据模型 (dataclass + Enum), 无 Qt/IBKR 依赖
 ├── config.py               # 全部常量 (连接/费率/颜色/tick/图表/交易时段)
 ├── single_instance.py      # 启动辅助: 杀掉同脚本的旧进程以释放 clientId
@@ -229,7 +230,7 @@ ibkr_trader/
 |------|-----------|
 | `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
 | `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。 |
-| `price_ladder.py` (1121) ★ | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 按 penny-pilot(<$3=0.01,≥$3=0.05)及 `TICK_SIZE_OVERRIDES`(SPX 0.05/0.10)。 |
+| `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
 | `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。 |
 | `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);每 `ACCOUNT_REFRESH_MS` (3s) 刷新账户摘要 + `request_currency_balances()`。 |
@@ -393,6 +394,17 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-22** — **点价梯加「条件单」(止盈/止损)**。点价梯勾选框那行加「条件单 ▾」开关, 展开面板:
+  ☑止盈 / ☑止损(可单选)+ 各自触发价 + 数量 + ☐用IBKR原生 + 「挂条件单」+ 已挂列表(✕ 取消)。
+  **含义**:到达触发价才挂出对应**限价单**。**本地模式(默认)**到价前不发到 IBKR,由本程序每 0.5s 监控现价、
+  到价才提交 —— **规避 IBKR「同合约不能双向挂单」(错误 201,正是"有卖单时挂不了买单"的根因)**,
+  但**只在程序运行时监控**(已持久化到 `conditional_orders.json`,重连恢复;关程序/崩溃即失效, 面板有醒目提示)。
+  **原生模式**:止损用 IBKR `STP LMT`(GTC,服务器端,关程序也有效)、止盈用普通 SELL LMT,但仍受 201 限制。
+  新增 `conditional_orders.py`(`ConditionalOrderManager`:计时器监控 + 触发下单 + 订阅/退订行情 + json 持久化)、
+  `models.ConditionalOrder`、`ibkr_engine.place_stop_limit_order`(secType 感知)/`_est_commission`;
+  主窗口接管理器(按品种路由下单、触发提示音、断开保留/重连恢复)。当前面向「平多·SELL」。
+  (`conditional_orders.py`, `models.py`, `ibkr_engine.py`, `paper_engine.py`, `widgets/price_ladder.py`,
+  `main_window.py`, `.gitignore`)
 - **2026-06-22** — **组合分析器「今日合并K线」升级为多周期/多天「组合K线」**。原蜡烛图 `duration` 写死
   `1 D`(仅当日);改为按「周期」下拉取 `CHART_TIMEFRAMES` 的 (bar_size, duration),1分/5分/1时/2时/4时/
   日线 等都能给出**多天**组合蜡烛(如 5分≈1周、1小时≈1月)。按钮改名「组合K线(蜡烛)」,状态/摘要文案去掉

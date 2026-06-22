@@ -334,6 +334,16 @@ class PaperEngine:
         return self.place_limit_order(pseudo, action, quantity, price,
                                       outside_rth=outside_rth)
 
+    def place_stop_limit_order(self, option: OptionInfo, action: OrderAction,
+                               quantity: int, stop_price: float,
+                               limit_price: float,
+                               outside_rth: bool = False) -> int:
+        """本地模拟不支持 IBKR 原生 STP LMT; 请在本地模拟下用「本地条件单」。"""
+        self.bridge.error_received.emit(
+            -1, -1, "本地模拟不支持原生止损单 — 请取消「用IBKR原生」改用本地条件单"
+        )
+        return -1
+
     def cancel_order(self, order_id: int):
         """Cancel a pending order."""
         order = self._orders.get(order_id)

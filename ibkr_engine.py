@@ -1619,6 +1619,54 @@ class IBKREngine:
         )
         return order_id
 
+    def _est_commission(self, option: OptionInfo, quantity: int) -> float:
+        """按品种估算佣金 (仅本地显示)。"""
+        from config import (
+            STOCK_COMMISSION_PER_SHARE, STOCK_COMMISSION_MIN,
+            FUTURES_COMMISSION_PER_CONTRACT, FUTURES_COMMISSION_MIN,
+        )
+        if option.right == "STK":
+            return max(STOCK_COMMISSION_PER_SHARE * quantity, STOCK_COMMISSION_MIN)
+        if option.right == "FUT":
+            return max(FUTURES_COMMISSION_PER_CONTRACT * quantity, FUTURES_COMMISSION_MIN)
+        return max(COMMISSION_PER_CONTRACT * quantity, COMMISSION_MIN)
+
+    def place_stop_limit_order(self, option: OptionInfo, action: OrderAction,
+                               quantity: int, stop_price: float,
+                               limit_price: float,
+                               outside_rth: bool = False) -> int:
+        """IBKR **原生 STP LMT**(止损限价)单: 现价触及 stop_price 后, 以 limit_price 挂限价单。
+        secType 按 option.right 路由(期权/正股/期货)。用 GTC(跨日有效)。返回 orderId。
+        注: 原生单是「已挂在 IBKR」的活动单, 同合约反向已有挂单时仍受 201 限制。"""
+        contract = self._quote_contract(option)
+
+        order = Order()
+        order.action = action.value
+        order.orderType = "STP LMT"
+        order.totalQuantity = quantity
+        order.auxPrice = stop_price      # 触发价 (stop trigger)
+        order.lmtPrice = limit_price     # 触发后挂的限价
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+        order.tif = "GTC"                # 止损单跨日有效, 不随当日收盘失效
+        order.outsideRth = outside_rth
+
+        order_id = self._app.next_order_id()
+        self._orders[order_id] = OrderInfo(
+            order_id=order_id, option=option, action=action,
+            quantity=quantity, limit_price=limit_price,
+            order_type=OrderType.LIMIT,
+            commission=self._est_commission(option, quantity),
+        )
+        print(f"[STP LMT] {action.value} {quantity}x {option.display_name} "
+              f"stop={stop_price:.2f} lmt={limit_price:.2f} "
+              f"outsideRth={outside_rth} orderId={order_id}", flush=True)
+        self._app.placeOrder(order_id, contract, order)
+        self.bridge.order_status_changed.emit(
+            order_id, OrderStatus.PENDING.value, 0, float(quantity), 0
+        )
+        return order_id
+
     def cancel_order(self, order_id: int):
         """Cancel an order."""
         print(f"[ORDER] Cancelling orderId={order_id}", flush=True)

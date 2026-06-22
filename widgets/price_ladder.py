@@ -16,7 +16,7 @@ import re
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QScrollArea, QFrame,
-    QLineEdit, QCheckBox, QMessageBox, QSpinBox,
+    QLineEdit, QCheckBox, QMessageBox, QSpinBox, QDoubleSpinBox,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QBrush, QFont
@@ -306,6 +306,9 @@ class PriceLadder(QWidget):
     close_position_requested = pyqtSignal(object)      # OptionInfo
     cancel_all_requested = pyqtSignal()
     detach_requested = pyqtSignal()                    # Detach into standalone window
+    conditional_requested = pyqtSignal(object)         # dict: 止盈/止损条件单请求
+    conditional_cancel_requested = pyqtSignal(int)     # cond_id
+    option_loaded = pyqtSignal()                       # set_option 后 (刷新条件单显示)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -511,8 +514,30 @@ class PriceLadder(QWidget):
         )
         checkbox_layout.addWidget(self.outside_rth_checkbox)
 
+        # 「条件单」开关 (止盈/止损) —— 点开下方条件单面板
+        self.cond_toggle_btn = QPushButton("条件单 ▾")
+        self.cond_toggle_btn.setCheckable(True)
+        self.cond_toggle_btn.setFixedHeight(24)
+        self.cond_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.cond_toggle_btn.setToolTip("挂止盈/止损条件单(到价才发限价单到 IBKR)")
+        self.cond_toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_BG_DARK}; color: {COLOR_ACCENT};
+                border: 1px solid {COLOR_BORDER}; border-radius: 3px;
+                padding: 2px 10px; font-size: 11px; font-weight: bold;
+            }}
+            QPushButton:checked {{ background-color: {COLOR_ACCENT}; color: white; }}
+        """)
+        self.cond_toggle_btn.toggled.connect(self._on_cond_toggle)
+        checkbox_layout.addWidget(self.cond_toggle_btn)
+
         checkbox_layout.addStretch()
         main_layout.addLayout(checkbox_layout)
+
+        # ── 条件单面板 (止盈/止损, 默认隐藏) ──
+        self.cond_panel = self._build_cond_panel()
+        self.cond_panel.setVisible(False)
+        main_layout.addWidget(self.cond_panel)
 
         # ── Position summary row ──
         pos_frame = QFrame()
@@ -712,6 +737,171 @@ class PriceLadder(QWidget):
             return "张"
         return {"FUT": "手", "STK": "股"}.get(self._option.right, "张")
 
+    # ── 条件单 (止盈/止损) ────────────────────────────────────────────
+
+    def _build_cond_panel(self) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background-color: {COLOR_BG_DARK}; "
+            f"border: 1px solid {COLOR_ACCENT}; border-radius: 3px; }}"
+        )
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(8, 6, 8, 6)
+        v.setSpacing(4)
+
+        hint = QLabel("止盈/止损 (平多·SELL): 到价才发限价单到 IBKR")
+        hint.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px; border: none;")
+        v.addWidget(hint)
+
+        def _price_spin():
+            sp = QDoubleSpinBox()
+            sp.setDecimals(2)
+            sp.setRange(0.0, 1_000_000.0)
+            sp.setSingleStep(0.01)
+            sp.setFixedWidth(100)
+            sp.setStyleSheet(
+                f"QDoubleSpinBox {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; "
+                f"border: 1px solid {COLOR_BORDER}; border-radius: 3px; padding: 2px; }}"
+            )
+            return sp
+
+        # 止盈行
+        tp_row = QHBoxLayout()
+        self.tp_check = QCheckBox("止盈")
+        self.tp_check.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 11px; font-weight: bold; border: none;")
+        tp_row.addWidget(self.tp_check)
+        tp_row.addWidget(QLabel("触发价"))
+        self.tp_price_spin = _price_spin()
+        tp_row.addWidget(self.tp_price_spin)
+        tp_row.addStretch()
+        v.addLayout(tp_row)
+
+        # 止损行
+        sl_row = QHBoxLayout()
+        self.sl_check = QCheckBox("止损")
+        self.sl_check.setStyleSheet(f"color: {COLOR_RED}; font-size: 11px; font-weight: bold; border: none;")
+        sl_row.addWidget(self.sl_check)
+        sl_row.addWidget(QLabel("触发价"))
+        self.sl_price_spin = _price_spin()
+        sl_row.addWidget(self.sl_price_spin)
+        sl_row.addStretch()
+        v.addLayout(sl_row)
+
+        # 数量 + 原生 + 挂单
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("数量"))
+        self.cond_qty_spin = QSpinBox()
+        self.cond_qty_spin.setRange(1, 1000)
+        self.cond_qty_spin.setValue(1)
+        self.cond_qty_spin.setFixedWidth(56)
+        self.cond_qty_spin.setStyleSheet(
+            f"QSpinBox {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 3px; padding: 2px; }}"
+        )
+        opt_row.addWidget(self.cond_qty_spin)
+
+        self.cond_native_check = QCheckBox("用IBKR原生")
+        self.cond_native_check.setToolTip(
+            "勾选: 用 IBKR 原生 STP LMT 挂到服务器(关程序也有效, 但同合约反向挂单受 201 限制)。\n"
+            "不勾选(默认): 本地监控, 到价才发单(可规避 201, 但仅程序运行时有效)。"
+        )
+        self.cond_native_check.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px; border: none;")
+        opt_row.addWidget(self.cond_native_check)
+        opt_row.addStretch()
+
+        self.arm_btn = QPushButton("挂条件单")
+        self.arm_btn.setFixedHeight(26)
+        self.arm_btn.setCursor(Qt.PointingHandCursor)
+        self.arm_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: {COLOR_ACCENT}; color: white; border: none;
+                border-radius: 3px; font-weight: bold; font-size: 11px; padding: 2px 12px; }}
+            QPushButton:hover {{ background-color: #0097a7; }}
+        """)
+        self.arm_btn.clicked.connect(self._on_arm_conditional)
+        opt_row.addWidget(self.arm_btn)
+        v.addLayout(opt_row)
+
+        # 已挂条件单列表
+        self.cond_list_container = QWidget()
+        self.cond_list_layout = QVBoxLayout(self.cond_list_container)
+        self.cond_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.cond_list_layout.setSpacing(2)
+        v.addWidget(self.cond_list_container)
+
+        return frame
+
+    def _on_cond_toggle(self, checked: bool):
+        self.cond_panel.setVisible(checked)
+        self.cond_toggle_btn.setText("条件单 ▴" if checked else "条件单 ▾")
+        # 打开时用现价播种触发价输入框 (方便微调)
+        if checked and self._option and self._engine:
+            tick = self._engine.get_tick(self._option.to_ibkr_key())
+            cur = tick.get("last", 0) or ((tick.get("bid", 0) + tick.get("ask", 0)) / 2
+                                          if tick.get("bid") and tick.get("ask") else 0)
+            if cur > 0:
+                if self.tp_price_spin.value() == 0:
+                    self.tp_price_spin.setValue(round(cur * 1.2, 2))
+                if self.sl_price_spin.value() == 0:
+                    self.sl_price_spin.setValue(round(cur * 0.85, 2))
+
+    def _on_arm_conditional(self):
+        if not self._option:
+            QMessageBox.warning(self, "未选合约", "请先在点价梯加载一个合约")
+            return
+        tp_on = self.tp_check.isChecked()
+        sl_on = self.sl_check.isChecked()
+        if not tp_on and not sl_on:
+            QMessageBox.warning(self, "未勾选", "请至少勾选「止盈」或「止损」其中之一")
+            return
+        tp_price = round(self.tp_price_spin.value(), 2)
+        sl_price = round(self.sl_price_spin.value(), 2)
+        if tp_on and tp_price <= 0:
+            QMessageBox.warning(self, "止盈价无效", "请填写止盈触发价")
+            return
+        if sl_on and sl_price <= 0:
+            QMessageBox.warning(self, "止损价无效", "请填写止损触发价")
+            return
+        self.conditional_requested.emit({
+            "tp_on": tp_on, "tp_price": tp_price,
+            "sl_on": sl_on, "sl_price": sl_price,
+            "qty": self.cond_qty_spin.value(),
+            "native": self.cond_native_check.isChecked(),
+            "outside_rth": self.get_outside_rth(),
+        })
+
+    def set_conditionals(self, conds: list):
+        """刷新「已挂本地条件单」列表 (conds: list[ConditionalOrder])。"""
+        # 清空旧行
+        while self.cond_list_layout.count():
+            item = self.cond_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        for c in conds:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            color = COLOR_GREEN if c.kind == "TP" else COLOR_RED
+            arrow = "≥" if c.kind == "TP" else "≤"
+            lbl = QLabel(f"{c.kind_label} SELL {c.quantity} {arrow}{c.trigger_price:.2f} "
+                         f"→限{c.limit_price:.2f} [本地]")
+            lbl.setStyleSheet(f"color: {color}; font-size: 10px; border: none;")
+            h.addWidget(lbl)
+            h.addStretch()
+            x = QPushButton("✕")
+            x.setFixedSize(18, 18)
+            x.setCursor(Qt.PointingHandCursor)
+            x.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {COLOR_TEXT_DIM}; "
+                f"border: none; font-size: 11px; }} QPushButton:hover {{ color: {COLOR_RED}; }}"
+            )
+            cid = c.cond_id
+            x.clicked.connect(lambda _=False, i=cid: self.conditional_cancel_requested.emit(i))
+            h.addWidget(x)
+            self.cond_list_layout.addWidget(row)
+
     def get_outside_rth(self) -> bool:
         """Whether orders should be allowed outside regular trading hours."""
         return self.outside_rth_checkbox.isChecked()
@@ -748,6 +938,7 @@ class PriceLadder(QWidget):
             self._tick_req_id = self._engine.subscribe_option_tick(option)
 
         self._rebuild_ladder()
+        self.option_loaded.emit()
 
     def _rebuild_ladder(self):
         """Rebuild all price ladder rows centered on mid price."""

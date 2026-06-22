@@ -21,6 +21,7 @@ from config import FUTURES_SPECS, FUTURES_MAX_EXPIRIES
 from models import OptionInfo, OrderAction, OrderType, TradingMode
 from ibkr_engine import IBKREngine
 from paper_engine import PaperEngine
+from conditional_orders import ConditionalOrderManager
 from sound_alerts import play_fill
 from widgets.symbol_bar import SymbolBar
 from widgets.option_chain import OptionChainWidget
@@ -151,6 +152,16 @@ class MainWindow(QMainWindow):
         self.ibkr_engine = IBKREngine()
         self.paper_engine = PaperEngine(self.ibkr_engine)
         self._active_engine = self.paper_engine  # Default to paper
+
+        # 本地条件单 (止盈/止损) 管理器 —— 回调用 self._active_engine (随模式切换)
+        self.cond_manager = ConditionalOrderManager(self)
+        self.cond_manager.configure(
+            get_tick=lambda key: self._active_engine.get_tick(key),
+            place=lambda opt, action, lmt, qty, outside: self._place_order(
+                opt, OrderAction(action), OrderType.LIMIT, lmt, qty, outside),
+            subscribe=lambda opt: self._active_engine.subscribe_option_tick(opt),
+            unsubscribe=lambda req_id: self._active_engine.unsubscribe_tick(req_id),
+        )
 
         self._current_symbol = "SPY"
         self._current_option: OptionInfo | None = None
@@ -309,6 +320,15 @@ class MainWindow(QMainWindow):
         # Price ladder -> detach
         self.price_ladder.detach_requested.connect(self._on_detach_ladder)
 
+        # Price ladder -> 条件单 (止盈/止损)
+        self.price_ladder.conditional_requested.connect(self._on_conditional_requested)
+        self.price_ladder.conditional_cancel_requested.connect(self._on_conditional_cancel)
+        self.cond_manager.changed.connect(self._refresh_conditionals)
+        self.cond_manager.triggered.connect(self._on_conditional_triggered)
+        self.cond_manager.failed.connect(self._on_conditional_failed)
+        # 点价梯换合约后刷新该合约的条件单显示
+        self.price_ladder.option_loaded.connect(self._refresh_conditionals)
+
         # Price ladder -> contract search
         self.price_ladder.contract_searched.connect(self._on_contract_searched)
         self._search_validated.connect(self._load_validated_contract)
@@ -415,6 +435,9 @@ class MainWindow(QMainWindow):
         self.ibkr_engine.request_positions()
         self.account_bar.start()
 
+        # 恢复本地条件单 (从磁盘) 并重新订阅各合约行情
+        self.cond_manager.resume()
+
         # 按当前交易品种加载 (期权链 / 正股伪合约 / 期货合约)
         self._load_current_instrument()
 
@@ -423,6 +446,8 @@ class MainWindow(QMainWindow):
         self.symbol_bar.set_switching(False)
         self.symbol_bar.set_connected(False)
         self.account_bar.stop()
+        # 退订条件单行情 (保留条件单本身, 重连后 resume)
+        self.cond_manager.suspend()
         self.statusBar().setStyleSheet(
             f"QStatusBar {{ color: {COLOR_RED}; }}"
         )
@@ -892,6 +917,73 @@ class MainWindow(QMainWindow):
         self._active_engine.cancel_order(order_id)
         self.statusBar().showMessage(f"已请求撤单: #{order_id}")
 
+    # ── 条件单 (止盈/止损) ─────────────────────────────────────────────
+
+    def _on_conditional_requested(self, req: dict):
+        """点价梯「挂条件单」: 按勾选挂止盈/止损 (本地 或 IBKR 原生)。"""
+        opt = getattr(self.price_ladder, "_option", None)
+        if opt is None:
+            self.statusBar().showMessage("未选合约 — 无法挂条件单")
+            return
+        if not self.ibkr_engine.is_connected:
+            self.statusBar().showMessage("未连接 — 无法挂条件单")
+            return
+        native = req["native"]
+        qty = req["qty"]
+        outside = req["outside_rth"]
+        msgs = []
+        if req["tp_on"]:
+            if native:
+                # 止盈 = 高于市价的卖出限价, 原生即普通 SELL LMT(到价成交)
+                oid = self._place_order(opt, OrderAction.SELL, OrderType.LIMIT,
+                                        req["tp_price"], qty, outside)
+                if oid > 0:
+                    msgs.append(f"止盈(原生限价@{req['tp_price']:.2f})")
+            else:
+                self.cond_manager.arm(opt, "TP", req["tp_price"],
+                                      req["tp_price"], qty, outside)
+                msgs.append(f"止盈(本地≥{req['tp_price']:.2f})")
+        if req["sl_on"]:
+            if native:
+                oid = self._active_engine.place_stop_limit_order(
+                    opt, OrderAction.SELL, qty, req["sl_price"],
+                    req["sl_price"], outside_rth=outside)
+                if oid > 0:
+                    msgs.append(f"止损(原生STP LMT@{req['sl_price']:.2f})")
+            else:
+                self.cond_manager.arm(opt, "SL", req["sl_price"],
+                                      req["sl_price"], qty, outside)
+                msgs.append(f"止损(本地≤{req['sl_price']:.2f})")
+        if msgs:
+            tag = "" if native else " (本地: 仅程序运行时监控)"
+            self.statusBar().showMessage("已挂条件单: " + " + ".join(msgs) + tag)
+            if native:
+                self.right_tabs.setCurrentIndex(1)
+        self._refresh_conditionals()
+
+    def _on_conditional_cancel(self, cond_id: int):
+        self.cond_manager.cancel(cond_id)
+        self.statusBar().showMessage(f"已取消本地条件单 #{cond_id}")
+
+    def _refresh_conditionals(self):
+        """把当前点价梯合约的本地条件单推给点价梯显示。"""
+        opt = getattr(self.price_ladder, "_option", None)
+        conds = self.cond_manager.for_key(opt.to_ibkr_key()) if opt else []
+        self.price_ladder.set_conditionals(conds)
+
+    def _on_conditional_triggered(self, cond, order_id: int):
+        play_fill("SLD")
+        self.statusBar().showMessage(
+            f"⚡ 条件单触发: {cond.kind_label} 卖出 {cond.quantity} "
+            f"{cond.option.display_name} @ {cond.limit_price:.2f} → 已下单 #{order_id}"
+        )
+        self.right_tabs.setCurrentIndex(1)
+        self._refresh_conditionals()
+
+    def _on_conditional_failed(self, cond, msg: str):
+        self.statusBar().setStyleSheet(f"QStatusBar {{ color: #ff9800; }}")
+        self.statusBar().showMessage(f"条件单 {cond.kind_label} 触发但{msg}")
+
     # ── Currency Exchange ─────────────────────────────────────────────
 
     def _on_currency_exchange(self):
@@ -1198,6 +1290,7 @@ class MainWindow(QMainWindow):
             sw.close()
         self._strategy_windows.clear()
 
+        self.cond_manager.cleanup()
         self.account_bar.cleanup()
         self.option_chain.cleanup()
         self.price_ladder.cleanup()

@@ -940,6 +940,27 @@ class PriceLadder(QWidget):
         self._rebuild_ladder()
         self.option_loaded.emit()
 
+    def _center_price(self) -> float:
+        """点价梯居中价 — bid/ask 都在取中值, 否则取存在的一侧, 再退到 last。
+
+        `_rebuild_ladder`(建梯)与 `_refresh`(判定是否需重建)**必须共用此式**:
+        否则单边报价(只有 bid 或只有 ask, SPY 0DTE 很常见)时两者算出的中心不一致
+        —— `_refresh` 看到单边价在范围外要求重建, 而 `_rebuild_ladder` 却用 `last`
+        居中, 下一拍 `_refresh` 又判定在范围外 → 反复重建 201 行 = 点价梯闪烁。
+        """
+        opt = self._option
+        if opt is None:
+            return 0.0
+        bid = self._last_bid if self._last_bid > 0 else opt.bid
+        ask = self._last_ask if self._last_ask > 0 else opt.ask
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        if ask > 0:
+            return ask
+        if bid > 0:
+            return bid
+        return opt.last if opt.last > 0 else 0.0
+
     def _rebuild_ladder(self):
         """Rebuild all price ladder rows centered on mid price."""
         # Clear existing rows
@@ -951,10 +972,8 @@ class PriceLadder(QWidget):
         if not self._option:
             return
 
-        # Determine tick size and center price
-        mid = self._option.mid
-        if mid <= 0:
-            mid = self._option.ask if self._option.ask > 0 else self._option.bid
+        # Determine tick size and center price (与 _refresh 的重建判定共用 _center_price)
+        mid = self._center_price()
         if mid <= 0:
             mid = 1.0
 
@@ -1036,12 +1055,13 @@ class PriceLadder(QWidget):
         self._option.ask = ask
         self._option.last = tick.get("last", 0)
 
-        # Auto re-center if current price is outside the visible ladder range
+        # Auto re-center if current price is outside the visible ladder range.
+        # 用与建梯相同的 _center_price() —— 否则单边报价时中心算法不一致会反复重建(闪烁)。
         if self._rows and (bid > 0 or ask > 0):
-            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
+            mid = self._center_price()
             top_price = self._rows[0].price
             bottom_price = self._rows[-1].price
-            if mid > top_price or mid < bottom_price:
+            if mid > 0 and (mid > top_price or mid < bottom_price):
                 self._rebuild_ladder()
                 return
 

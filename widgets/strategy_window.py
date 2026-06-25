@@ -1,7 +1,8 @@
-"""Strategy Builder Window — multi-leg option combo orders.
+"""Strategy Builder — multi-leg option combo orders.
 
-Lazy-loaded: this module is only imported when the user clicks the
-strategy button, consuming zero resources at startup.
+`StrategyPanel` is an embeddable QWidget used as the「多腿组合」tab inside the
+main window (independent of the single-leg price ladder). `StrategyWindow` is a
+thin QMainWindow wrapper kept for standalone / backward-compatible use.
 """
 
 import threading
@@ -87,10 +88,10 @@ WINDOW_STYLESHEET = f"""
 """
 
 
-class StrategyWindow(QMainWindow):
-    """Multi-leg option strategy builder and order placer."""
+class StrategyPanel(QWidget):
+    """Multi-leg option strategy builder and order placer (embeddable widget)."""
 
-    def __init__(self, engine, symbol: str = "SPY", parent=None):
+    def __init__(self, engine=None, symbol: str = "SPY", parent=None):
         super().__init__(parent)
         self._engine = engine
         self._symbol = symbol
@@ -101,18 +102,13 @@ class StrategyWindow(QMainWindow):
         self._legs: list[ComboLegInfo] = []
         self._tick_req_ids: list[int] = []
         self._refresh_timer: QTimer | None = None
-
-        self.setWindowTitle(f"策略组合 — {symbol}")
-        self.setMinimumSize(700, 550)
-        self.resize(780, 620)
+        self._loaded = False  # 是否已加载期权链 (懒加载: 首次进入该 Tab 才拉)
 
         self._build_ui()
         self.setStyleSheet(WINDOW_STYLESHEET)
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
@@ -258,9 +254,37 @@ class StrategyWindow(QMainWindow):
 
     # ── Public Interface ──────────────────────────────────────────────
 
-    def show_and_load(self):
-        """Show window and load option chain in background."""
-        self.show()
+    def set_engine(self, engine):
+        """切换当前引擎 (连接 / 真实↔模拟热切换时由主窗口调用)。"""
+        self._engine = engine
+
+    def set_symbol(self, symbol: str):
+        """切换标的 (跟随主窗口顶栏)。重置已加载状态; 若该 Tab 正显示则立即重载。"""
+        if symbol == self._symbol:
+            return
+        self._symbol = symbol
+        self._symbol_label.setText(symbol)
+        self._unsubscribe_all_ticks()
+        self._legs.clear()
+        self._update_legs_table()
+        self._update_summary()
+        self._loaded = False
+        self._status_label.setText("标的已切换 — 切到本页将重新加载期权链")
+        if self.isVisible() and self._engine is not None:
+            self.load_chain()
+
+    def ensure_loaded(self):
+        """懒加载: 首次进入「多腿组合」Tab 时加载期权链 (已加载则跳过)。"""
+        if self._loaded or self._engine is None:
+            return
+        self.load_chain()
+
+    def load_chain(self):
+        """后台加载当前标的的期权链。"""
+        if self._engine is None:
+            self._status_label.setText("未连接 — 无法加载期权链")
+            return
+        self._loaded = True
         self._status_label.setText("正在加载期权链...")
         self._place_btn.setEnabled(False)
 
@@ -274,6 +298,7 @@ class StrategyWindow(QMainWindow):
             except Exception as e:
                 self._expirations = []
                 self._strikes = []
+                self._loaded = False  # 允许重试
                 QTimer.singleShot(0, lambda: self._status_label.setText(
                     f"加载失败: {e}"
                 ))
@@ -770,7 +795,29 @@ class StrategyWindow(QMainWindow):
         )
         QMessageBox.critical(self, "下单失败", error)
 
-    # ── Cleanup ──────────────────────────────────────────────────────
+
+class StrategyWindow(QMainWindow):
+    """Standalone window wrapper around :class:`StrategyPanel`.
+
+    Kept for backward compatibility / standalone use; the main GUI now embeds
+    :class:`StrategyPanel` directly as the「多腿组合」tab.
+    """
+
+    def __init__(self, engine, symbol: str = "SPY", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"策略组合 — {symbol}")
+        self.setMinimumSize(700, 550)
+        self.resize(780, 620)
+        self.panel = StrategyPanel(engine=engine, symbol=symbol, parent=self)
+        self.setCentralWidget(self.panel)
+        self.setStyleSheet(WINDOW_STYLESHEET)
+
+    def show_and_load(self):
+        self.show()
+        self.panel.ensure_loaded()
+
+    def cleanup(self):
+        self.panel.cleanup()
 
     def closeEvent(self, event):
         self.cleanup()

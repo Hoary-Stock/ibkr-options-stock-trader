@@ -30,7 +30,7 @@ from widgets.position_panel import PositionPanel
 from widgets.order_panel import OrderPanel
 from widgets.account_bar import AccountBar
 from widgets.option_calculator import OptionCalculator
-from widgets.currency_dialog import CurrencyExchangeDialog
+from widgets.strategy_window import StrategyPanel
 # ChartWindow is imported lazily (first chart open) — it pulls in
 # numpy + pyqtgraph (~25MB), which shouldn't load at startup
 
@@ -168,7 +168,6 @@ class MainWindow(QMainWindow):
         self._instrument = "OPT"   # "OPT"(默认) / "STK" / "FUT"
         self._future_expiries: list = []  # 当前期货标的的合约月份 [{expiry,con_id,...}]
         self._chart_windows: list = []  # list[ChartWindow]
-        self._strategy_windows: list = []
 
         # Detachable price ladder state
         self._ladder_detached = False
@@ -213,17 +212,6 @@ class MainWindow(QMainWindow):
         )
         self._chart_btn.clicked.connect(self._on_open_chart)
         top_bar_layout.addWidget(self._chart_btn)
-
-        self._strategy_btn = QPushButton("策略组合")
-        self._strategy_btn.setFixedHeight(30)
-        self._strategy_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_BG_PANEL}; color: {COLOR_ACCENT}; "
-            f"border: 1px solid {COLOR_BORDER}; padding: 2px 12px; border-radius: 3px; "
-            f"font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_ACCENT}; color: {COLOR_BG}; }}"
-        )
-        self._strategy_btn.clicked.connect(self._on_open_strategy)
-        top_bar_layout.addWidget(self._strategy_btn)
 
         # Session indicator (shows current market session for SPX options)
         self._session_label = QLabel("--")
@@ -290,7 +278,22 @@ class MainWindow(QMainWindow):
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setChildrenCollapsible(False)
-        main_layout.addWidget(self.main_splitter)
+
+        # ── 中央: 顶层 Tab —「单腿点价」(现有点价梯) /「多腿组合」(策略组合) ──
+        # 两个模块相互独立: 单腿点价用左侧点价梯; 多腿组合是嵌入的策略生成器。
+        self.center_tabs = QTabWidget()
+
+        single_leg_tab = QWidget()
+        single_leg_layout = QVBoxLayout(single_leg_tab)
+        single_leg_layout.setContentsMargins(0, 0, 0, 0)
+        single_leg_layout.addWidget(self.main_splitter)
+        self.center_tabs.addTab(single_leg_tab, "单腿点价")
+
+        # 多腿组合面板 (懒加载期权链: 首次切到该 Tab 才拉)
+        self.strategy_panel = StrategyPanel(symbol=self._current_symbol)
+        self.center_tabs.addTab(self.strategy_panel, "多腿组合")
+
+        main_layout.addWidget(self.center_tabs)
 
     def _connect_signals(self):
         # Symbol bar
@@ -343,8 +346,8 @@ class MainWindow(QMainWindow):
         # Order panel -> cancel
         self.order_panel.cancel_requested.connect(self._on_cancel_order)
 
-        # Account bar -> currency exchange
-        self.account_bar.currency_exchange_clicked.connect(self._on_currency_exchange)
+        # 中央 Tab 切换 -> 进入「多腿组合」时懒加载期权链
+        self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
 
         # IBKR engine signals
         self.ibkr_engine.bridge.connected.connect(self._on_connected)
@@ -426,6 +429,10 @@ class MainWindow(QMainWindow):
         self.order_panel.set_engine(self._active_engine)
         self.account_bar.set_engine(self._active_engine)
         self.calculator.set_engine(self._active_engine)
+        self.strategy_panel.set_engine(self._active_engine)
+        # 若当前正停在「多腿组合」Tab, 立即加载期权链
+        if self.center_tabs.currentWidget() is self.strategy_panel:
+            self.strategy_panel.ensure_loaded()
 
         self.statusBar().setStyleSheet("")
         self.statusBar().showMessage(f"已连接 ({mode.label})")
@@ -465,8 +472,17 @@ class MainWindow(QMainWindow):
 
     def _on_symbol_changed(self, symbol: str):
         self._current_symbol = symbol
+        # 多腿组合面板跟随标的 (重置已加载状态; 若该 Tab 正显示则重载)
+        self.strategy_panel.set_symbol(symbol)
         if self.ibkr_engine.is_connected:
             self._load_current_instrument()
+
+    def _on_center_tab_changed(self, index: int):
+        """切到「多腿组合」Tab → 懒加载期权链 (已连接且未加载时)。"""
+        if (self.center_tabs.widget(index) is self.strategy_panel
+                and self.ibkr_engine.is_connected):
+            self.strategy_panel.set_engine(self._active_engine)
+            self.strategy_panel.ensure_loaded()
 
     # ── Instrument type (期权/正股/期货) ────────────────────────────────
 
@@ -595,6 +611,7 @@ class MainWindow(QMainWindow):
             self.order_panel.set_engine(self._active_engine)
             self.account_bar.set_engine(self._active_engine)
             self.calculator.set_engine(self._active_engine)
+            self.strategy_panel.set_engine(self._active_engine)
 
     def _on_reconnect_requested(self, mode_value: str):
         """Handle hot switch: disconnect and reconnect to different port."""
@@ -984,16 +1001,6 @@ class MainWindow(QMainWindow):
         self.statusBar().setStyleSheet(f"QStatusBar {{ color: #ff9800; }}")
         self.statusBar().showMessage(f"条件单 {cond.kind_label} 触发但{msg}")
 
-    # ── Currency Exchange ─────────────────────────────────────────────
-
-    def _on_currency_exchange(self):
-        """Open currency exchange dialog."""
-        if not self.ibkr_engine.is_connected:
-            QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
-            return
-        dialog = CurrencyExchangeDialog(self._active_engine, self)
-        dialog.exec_()
-
     # ── Chart Window ─────────────────────────────────────────────────
 
     def _on_open_chart(self):
@@ -1013,28 +1020,6 @@ class MainWindow(QMainWindow):
         chart.destroyed.connect(lambda: self._chart_windows.remove(chart)
                                 if chart in self._chart_windows else None)
         chart.show_and_load()
-
-    # ── Strategy Window ─────────────────────────────────────────────
-
-    def _on_open_strategy(self):
-        """Open a strategy builder window (lazy import)."""
-        if not self.ibkr_engine.is_connected:
-            QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
-            return
-
-        from widgets.strategy_window import StrategyWindow
-
-        win = StrategyWindow(
-            engine=self._active_engine,
-            symbol=self._current_symbol,
-            parent=None,
-        )
-        self._strategy_windows.append(win)
-        win.destroyed.connect(
-            lambda: self._strategy_windows.remove(win)
-            if win in self._strategy_windows else None
-        )
-        win.show_and_load()
 
     # ── Detachable Price Ladder ──────────────────────────────────────
 
@@ -1284,11 +1269,8 @@ class MainWindow(QMainWindow):
             chart.close()
         self._chart_windows.clear()
 
-        # Close all strategy windows
-        for sw in list(self._strategy_windows):
-            sw.cleanup()
-            sw.close()
-        self._strategy_windows.clear()
+        # 多腿组合面板 (退订各腿行情 + 停止刷新定时器)
+        self.strategy_panel.cleanup()
 
         self.cond_manager.cleanup()
         self.account_bar.cleanup()

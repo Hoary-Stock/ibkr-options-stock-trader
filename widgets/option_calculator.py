@@ -19,7 +19,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
-    QCheckBox, QFrame, QPushButton,
+    QCheckBox, QFrame, QPushButton, QRadioButton, QButtonGroup,
 )
 
 from models import OptionInfo
@@ -279,35 +279,63 @@ class OptionCalculator(QWidget):
         col.addStretch(1)
 
     def _build_right_column(self, col: QVBoxLayout):
-        """右列: what-if — 改各参数 + 目标期权价, 反向求解所需标的价 S。"""
-        head = QLabel("反向 · 求标的价")
+        """右列: what-if 试算, 两个方向可切换:
+           A「期权价→标的价」: 由目标期权价反推所需标的价 (原功能);
+           B「标的价→期权价」: 由假设标的价正算该价位下的期权价 (新增)。
+        共享一组参数 (K/IV/r/到期), 仅可变输入与输出标题随模式切换。"""
+        head = QLabel("反向 · 试算")
         head.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 11px; font-weight: bold;")
         col.addWidget(head)
 
-        hint = QLabel("设定目标期权价与到期时间, 反推标的需到的价位")
-        hint.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px;")
-        hint.setWordWrap(True)
-        col.addWidget(hint)
+        # 模式切换 (两个方向)
+        self._mode_group = QButtonGroup(self)
+        self._mode_solve_s = QRadioButton("期权价→标的价")
+        self._mode_solve_price = QRadioButton("标的价→期权价")
+        self._mode_solve_s.setChecked(True)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        for rb in (self._mode_solve_s, self._mode_solve_price):
+            rb.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px;")
+            self._mode_group.addButton(rb)
+            mode_row.addWidget(rb)
+        mode_row.addStretch(1)
+        col.addLayout(mode_row)
+        self._mode_solve_s.toggled.connect(self._on_solver_mode_changed)
+
+        self._solver_hint = QLabel("")
+        self._solver_hint.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px;")
+        self._solver_hint.setWordWrap(True)
+        col.addWidget(self._solver_hint)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
 
+        # 可变输入: 目标期权价 (模式A) / 假设标的价 (模式B) —— 两者叠放同一格, 按模式只显示一个
         self._target_spin = self._make_spin(2, 1_000_000.0, 0.05, on_change=self._solve)
+        self._under_spin = self._make_spin(2, 1_000_000.0, 0.5, on_change=self._solve)
+        self._target_in_label = QLabel("目标期权价")
+        self._under_in_label = QLabel("假设标的价")
+        for lab in (self._target_in_label, self._under_in_label):
+            lab.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        grid.addWidget(self._target_in_label, 0, 0)
+        grid.addWidget(self._under_in_label, 0, 0)
+        grid.addWidget(self._target_spin, 0, 1)
+        grid.addWidget(self._under_spin, 0, 1)
+
+        # 共享参数
         self._wk_spin = self._make_spin(2, 1_000_000.0, 1.0, on_change=self._solve)
         self._wiv_spin = self._make_spin(2, 1000.0, 1.0, " %", on_change=self._solve)
         self._wr_spin = self._make_spin(2, 100.0, 0.25, " %", on_change=self._solve)
         self._wdays_spin = self._make_spin(4, 3650.0, 0.5, " 天", on_change=self._solve)
         self._wr_spin.setValue(RISK_FREE_RATE * 100.0)
-
-        rows = [
-            ("目标期权价", self._target_spin),
+        params = [
             ("行权价 K", self._wk_spin),
             ("隐含波动率 IV", self._wiv_spin),
             ("无风险利率 r", self._wr_spin),
             ("剩余到期", self._wdays_spin),
         ]
-        for i, (label, spin) in enumerate(rows):
+        for i, (label, spin) in enumerate(params, start=1):
             lab = QLabel(label)
             lab.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
             grid.addWidget(lab, i, 0)
@@ -337,32 +365,36 @@ class OptionCalculator(QWidget):
         out.setHorizontalSpacing(8)
         out.setVerticalSpacing(3)
 
-        lab_s = QLabel("所需标的价")
-        lab_s.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
-        self._solved_s_label = QLabel("—")
-        self._solved_s_label.setStyleSheet(
+        # 输出标题随模式切换 (A: 所需标的价/当前标的/需变动; B: 期权价/盘口中间价/相对盘口)
+        self._out_main_title = QLabel("所需标的价")
+        self._out_main_title.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        self._out_main_value = QLabel("—")
+        self._out_main_value.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-weight: bold; font-size: 20px;"
         )
-        out.addWidget(lab_s, 0, 0)
-        out.addWidget(self._solved_s_label, 0, 1, Qt.AlignRight)
+        out.addWidget(self._out_main_title, 0, 0)
+        out.addWidget(self._out_main_value, 0, 1, Qt.AlignRight)
 
-        lab_cur = QLabel("当前标的")
-        lab_cur.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
-        self._cur_under_label = QLabel("—")
-        self._cur_under_label.setStyleSheet("font-size: 13px;")
-        out.addWidget(lab_cur, 1, 0)
-        out.addWidget(self._cur_under_label, 1, 1, Qt.AlignRight)
+        self._out_ref_title = QLabel("当前标的")
+        self._out_ref_title.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        self._out_ref_value = QLabel("—")
+        self._out_ref_value.setStyleSheet("font-size: 13px;")
+        out.addWidget(self._out_ref_title, 1, 0)
+        out.addWidget(self._out_ref_value, 1, 1, Qt.AlignRight)
 
-        lab_move = QLabel("需变动")
-        lab_move.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
-        self._move_label = QLabel("—")
-        self._move_label.setStyleSheet("font-size: 13px; font-weight: bold;")
-        out.addWidget(lab_move, 2, 0)
-        out.addWidget(self._move_label, 2, 1, Qt.AlignRight)
+        self._out_cmp_title = QLabel("需变动")
+        self._out_cmp_title.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        self._out_cmp_value = QLabel("—")
+        self._out_cmp_value.setStyleSheet("font-size: 13px; font-weight: bold;")
+        out.addWidget(self._out_cmp_title, 2, 0)
+        out.addWidget(self._out_cmp_value, 2, 1, Qt.AlignRight)
         out.setColumnStretch(1, 1)
         col.addLayout(out)
 
         col.addStretch(1)
+
+        # 初始化模式相关的可见性 / 标题 / 提示
+        self._on_solver_mode_changed()
 
     # ── Wiring ───────────────────────────────────────────────────────────
 
@@ -387,10 +419,10 @@ class OptionCalculator(QWidget):
                 f"color: {COLOR_TEXT_DIM}; font-size: 13px;"
             )
             self._greeks_label.setText("")
-            self._solved_s_label.setText("—")
-            self._cur_under_label.setText("—")
-            self._move_label.setText("仅期权适用")
-            self._move_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            self._out_main_value.setText("—")
+            self._out_ref_value.setText("—")
+            self._out_cmp_value.setText("仅期权适用")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
             return
         self._set_inputs_enabled(True)
         self._apply_follow_state(self._follow_chk.isChecked())
@@ -511,8 +543,28 @@ class OptionCalculator(QWidget):
 
     # ── Reverse solver (right column) ─────────────────────────────────────
 
+    def _on_solver_mode_changed(self, *args):
+        """切换试算方向: 调整可变输入的可见性 + 输出标题 + 提示, 并重算。"""
+        mode_b = self._mode_solve_price.isChecked()  # True = 标的价→期权价
+        self._target_in_label.setVisible(not mode_b)
+        self._target_spin.setVisible(not mode_b)
+        self._under_in_label.setVisible(mode_b)
+        self._under_spin.setVisible(mode_b)
+        if mode_b:
+            self._solver_hint.setText("设定假设标的价与到期, 算该价位下的期权价")
+            self._out_main_title.setText("期权价")
+            self._out_ref_title.setText("盘口中间价")
+            self._out_cmp_title.setText("相对盘口")
+        else:
+            self._solver_hint.setText("设定目标期权价与到期, 反推标的需到的价位")
+            self._out_main_title.setText("所需标的价")
+            self._out_ref_title.setText("当前标的")
+            self._out_cmp_title.setText("需变动")
+        self._solve()
+
     def _seed_solver_from_live(self):
-        """用左列实时值播种右列: K/IV/r/到期天数, 目标价默认取当前盘口中间价。"""
+        """用左列实时值播种右列: K/IV/r/到期天数; 目标期权价取盘口中间价、
+        假设标的价取当前标的, 两个方向都有合理初值。"""
         if self._option is None or self._option.right not in ("C", "P"):
             return
         block = self._block_solver_spins(True)
@@ -526,9 +578,20 @@ class OptionCalculator(QWidget):
             self._target_spin.setValue(self._mid)
         elif self._theo_value() > 0:
             self._target_spin.setValue(self._theo_value())
+        und = self._current_underlying()
+        if und > 0:
+            self._under_spin.setValue(und)
         self._block_solver_spins(block)
         self._solver_seeded = True
         self._solve()
+
+    def _current_underlying(self) -> float:
+        """当前标的实时价 (供右列两个方向共用)。"""
+        if self._engine is None or self._option is None:
+            return 0.0
+        return self._live_underlying(
+            self._engine.get_tick(self._option.to_ibkr_key()) or {}
+        )
 
     def _theo_value(self) -> float:
         """左列当前理论价 (数值)，供播种目标价时回退使用。"""
@@ -539,9 +602,16 @@ class OptionCalculator(QWidget):
             return 0.0
 
     def _solve(self):
-        """反向求解: 由目标期权价 + (K,IV,r,T) 求所需标的价 S, 并对比当前标的。"""
+        """按当前模式分派: A 反推标的价 / B 正算期权价。"""
         if self._option is None or self._option.right not in ("C", "P"):
             return
+        if self._mode_solve_price.isChecked():
+            self._solve_price()
+        else:
+            self._solve_underlying()
+
+    def _solve_underlying(self):
+        """模式A: 由目标期权价 + (K,IV,r,T) 求所需标的价 S, 并对比当前标的。"""
         target = self._target_spin.value()
         K = self._wk_spin.value()
         sigma = self._wiv_spin.value() / 100.0
@@ -549,30 +619,27 @@ class OptionCalculator(QWidget):
         T = max(self._wdays_spin.value(), 0.0) / 365.0
 
         # 当前标的价 (用最近一次实时值)
-        cur = self._live_underlying(
-            self._engine.get_tick(self._option.to_ibkr_key()) or {}
-            if self._engine is not None else {}
-        )
-        self._cur_under_label.setText(f"${cur:.2f}" if cur > 0 else "—")
+        cur = self._current_underlying()
+        self._out_ref_value.setText(f"${cur:.2f}" if cur > 0 else "—")
 
         if target <= 0 or sigma <= 0 or T <= 0:
-            self._solved_s_label.setText("—")
+            self._out_main_value.setText("—")
             msg = "等待 IV 行情…" if sigma <= 0 else (
                 "已到期" if T <= 0 else "设定目标价")
-            self._move_label.setText(msg)
-            self._move_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            self._out_cmp_value.setText(msg)
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
             return
 
         solved = solve_underlying_for_price(
             target, K, T, r, sigma, self._option.right, DIVIDEND_YIELD
         )
         if solved <= 0:
-            self._solved_s_label.setText("无解")
-            self._move_label.setText("目标价超出可达范围")
-            self._move_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            self._out_main_value.setText("无解")
+            self._out_cmp_value.setText("目标价超出可达范围")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
             return
 
-        self._solved_s_label.setText(f"${solved:.2f}")
+        self._out_main_value.setText(f"${solved:.2f}")
 
         if cur > 0:
             diff = solved - cur
@@ -581,18 +648,61 @@ class OptionCalculator(QWidget):
             up = diff >= 0
             arrow = "↑" if up else "↓"
             color = COLOR_GREEN if up else COLOR_RED
-            self._move_label.setText(f"{arrow} ${abs(diff):.2f} ({pct:+.1f}%)")
-            self._move_label.setStyleSheet(
+            self._out_cmp_value.setText(f"{arrow} ${abs(diff):.2f} ({pct:+.1f}%)")
+            self._out_cmp_value.setStyleSheet(
                 f"color: {color}; font-size: 13px; font-weight: bold;"
             )
         else:
-            self._move_label.setText("无当前标的可比")
-            self._move_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            self._out_cmp_value.setText("无当前标的可比")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+
+    def _solve_price(self):
+        """模式B: 由假设标的价 + (K,IV,r,T) 正算期权价, 并对比当前盘口中间价。"""
+        S = self._under_spin.value()
+        K = self._wk_spin.value()
+        sigma = self._wiv_spin.value() / 100.0
+        r = self._wr_spin.value() / 100.0
+        T = max(self._wdays_spin.value(), 0.0) / 365.0
+
+        # 参考: 当前盘口中间价 (期权现价)
+        self._out_ref_value.setText(f"${self._mid:.2f}" if self._mid > 0 else "—")
+
+        if S <= 0 or sigma <= 0:
+            self._out_main_value.setText("—")
+            self._out_cmp_value.setText("等待 IV 行情…" if sigma <= 0 else "设定标的价")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            return
+        if T <= 0:
+            price = max(self._intrinsic(S, K), 0.0)
+            self._out_main_value.setText(f"${price:.2f}")
+            self._out_cmp_value.setText("已到期 (仅内在价值)")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+            return
+
+        price = black_scholes_price(
+            S, K, T, r, sigma, self._option.right, DIVIDEND_YIELD
+        )
+        self._out_main_value.setText(f"${price:.2f}")
+
+        # 相对当前盘口: 若标的到该价位, 期权较现价的盈亏方向
+        if self._mid > 0 and price > 0:
+            diff = price - self._mid
+            pct = diff / self._mid * 100.0
+            up = diff >= 0
+            arrow = "↑" if up else "↓"
+            color = COLOR_GREEN if up else COLOR_RED
+            self._out_cmp_value.setText(f"{arrow} ${abs(diff):.2f} ({pct:+.1f}%)")
+            self._out_cmp_value.setStyleSheet(
+                f"color: {color}; font-size: 13px; font-weight: bold;"
+            )
+        else:
+            self._out_cmp_value.setText("无盘口可比")
+            self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
 
     def _block_solver_spins(self, block: bool) -> bool:
         prev = self._target_spin.signalsBlocked()
-        for sp in (self._target_spin, self._wk_spin, self._wiv_spin,
-                   self._wr_spin, self._wdays_spin):
+        for sp in (self._target_spin, self._under_spin, self._wk_spin,
+                   self._wiv_spin, self._wr_spin, self._wdays_spin):
             sp.blockSignals(block)
         return prev
 
@@ -631,10 +741,10 @@ class OptionCalculator(QWidget):
         self._valuation_label.setStyleSheet(
             f"color: {COLOR_TEXT_DIM}; font-size: 13px;"
         )
-        self._solved_s_label.setText("—")
-        self._cur_under_label.setText("—")
-        self._move_label.setText("选择期权后求解")
-        self._move_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
+        self._out_main_value.setText("—")
+        self._out_ref_value.setText("—")
+        self._out_cmp_value.setText("选择期权后求解")
+        self._out_cmp_value.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 13px;")
 
     def _block_spins(self, block: bool) -> bool:
         """统一阻塞/恢复所有输入框信号; 返回 s_spin 之前的阻塞状态以便还原。"""
@@ -647,11 +757,13 @@ class OptionCalculator(QWidget):
     def _set_inputs_enabled(self, enabled: bool):
         for sp in (self._s_spin, self._k_spin, self._iv_spin,
                    self._r_spin, self._days_spin,
-                   self._target_spin, self._wk_spin, self._wiv_spin,
-                   self._wr_spin, self._wdays_spin):
+                   self._target_spin, self._under_spin, self._wk_spin,
+                   self._wiv_spin, self._wr_spin, self._wdays_spin):
             sp.setEnabled(enabled)
         self._follow_chk.setEnabled(enabled)
         self._sync_btn.setEnabled(enabled)
+        self._mode_solve_s.setEnabled(enabled)
+        self._mode_solve_price.setEnabled(enabled)
 
     def _on_follow_toggled(self, checked: bool):
         self._apply_follow_state(checked)

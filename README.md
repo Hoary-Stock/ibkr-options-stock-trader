@@ -118,7 +118,8 @@ ibkr_trader/
        ┌────────────────────────────────────────────────────────┐
        │  MainWindow  —  组装 widgets, 把信号连到 UI 更新          │
        │   SymbolBar · OptionChain · PriceLadder · PositionPanel  │
-       │   OrderPanel · AccountBar · (ChartWindow/StrategyWindow) │
+       │   OrderPanel · AccountBar · 中央 Tab(单腿点价/多腿组合)   │
+       │   + ChartWindow(懒加载)                                  │
        └────────────────────────────────────────────────────────┘
 ```
 
@@ -213,14 +214,16 @@ ibkr_trader/
 ### 4.5 主窗口 `main_window.py` (916 行)
 
 `MainWindow(QMainWindow)`:
-- `_build_ui()` 组装顶栏 SymbolBar、账户条 AccountBar、左侧 OptionChain、中间 PriceLadder、
-  右侧 PositionPanel + OrderPanel(QSplitter 布局),底部状态栏 + 交易时段指示。
+- `_build_ui()` 组装顶栏 SymbolBar、账户条 AccountBar,中央**顶层 `QTabWidget`**:
+  「单腿点价」Tab(左侧 OptionChain、中间 PriceLadder、右侧 PositionPanel + OrderPanel 的 QSplitter 布局)
+  与「多腿组合」Tab(嵌入的 `StrategyPanel`,独立于单腿点价);底部状态栏 + 交易时段指示。
 - `_connect_signals()` 把 engine bridge 的全部信号连到对应槽。
-- 交互槽:`_on_connect/_on_disconnect`、`_on_symbol_changed`、`_on_mode_changed`(真实/模拟切换)、
+- 交互槽:`_on_connect/_on_disconnect`、`_on_symbol_changed`(同步多腿面板标的)、
+  `_on_mode_changed`(真实/模拟切换,同步多腿面板引擎)、`_on_center_tab_changed`(切到「多腿组合」懒加载链)、
   `_load_option_chain`、`_fetch_stock_price`(链头显示标的实时价)、`_on_option_selected`、
   `_on_contract_searched`/`_load_validated_contract`、`_on_order_requested`/`_on_market_order_requested`、
-  `_on_close_position_requested`、`_on_cancel_all_requested`/`_on_cancel_order`、`_on_currency_exchange`、
-  `_on_open_chart`(懒加载 ChartWindow)、`_on_open_strategy`(懒加载 StrategyWindow)、
+  `_on_close_position_requested`、`_on_cancel_all_requested`/`_on_cancel_order`、
+  `_on_open_chart`(懒加载 ChartWindow)、
   `_on_detach_ladder`/`_on_reattach_ladder`(点价梯独立窗口)、`_update_session_indicator`(SPX GTH/RTH/Curb)、
   `_on_error`/`_on_order_rejected`(弹窗 + 状态栏标红)、`closeEvent`。
 
@@ -233,13 +236,12 @@ ibkr_trader/
 | `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
 | `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。 |
-| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);每 `ACCOUNT_REFRESH_MS` (3s) 刷新账户摘要 + `request_currency_balances()`。 |
+| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);右侧**美东时间实时时钟**(`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地);每 `ACCOUNT_REFRESH_MS` (3s) 刷新账户摘要 + `request_currency_balances()`。 |
 | `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;期权 GUI 嵌在 `AccountBar`、正股 client 放顶栏。 |
-| `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·求标的价」**:可任意改各参数甚至**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「在该到期时间下、期权要值目标价、标的需到的价位」,并对比当前标的算需变动金额/百分比(↑绿/↓红);换合约时自动用实时值播种一次,「↺ 用实时值填充」可手动重置;Put 目标价超 `K·e^(-rT)` 显示「无解」。正股伪合约两列均显示「仅期权适用」。 |
-| `currency_dialog.py` (180) | 外汇兑换对话框,走 `place_forex_order`(`FOREX_PAIRS`)。 |
+| `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·试算」**:顶部单选切换两个方向,共享一组参数(K/IV/r/到期):**①「期权价→标的价」**(原功能)改**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「期权要值目标价时标的需到的价位」,对比当前标的算需变动金额/百分比(↑绿/↓红),Put 目标价超 `K·e^(-rT)` 显示「无解」;**②「标的价→期权价」**(新增)改**假设标的价**,正算 Black-Scholes 期权价并与盘口中间价比对(相对盘口涨跌, ↑绿/↓红, 到期则取内在价值)。换合约时自动用实时值播种(目标价取盘口中价、假设标的取当前标的),「↺ 用实时值填充」可手动重置。正股伪合约两列均显示「仅期权适用」。 |
 | `quantity_selector.py` (31) | 1–100 张数量微调器,emit `quantity_changed`。 |
 | `strategy_defs.py` (196) | 纯数据:`StrategyType` 枚举 + `LegTemplate`/`StrategyTemplate` + `STRATEGY_REGISTRY`(牛/熊市价差、蝶式、铁鹰、铁蝶、跨式、宽跨、日历价差、自定义)。 |
-| `strategy_window.py` (777) | 懒加载组合策略窗口;选模板 + 行权价/到期 → 生成各腿 → `place_combo_order` 一键下 combo。 |
+| `strategy_window.py` (≈810) | **多腿组合策略生成器**。核心为可嵌入的 `StrategyPanel(QWidget)`,作主窗口「多腿组合」Tab:选模板 + 行权价/到期 → 生成各腿(实时刷新 bid/ask/净价/最大盈亏/佣金)→ `place_combo_order` 一键下 combo;`set_engine`/`set_symbol`/`ensure_loaded`(懒加载期权链)/`cleanup`(退订各腿行情)。`StrategyWindow(QMainWindow)` 为薄壳,兼容独立窗口用法。 |
 | `chart_window.py` (879) | 懒加载 K 线窗口(numpy + pyqtgraph,约 25MB,故不在启动时导入);多周期(`CHART_TIMEFRAMES`)、MA5/20/50/200 + VWAP + 量柱、向左平移无限加载历史、实时流式/轮询更新。 |
 | `candlestick_item.py` (123) | pyqtgraph 自绘 OHLC,涨=空心绿、跌=实心红,cosmetic pen 任意缩放清晰。 |
 | `chart_indicators.py` (38) | `IndicatorCalculator` 静态方法:`moving_average`、`vwap`(累积)、`volume_colors`。 |
@@ -394,6 +396,29 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-25** — **计算器右列加「标的价→期权价」方向(双向 what-if)**。右列顶部加单选切换:
+  原「期权价→标的价」(反解所需标的价)保留;新增「标的价→期权价」—— 输入**假设的正股/指数价格**,
+  用 Black-Scholes 正算该价位下的期权价,并与当前盘口中间价比对(相对涨跌 ↑绿/↓红, 到期取内在价值)。
+  两方向共享 K/IV/r/到期参数;播种时同时填目标期权价(盘口中价)与假设标的价(当前标的)。
+  `_solve` 改为按模式分派 `_solve_underlying`/`_solve_price`,输出标签改为通用三行随模式改标题。
+  (`widgets/option_calculator.py`)
+- **2026-06-25** — **修点价梯闪烁(单边报价时无限重建)**。根因:`_rebuild_ladder`(建梯)与 `_refresh`
+  (判定是否需重建)的**居中价算法不一致** —— 只有 bid 或只有 ask 时(SPY 0DTE 常见,行情线吃紧时
+  尤甚),`_refresh` 用「存在的那一侧」判定价格已出范围要求重建,而 `_rebuild_ladder` 用 `OptionInfo.mid`
+  (单边时退化为 `last`)居中,中心对不上 → 下一拍又判定出范围 → 每 200ms 重建 201 行 = 闪烁。
+  修复:抽出共用的 `_center_price()`(bid&ask 都在取中值, 否则取存在的一侧, 再退 `last`),建梯与重建判定
+  统一调用。(`widgets/price_ladder.py`)
+- **2026-06-25** — **多腿组合并入主 GUI 作独立 Tab + 账户条「换汇」改为美东实时时钟**。
+  ① 原「策略组合」弹窗按钮改为主窗口中央**顶层 Tab**:「单腿点价」(现有点价梯/期权链/持仓委托)与
+  「多腿组合」(策略生成器)互不干扰。`strategy_window.py` 把核心重构成可嵌入的 `StrategyPanel(QWidget)`
+  (新增 `set_engine`/`set_symbol`/`ensure_loaded`/`load_chain`,**懒加载**:首次切到该 Tab 才拉期权链,
+  不浪费行情线),保留 `StrategyWindow(QMainWindow)` 薄壳以兼容独立窗口用法;主窗口用 `QTabWidget` 承载、
+  跟随连接/模式热切换/标的变化更新引擎与标的,关窗时 `cleanup()`。删除主窗口 `_on_open_strategy` 与顶栏按钮。
+  ② **去除换汇**:`AccountBar` 移除「换汇」按钮与 `currency_exchange_clicked` 信号,改为右侧**美东时间时钟**
+  (每秒刷新 `America/New_York`,无 tz 数据回退本地);主窗口删 `_on_currency_exchange` 及其连接,
+  删除孤立的 `widgets/currency_dialog.py`(引擎 `place_forex_order` 后端保留,只是无 UI 入口)。
+  各币种现金余额条 `CurrencyBalanceBar` 保留不变。
+  (`widgets/strategy_window.py`, `main_window.py`, `widgets/account_bar.py`, `widgets/currency_dialog.py` 删)
 - **2026-06-22** — **点价梯加「条件单」(止盈/止损)**。点价梯勾选框那行加「条件单 ▾」开关, 展开面板:
   ☑止盈 / ☑止损(可单选)+ 各自触发价 + 数量 + ☐用IBKR原生 + 「挂条件单」+ 已挂列表(✕ 取消)。
   **含义**:到达触发价才挂出对应**限价单**。**本地模式(默认)**到价前不发到 IBKR,由本程序每 0.5s 监控现价、

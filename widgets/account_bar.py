@@ -1,11 +1,12 @@
 """Account summary bar — displays portfolio value, cash, buying power, P&L."""
 
 import math
+from datetime import datetime
 
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QFrame,
+    QWidget, QHBoxLayout, QLabel, QFrame,
 )
-from PyQt5.QtCore import pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QTimer
 
 from config import (
     COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT, COLOR_TEXT_DIM,
@@ -16,9 +17,7 @@ from widgets.currency_balance import CurrencyBalanceBar
 
 
 class AccountBar(QWidget):
-    """Horizontal bar showing account summary and forex button."""
-
-    currency_exchange_clicked = pyqtSignal()
+    """Horizontal bar showing account summary and a live US-Eastern clock."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +45,12 @@ class AccountBar(QWidget):
         self._refresh_timer = QTimer()
         self._refresh_timer.timeout.connect(self._refresh)
         self._refresh_timer.setInterval(ACCOUNT_REFRESH_MS)
+
+        # 美东时间实时时钟 (每秒刷新, 独立于连接, 始终运行)
+        self._clock_timer = QTimer()
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
+        self._update_clock()
 
     def _build_ui(self):
         self.setFixedHeight(36)
@@ -109,26 +114,14 @@ class AccountBar(QWidget):
 
         layout.addStretch()
 
-        # Forex button
-        self.forex_btn = QPushButton("换汇")
-        self.forex_btn.setFixedSize(60, 26)
-        self.forex_btn.setCursor(Qt.PointingHandCursor)
-        self.forex_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {COLOR_BG_PANEL};
-                color: {COLOR_ACCENT};
-                border: 1px solid {COLOR_ACCENT};
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {COLOR_ACCENT};
-                color: white;
-            }}
-        """)
-        self.forex_btn.clicked.connect(self.currency_exchange_clicked.emit)
-        layout.addWidget(self.forex_btn)
+        # 美东时间实时时钟 (替代原「换汇」按钮)
+        self.clock_label = QLabel("🕐 --:--:--")
+        self.clock_label.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 13px; font-weight: bold; "
+            f"border: none; font-family: 'Consolas', 'Menlo', monospace;"
+        )
+        self.clock_label.setToolTip("美东时间 (America/New_York)")
+        layout.addWidget(self.clock_label)
 
     def _make_sep(self) -> QFrame:
         sep = QFrame()
@@ -245,5 +238,17 @@ class AccountBar(QWidget):
             if hasattr(self._engine, "request_currency_balances"):
                 self._engine.request_currency_balances()
 
+    def _update_clock(self):
+        """刷新美东时间显示 (每秒)。无 tz 数据时回退本地时间。"""
+        try:
+            import zoneinfo
+            et = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+            tz = et.tzname() or "ET"
+        except Exception:
+            et = datetime.now()
+            tz = "本地"
+        self.clock_label.setText(f"🕐 美东 {et:%m-%d %H:%M:%S} {tz}")
+
     def cleanup(self):
         self._refresh_timer.stop()
+        self._clock_timer.stop()

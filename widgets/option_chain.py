@@ -411,17 +411,40 @@ class OptionChainWidget(QWidget):
         self._snap_timer.start(250)
 
     def _on_tab_changed(self, index: int):
-        """切到新到期日: 先把表滚到 ATM, 再对可见行拉快照 (不占常驻行情线)。"""
+        """切到新到期日: 把表滚到最接近现价的行权价居中, 再对可见行拉快照。
+
+        居中**延后**到下一轮事件循环: 刚建/刚切的表此刻 viewport 高度可能还是 0,
+        立即 scrollToItem 会无效 → 表停在最上面(最低行权价, 如 0.5)。延后到布局
+        完成后再滚, 才能真正居中到平值附近。
+        """
         if index < 0 or index >= len(self._expirations):
             return
         table = self.tab_widget.widget(index)
-        if isinstance(table, QTableWidget):
-            self._ensure_table_built(table)
-            self._scroll_table_to_atm(table)
+        if not isinstance(table, QTableWidget):
+            return
+        self._ensure_table_built(table)
+        QTimer.singleShot(0, lambda t=table: self._center_and_snapshot(t))
+
+    def _center_and_snapshot(self, table: QTableWidget):
+        """布局就绪后: 先把最接近现价的行权价滚到居中, 再对(居中后的)可见行拉快照。"""
+        if table is not self.tab_widget.currentWidget():
+            return  # 期间又切走了, 放弃
+        self._scroll_table_to_atm(table)
         self._request_snapshots()
 
+    def _recompute_atm_row(self):
+        """用**最新现价**重算最接近的行权价行 (现价随实时行情更新, 故每次切表都重算)。"""
+        if not self._strikes:
+            self._atm_row = 0
+        elif self._stock_price > 0:
+            self._atm_row = min(range(len(self._strikes)),
+                                key=lambda i: abs(self._strikes[i] - self._stock_price))
+        else:
+            self._atm_row = len(self._strikes) // 2
+
     def _scroll_table_to_atm(self, table: QTableWidget):
-        """把表格滚动到 ATM 行居中, 使默认可见区聚焦平值附近。"""
+        """把表格滚动到最接近现价的行权价行居中, 使默认可见区聚焦平值附近。"""
+        self._recompute_atm_row()
         if 0 <= self._atm_row < table.rowCount():
             item = table.item(self._atm_row, 4)
             if item:

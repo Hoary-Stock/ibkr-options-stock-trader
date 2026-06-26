@@ -765,6 +765,10 @@ class IBKREngine:
         # Index options (SPX/XSP/...) are ambiguous without it: reqMktData
         # returns error 200 and the price silently never arrives.
         self._opt_trading_class: dict[str, str] = {}
+        # Per-expiry **real** strike list, keyed "SYMBOL|EXPIRY". Resolved from the
+        # matching option class (not the global union) so the chain never builds
+        # phantom (expiry, strike, class) contracts → error 200 / 空表.
+        self._opt_strikes_by_expiry: dict[str, list] = {}
         self._mode = TradingMode.PAPER
 
         # Order & position tracking
@@ -1115,26 +1119,106 @@ class IBKREngine:
                 all_expirations.update(p["expirations"])
                 all_strikes.update(p["strikes"])
 
-        # Learn each expiry's trading class so option contracts can be
-        # disambiguated later. SPX lists two classes — "SPX" (monthly,
-        # AM-settled) and "SPXW" (weeklies/dailies/0DTE, PM-settled). Without
-        # the exact tradingClass, reqMktData is ambiguous → error 200 → no
-        # price. On the rare overlap (3rd Friday), prefer the "...W" class
-        # since that's the intraday-quoted PM-settled contract.
+        # Resolve **per-expiry** strikes + tradingClass from the matching option
+        # class — NOT the global union. reqSecDefOptParams returns one entry per
+        # (exchange, tradingClass) with that class's own expirations + strikes.
+        # The old code unioned everything, so an expiry from class A could be
+        # paired with strikes/class from class B → a contract that doesn't exist
+        # → error 200 → whole expiry tab empty (e.g. NVDA 07/10). Here each expiry
+        # takes the strikes of the class that actually lists it. On overlap (e.g.
+        # SPX 3rd Friday lists both SPX & SPXW) prefer the "...W" class (intraday-
+        # quoted PM-settled); otherwise the class with the most strikes.
         sym_up = symbol.upper()
-        for p in params_list:
+        smart_params = [p for p in params_list if p["exchange"] == "SMART"]
+        use_params = smart_params if smart_params else params_list
+
+        exp_entries: dict[str, list] = {}  # exp -> [(tradingClass, strikes_list), ...]
+        for p in use_params:
             tclass = p.get("tradingClass") or ""
-            if not tclass:
-                continue
-            prefer_w = tclass.upper().endswith("W")
+            strikes_p = p["strikes"]
             for exp in p["expirations"]:
-                map_key = f"{sym_up}|{exp}"
-                if map_key not in self._opt_trading_class or prefer_w:
-                    self._opt_trading_class[map_key] = tclass
+                exp_entries.setdefault(exp, []).append((tclass, strikes_p))
+
+        for exp, entries in exp_entries.items():
+            w_entries = [e for e in entries if e[0].upper().endswith("W")]
+            tclass, strikes_p = max(w_entries or entries, key=lambda e: len(e[1]))
+            map_key = f"{sym_up}|{exp}"
+            self._opt_strikes_by_expiry[map_key] = sorted(strikes_p)
+            if tclass:
+                self._opt_trading_class[map_key] = tclass
 
         expirations = sorted(all_expirations)
         strikes = sorted(all_strikes)
         return expirations, strikes
+
+    def option_strikes_for_expiry(self, symbol: str, expiry: str) -> list:
+        """该到期日**真实存在**的行权价 (来自实际列出它的 option class)。
+
+        用于按到期日建期权链, 避免用全链 union 行权价拼出不存在的合约
+        (error 200 / 空表)。未加载过该标的链时返回 []，调用方应回退到 union。
+
+        注: 来自 reqSecDefOptParams, 行权价是该 class **跨所有到期日的并集**, 故对
+        单一 class 的标的 (如 NVDA) 各到期日相同 —— 仍可能含某到期日不存在的行权价。
+        要精确到单个到期日, 用 `request_option_strikes_live` (reqContractDetails)。"""
+        return self._opt_strikes_by_expiry.get(f"{symbol.upper()}|{expiry}", [])
+
+    def request_option_strikes_live(self, symbol: str, expiry: str,
+                                    timeout: float = 8.0) -> tuple:
+        """用 reqContractDetails 取 (symbol, expiry) **该到期日真实存在**的期权合约,
+        返回 `(strikes_sorted, trading_class, ok)`。
+
+        这是按到期日精确取行权价的权威途径 —— 解决 reqSecDefOptParams 的并集行权价
+        在某些到期日不存在 → reqMktData/下单 error 200 → 整张到期日表空 (如 NVDA 07/10)。
+        阻塞 (内部 Event.wait), **调用方须放后台线程**。
+          - ok=True  : 请求成功 (strikes 可能为空 = 该到期日确无 SMART 合约);
+          - ok=False : 超时/错误 → 调用方可回退到并集行权价。
+        同时把权威 tradingClass / 行权价写回缓存, 供下单与点价梯复用。"""
+        if not self._app or not self._connected:
+            return [], "", False
+        c = Contract()
+        c.symbol = symbol
+        c.secType = "OPT"
+        c.exchange = "SMART"
+        c.currency = "USD"
+        c.lastTradeDateOrContractMonth = expiry
+        req_id = self._app.next_req_id()
+        self._app._contract_data[req_id] = {
+            "details": [], "event": threading.Event(), "error": None,
+        }
+        try:
+            self._app.reqContractDetails(req_id, c)
+        except Exception:
+            self._app._contract_data.pop(req_id, None)
+            return [], "", False
+        ok = self._app._contract_data[req_id]["event"].wait(timeout)
+        state = self._app._contract_data.pop(req_id, None) or {}
+        if not ok:
+            return [], "", False
+        details = state.get("details") or []
+        # 按 tradingClass 分组收集行权价 (优先标准乘数 100; 全非标则不过滤)
+        by_class: dict[str, set] = {}
+        for cd in details:
+            con = cd.contract
+            mult = str(getattr(con, "multiplier", "") or "")
+            if mult not in ("100", ""):
+                continue
+            by_class.setdefault(con.tradingClass or "", set()).add(float(con.strike))
+        if not by_class:
+            for cd in details:
+                con = cd.contract
+                by_class.setdefault(con.tradingClass or "", set()).add(float(con.strike))
+        if not by_class:
+            return [], "", True  # 成功但无合约 → 该到期日确实没有
+        # 选 class: 优先 "...W" (周/日, 盘中报价), 否则合约数最多者
+        classes = list(by_class)
+        w = [cl for cl in classes if cl.upper().endswith("W")]
+        best = max(w or classes, key=lambda cl: len(by_class[cl]))
+        strikes = sorted(by_class[best])
+        map_key = f"{symbol.upper()}|{expiry}"
+        if best:
+            self._opt_trading_class[map_key] = best
+        self._opt_strikes_by_expiry[map_key] = strikes
+        return strikes, best, True
 
     def _trading_class_for(self, symbol: str, expiry: str) -> str:
         """Best-known option tradingClass for (symbol, expiry).

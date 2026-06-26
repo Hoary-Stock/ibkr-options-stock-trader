@@ -1,5 +1,6 @@
 """Option Chain — T-shaped quote table with expiry tabs + date range filter."""
 
+import threading
 from datetime import datetime, timedelta
 
 from PyQt5.QtWidgets import (
@@ -27,13 +28,16 @@ class OptionChainWidget(QWidget):
     """T-shaped option chain with expiry tabs and date range filter."""
 
     option_selected = pyqtSignal(object)  # OptionInfo
+    # 后台 reqContractDetails 取到某到期日真实行权价后, 回到 GUI 线程填表
+    _strikes_ready = pyqtSignal(str, str, object, bool)  # symbol, expiry, strikes, ok
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._symbol = ""
         self._all_expirations: list[str] = []  # ALL future expirations
         self._expirations: list[str] = []       # Currently displayed (filtered)
-        self._strikes: list[float] = []
+        self._strikes: list[float] = []      # 当前 Tab(到期日)的行权价
+        self._all_strikes: list[float] = []  # 全链 union (按到期日取不到时的回退)
         self._options: dict[str, OptionInfo] = {}  # key -> OptionInfo
         self._sub_req_ids: dict[str, int] = {}      # key -> reqId
         self._engine = None
@@ -41,6 +45,10 @@ class OptionChainWidget(QWidget):
         self._range_buckets: dict[str, list[str]] = {}  # range_name -> [expirations]
         self._active_range: str = ""
         self._atm_row: int = 0   # ATM 行索引 (切 Tab 时滚到此处, 优先取价)
+        # 各到期日**真实**行权价 (reqContractDetails 取, 按到期日缓存)
+        self._real_strikes: dict[str, list] = {}
+        self._fetching_strikes: set = set()   # 正在后台取的到期日, 防重复请求
+        self._strikes_ready.connect(self._on_strikes_ready)
         # 视口取价去抖: 滚动停止 ~250ms 后只对当前可见行拉一次快照 (省行情线)
         self._snap_timer = QTimer(self)
         self._snap_timer.setSingleShot(True)
@@ -176,6 +184,10 @@ class OptionChainWidget(QWidget):
         """Load option chain data."""
         self._symbol = symbol
         self._stock_price = stock_price
+        # 换标的: 清掉按到期日缓存的真实行权价 (不同标的共用同样的周五到期日字符串,
+        # 不清会把上一个标的的行权价错配到新标的)。
+        self._real_strikes.clear()
+        self._fetching_strikes.clear()
 
         # Filter to future expirations only
         today = datetime.now().strftime("%Y%m%d")
@@ -183,15 +195,14 @@ class OptionChainWidget(QWidget):
 
         # 显示**全部**行权价 (能滚到远端如 SPY 695 put); 不再按 ATM±N 裁剪。
         # 行情线占用由「按视口取价」控制 (只对当前滚动可见行拉快照), 而非靠少显示。
-        self._strikes = sorted(strikes)
-        if stock_price > 0 and self._strikes:
-            self._atm_row = min(range(len(self._strikes)),
-                                key=lambda i: abs(self._strikes[i] - stock_price))
-        else:
-            self._atm_row = len(self._strikes) // 2
+        # 各到期日实际行权价不同 → 建表时按到期日取真实行权价 (见 _ensure_table_built),
+        # 全链 union 仅作取不到时的回退。
+        self._all_strikes = sorted(strikes)
+        self._strikes = self._all_strikes
+        self._recompute_atm_row()
 
         print(f"[DEBUG] Option chain: {len(self._all_expirations)} total expirations, "
-              f"{len(self._strikes)} strikes displayed (full), "
+              f"{len(self._all_strikes)} union strikes, "
               f"ATM row={self._atm_row}, stock_price={stock_price}", flush=True)
 
         self.title_label.setText(f"期权链 — {symbol}")
@@ -358,14 +369,94 @@ class OptionChainWidget(QWidget):
         return table
 
     def _ensure_table_built(self, table: QTableWidget):
-        """首次显示该到期日 Tab 时, 填充全部行权价行 (懒加载)。"""
+        """首次显示该到期日 Tab 时填充行权价行 (懒加载)。
+
+        行权价按**该到期日真实存在**的取 —— 已缓存则立即填; 未缓存则显示「加载中」
+        并发起后台 reqContractDetails (`_start_strikes_fetch`), 数据回来再填
+        (`_on_strikes_ready`)。这样不会用全链 union 拼出该到期日不存在的合约
+        (否则整张表空, 如 NVDA 07/10)。
+        """
         if getattr(table, "_built", False):
             return
         expiry = getattr(table, "_expiry", "")
-        table.setRowCount(len(self._strikes))
+        cached = self._real_strikes.get(expiry)
+        if cached is not None:
+            self._populate_table_rows(table, cached)
+        else:
+            self._show_loading_placeholder(table)
+            self._start_strikes_fetch(expiry)
 
-        # Populate strikes
-        for row, strike in enumerate(self._strikes):
+    def _show_loading_placeholder(self, table: QTableWidget):
+        """该到期日真实行权价还在后台拉取时, 显示一行提示。"""
+        table.setRowCount(1)
+        item = QTableWidgetItem("正在加载该到期日合约…")
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setForeground(QBrush(QColor(COLOR_TEXT_DIM)))
+        table.setItem(0, 4, item)
+        table.setRowHeight(0, 28)
+
+    def _start_strikes_fetch(self, expiry: str):
+        """后台 reqContractDetails 取该到期日真实行权价 (结果经信号回 GUI 线程)。"""
+        if not expiry or expiry in self._fetching_strikes or self._engine is None:
+            return
+        if not hasattr(self._engine, "request_option_strikes_live"):
+            # 旧引擎: 回退到 union, 直接当作就绪 (ok=False)
+            self._strikes_ready.emit(self._symbol, expiry, [], False)
+            return
+        self._fetching_strikes.add(expiry)
+        eng, sym = self._engine, self._symbol
+
+        def work():
+            try:
+                strikes, _tc, ok = eng.request_option_strikes_live(sym, expiry)
+            except Exception:
+                strikes, ok = [], False
+            self._strikes_ready.emit(sym, expiry, strikes or [], bool(ok))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_strikes_ready(self, symbol: str, expiry: str, strikes: list, ok: bool):
+        """(GUI 线程) 后台取到该到期日真实行权价 → 缓存并填当前 Tab。
+
+        - 结果对应的 symbol 已不是当前标的 → 丢弃 (换标的期间的过期结果);
+        - ok=True : 用权威行权价 (为空 = 该到期日确无合约 → 表内提示, 不拼 union);
+        - ok=False: 超时/旧引擎 → 回退全链 union (至少 ATM 附近能出价)。"""
+        self._fetching_strikes.discard(expiry)
+        if symbol != self._symbol:
+            return  # 过期结果 (已切到别的标的)
+        resolved = list(strikes) if ok else list(self._all_strikes)
+        self._real_strikes[expiry] = resolved
+
+        idx = self.tab_widget.currentIndex()
+        if not (0 <= idx < len(self._expirations)) or self._expirations[idx] != expiry:
+            return  # 期间已切走; 数据已缓存, 下次切回即用
+        table = self.tab_widget.widget(idx)
+        if not isinstance(table, QTableWidget) or getattr(table, "_built", False):
+            return
+        self._populate_table_rows(table, resolved)
+        self._strikes = table._strikes
+        self._recompute_atm_row()
+        QTimer.singleShot(0, lambda t=table: self._center_and_snapshot(t))
+
+    def _populate_table_rows(self, table: QTableWidget, strikes: list):
+        """用给定行权价填充表格行 (建表的实际填充步骤)。"""
+        table._strikes = strikes
+        expiry = getattr(table, "_expiry", "")
+
+        if not strikes:
+            # 该到期日确无合约 (reqContractDetails 返回空) → 提示而非拼假行
+            table.setRowCount(1)
+            item = QTableWidgetItem("该到期日无可用合约")
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setForeground(QBrush(QColor(COLOR_TEXT_DIM)))
+            table.setItem(0, 4, item)
+            table.setRowHeight(0, 28)
+            table._built = True
+            return
+
+        table.setRowCount(len(strikes))
+
+        for row, strike in enumerate(strikes):
             # Strike column (center)
             strike_str = f"{int(strike)}" if strike == int(strike) else f"{strike:g}"
             item = QTableWidgetItem(strike_str)
@@ -404,8 +495,6 @@ class OptionChainWidget(QWidget):
 
         table._built = True
 
-        return table
-
     def _on_table_scrolled(self, _value: int):
         """表格滚动: 重启去抖定时器, 停下后对可见行拉快照。"""
         self._snap_timer.start(250)
@@ -423,7 +512,10 @@ class OptionChainWidget(QWidget):
         if not isinstance(table, QTableWidget):
             return
         self._ensure_table_built(table)
-        QTimer.singleShot(0, lambda t=table: self._center_and_snapshot(t))
+        # 已就绪(缓存命中)才居中/取价; 否则等 _on_strikes_ready 数据回来再处理
+        if getattr(table, "_built", False):
+            self._strikes = getattr(table, "_strikes", self._all_strikes)
+            QTimer.singleShot(0, lambda t=table: self._center_and_snapshot(t))
 
     def _center_and_snapshot(self, table: QTableWidget):
         """布局就绪后: 先把最接近现价的行权价滚到居中, 再对(居中后的)可见行拉快照。"""
@@ -544,8 +636,9 @@ class OptionChainWidget(QWidget):
             return  # 行尚未懒填充, 无可更新单元格
 
         expiry = self._expirations[idx]
+        strikes = getattr(table, "_strikes", self._strikes)
 
-        for row, strike in enumerate(self._strikes):
+        for row, strike in enumerate(strikes):
             for right_idx, right in enumerate(("C", "P")):
                 key = f"{self._symbol}_{expiry}_{right}_{strike}"
                 tick = self._engine.get_tick(key)
@@ -595,14 +688,15 @@ class OptionChainWidget(QWidget):
 
     def _on_cell_clicked(self, table: QTableWidget, row: int, col: int):
         """Click on a cell -> emit option_selected."""
-        if row < 0 or row >= len(self._strikes):
+        strikes = getattr(table, "_strikes", self._strikes)
+        if row < 0 or row >= len(strikes):
             return
 
         idx = self.tab_widget.currentIndex()
         if idx < 0 or idx >= len(self._expirations):
             return
 
-        strike = self._strikes[row]
+        strike = strikes[row]
         expiry = self._expirations[idx]
 
         # Determine Call or Put based on column

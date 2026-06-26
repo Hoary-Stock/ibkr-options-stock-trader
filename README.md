@@ -410,6 +410,16 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **修: 某些到期日整张表空(如 NVDA 07/10)—— 期权链按到期日取真实合约**。
+  根因(日志实锤): `NVDA 260708 C 210` 成交而 `NVDA 260710 C 210` 报 **code=200 No security definition**
+  —— `request_option_chain` 把所有 option class 的到期日与行权价**并集**化, `reqSecDefOptParams` 的行权价
+  又是「该 class 跨所有到期日的并集」, 于是某到期日会被配上它**实际不存在**的行权价/class → reqMktData/下单
+  全 200 → 整张到期日表空。修复分两层:
+  ① `request_option_chain` 改为**按到期日**从「实际列出它的 class」解析行权价+tradingClass(SPX/SPXW 等多 class 仍正确);
+  ② 新增 `request_option_strikes_live`(**reqContractDetails** 按到期日取**真实存在**的合约), 期权链建表时**懒加载**该
+  到期日真实行权价(后台线程 + 信号回 GUI, 显示「加载中」占位; 确无合约则提示「该到期日无可用合约」, 不再拼假行)。
+  权威 tradingClass 写回缓存 → 下单/点价梯也用对的 class, 不再 200。`paper_engine` 同步代理两个新方法。
+  (`ibkr_engine.py`, `widgets/option_chain.py`, `paper_engine.py`)
 - **2026-06-26** — **计算器右下角指数条加第二行: 美债收益率 13周/5年/10年(刷新 30s)**。
   第一行仍是 SPY/SPX(+换算)/VIX; 新增第二行经 CBOE 收益率指数订阅: **IRX(13周)/FVX(5年)/TNX(10年)**,
   显示百分比(TNX/FVX 指数=收益率×10 → `scale=0.1` 还原; IRX≈收益率)。**无标准 2 年期 CBOE 指数**,

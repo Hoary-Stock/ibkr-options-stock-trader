@@ -102,6 +102,12 @@ class PaperEngine:
     def request_option_chain(self, symbol):
         return self.ibkr.request_option_chain(symbol)
 
+    def option_strikes_for_expiry(self, symbol, expiry):
+        return self.ibkr.option_strikes_for_expiry(symbol, expiry)
+
+    def request_option_strikes_live(self, symbol, expiry, timeout=8.0):
+        return self.ibkr.request_option_strikes_live(symbol, expiry, timeout)
+
     def subscribe_option_tick(self, option):
         return self.ibkr.subscribe_option_tick(option)
 

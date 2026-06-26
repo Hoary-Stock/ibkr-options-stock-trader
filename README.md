@@ -410,6 +410,11 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **期权链标题在标的价右侧显示标的 IV (如 `SPY $730.76  IV 18.2%`)**。
+  标的隐含波动率 = IBKR 对该标的计算的「期权隐含波动率」(TWS 的 Implied Vol %)。做法: 期权链的标的行情
+  订阅 (`_fetch_stock_price`) 加 **genericTick 106**, 引擎 `tickGeneric` 处理 **tickType 24** → 存
+  `_tick_data['iv']`; `_refresh_prices` 把它拼到标题价格右侧 (小数×100 显示百分比)。指数(SPX 等)可能不下发
+  则不显示。(`ibkr_engine.py`, `main_window.py`, `widgets/option_chain.py`)
 - **2026-06-26** — **期权链工具条加 ES 动量翻转指示 (Vordinkkk 法; 只看 ES)**。
   在「全部」与「刷新报价」之间显示 **ES** (E-mini S&P 500 连续期货) 的动量翻转: 翻多▲(绿)/翻空▼(红)/
   当前方向 多·空 / 无数据 —。算法移植自 `vordinkkk_momentum`: 1分钟K线, 动量=收盘[t]−收盘[t−10],

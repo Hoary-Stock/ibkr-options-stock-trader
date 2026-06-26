@@ -741,7 +741,12 @@ class OptionChainWidget(QWidget):
                 price = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
             if price > 0:
                 self._stock_price = price
-                self.title_label.setText(f"期权链 — {self._symbol}  ${price:.2f}")
+                # 标的 IV (generic tick 106 → tickType 24) 显示在价格右侧; 无则不显示
+                iv = stock_tick.get("iv", 0) or 0
+                iv_txt = f"  IV {iv * 100:.1f}%" if iv > 0 else ""
+                self.title_label.setText(
+                    f"期权链 — {self._symbol}  ${price:.2f}{iv_txt}"
+                )
 
         idx = self.tab_widget.currentIndex()
         if idx < 0 or idx >= len(self._expirations):

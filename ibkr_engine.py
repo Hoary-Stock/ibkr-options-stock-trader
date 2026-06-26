@@ -402,7 +402,14 @@ class IBKRApp(EWrapper, EClient):
         self._active_mkt_data_reqs.discard(reqId)
 
     def tickGeneric(self, reqId, tickType, value):
-        pass
+        """通用单值 tick。tickType 24 = 标的「期权隐含波动率」(请求 genericTick 106 时下发,
+        即 TWS 的 Implied Vol %, 小数如 0.18=18%)。存入 _tick_data[key]['iv'] 供期权链标题显示。"""
+        key = self._tick_req_to_key.get(reqId)
+        if key is None:
+            return
+        if tickType == 24 and value is not None and value == value and value > 0:
+            d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+            d["iv"] = float(value)
 
     def tickOptionComputation(
         self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice,

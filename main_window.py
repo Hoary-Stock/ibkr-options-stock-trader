@@ -735,7 +735,9 @@ class MainWindow(QMainWindow):
         app._tick_req_to_key[req_id] = key
         app._tick_data[key] = {"bid": 0.0, "ask": 0.0, "last": 0.0}
         app._active_mkt_data_reqs.add(req_id)
-        app.reqMktData(req_id, contract, "", False, False, [])
+        # generic tick 106 = Option Implied Volatility → 标的 IV (tickGeneric tickType 24),
+        # 显示在期权链标题价格右侧。指数(SPX 等)可能不下发, 缺则标题不显示 IV。
+        app.reqMktData(req_id, contract, "106", False, False, [])
 
         # Wait up to 5 seconds for initial price
         for _ in range(50):

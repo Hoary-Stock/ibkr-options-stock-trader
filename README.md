@@ -410,6 +410,12 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **修: error 321 "Invalid account code" —— 用 managedAccounts 取权威账户**。
+  reqPnL/reqPnLSingle 之前只从 `accountSummary` 取账户名, 多账户/账户组时会被最后一行覆盖成
+  reqPnL **不接受**的代码 → 321 刷状态栏。改为实现 EWrapper 的 **`managedAccounts`** 回调(连接即
+  自动下发**有效账户代码**列表, 早于 accountSummary), 取第一个为主账户; `accountSummary` 仅在其
+  未给出时兜底。另加 321 专门处理: 记下实际所用账户(排查用)并一次性提示, 不再刷屏。
+  (`ibkr_engine.py`)
 - **2026-06-26** — **修: 某些到期日整张表空(如 NVDA 07/10)—— 期权链按到期日取真实合约**。
   根因(日志实锤): `NVDA 260708 C 210` 成交而 `NVDA 260710 C 210` 报 **code=200 No security definition**
   —— `request_option_chain` 把所有 option class 的到期日与行权价**并集**化, `reqSecDefOptParams` 的行权价

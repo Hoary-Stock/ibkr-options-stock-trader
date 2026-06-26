@@ -139,8 +139,12 @@ class IBKRApp(EWrapper, EClient):
         # Per-position PnL subscriptions: reqId -> conId
         self._pnl_single_reqs: dict[int, int] = {}
 
-        # Account name (discovered from accountSummary)
+        # Account name. Authoritative source = managedAccounts (sent on connect);
+        # accountSummary is only a fallback. Using a non-managed / wrong account
+        # code in reqPnL/reqPnLSingle triggers error 321 "Invalid account code".
         self._account_name: str = ""
+        self._managed_accounts: list[str] = []
+        self._acct_err_warned = False   # error 321 仅提示一次, 不刷屏
 
         # 自算「今日期权交易总盈亏」(不依赖 IBKR 的 dailyPnL —— 它常为 -- / 未含费)。
         # 今日盈亏 = 今日成交现金流 + 当前持仓市值 − 今日手续费, 全部按 execId/conId 去重、跨日清零。
@@ -247,6 +251,21 @@ class IBKRApp(EWrapper, EClient):
             else:
                 # 已切延迟仍报 → 静默 (该合约连延迟数据也没有), 不刷状态栏
                 pass
+            return
+
+        # 321: "Invalid account code" — reqPnL/reqPnLSingle 用了无效账户。根因已由
+        # managedAccounts 取权威账户修正; 万一仍出现 (多账户/子账户), 记下实际用的账户
+        # 供排查, 并一次性提示, 不反复刷状态栏。
+        if errorCode == 321:
+            if not self._acct_err_warned:
+                self._acct_err_warned = True
+                print(f"[ACCT] 321 invalid account: {errorString} "
+                      f"(account={self._account_name}, "
+                      f"managed={self._managed_accounts})", flush=True)
+                self.bridge.error_received.emit(
+                    reqId, errorCode,
+                    "账户校验失败(321) — 多账户时请确认主账户; 详见 app 日志"
+                )
             return
 
         if errorCode in IGNORED_ERROR_CODES:
@@ -607,8 +626,22 @@ class IBKRApp(EWrapper, EClient):
 
     # ── Account Summary Callbacks ────────────────────────────────────
 
+    def managedAccounts(self, accountsList: str):
+        """IBKR 连接后自动下发的**有效账户代码**列表 (逗号分隔), 无需请求。
+
+        这是 reqPnL/reqPnLSingle 该用的权威账户来源。之前只从 accountSummary 取账户,
+        多账户/账户组时会被最后一行覆盖成一个 reqPnL 不接受的代码 → error 321
+        "Invalid account code"。这里取第一个有效账户为主账户。"""
+        accts = [a.strip() for a in (accountsList or "").split(",") if a.strip()]
+        self._managed_accounts = accts
+        if accts:
+            self._account_name = accts[0]
+
     def accountSummary(self, reqId, account, tag, value, currency):
-        self._account_name = account
+        # 仅在 managedAccounts 尚未给出账户时, 才用 summary 行兜底 (避免被多账户/
+        # 账户组的某一行覆盖成 reqPnL 不接受的代码 → 321)。
+        if not self._account_name:
+            self._account_name = account
         # Ledger request → per-currency cash balances (separate subscription)
         if reqId == self._ledger_req_id:
             if tag == "CashBalance" and currency and currency != "BASE":

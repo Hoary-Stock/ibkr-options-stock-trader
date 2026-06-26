@@ -142,6 +142,11 @@ class OptionCalculator(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start(CALCULATOR_REFRESH_MS)
 
+        # 美债收益率刷新慢 (30s): 利率变动慢, 无需跟随计算器高频刷新
+        self._rate_timer = QTimer(self)
+        self._rate_timer.timeout.connect(self._update_rates)
+        self._rate_timer.start(30_000)
+
     # ── UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -227,6 +232,27 @@ class OptionCalculator(QWidget):
         bar.addWidget(self._vix_label)
 
         root.addLayout(bar)
+
+        # 第二行: 美债收益率 (13周 / 5年 / 10年)。刷新慢 (30s), 利率变动慢无需高频。
+        # 13周(IRX) 作为短端档位 (无标准 2 年期 CBOE 指数, 用 IRX 替代)。
+        rate_bar = QHBoxLayout()
+        rate_bar.setSpacing(10)
+        rate_cap = QLabel("美债")
+        rate_cap.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+        rate_bar.addWidget(rate_cap)
+        self._rate_labels: dict[str, QLabel] = {}
+        for label, sym, _scale in self._RATE_SYMBOLS:
+            cap = QLabel(label)
+            cap.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+            val = QLabel("—")
+            val.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-size: 13px; font-weight: bold;"
+            )
+            self._rate_labels[sym] = val
+            rate_bar.addWidget(cap)
+            rate_bar.addWidget(val)
+        rate_bar.addStretch(1)
+        root.addLayout(rate_bar)
 
     @staticmethod
     def _make_spin(decimals, maximum, step, suffix="", on_change=None):
@@ -519,10 +545,14 @@ class OptionCalculator(QWidget):
     # ── 大盘指数条 (SPY / SPX / VIX) ─────────────────────────────────────
 
     _INDEX_BAR_SYMBOLS = ("SPY", "SPX", "VIX")
+    # 美债收益率档位: (显示标签, CBOE 指数代码, 显示换算 scale)。
+    # TNX/FVX 指数=收益率×10 → ×0.1 还原为百分比; IRX≈收益率 → ×1.0。
+    # 13周(IRX) 用作短端 (无标准 2 年期 CBOE 指数)。
+    _RATE_SYMBOLS = (("13周", "IRX", 1.0), ("5年", "FVX", 0.1), ("10年", "TNX", 0.1))
 
     def _ensure_index_subscriptions(self):
-        """连接后订阅 SPY/SPX/VIX 行情 (每个引擎仅订阅一次)。
-        SPX/VIX 为 CBOE 指数, 若账户无指数行情权限则相应字段保持「—」。"""
+        """连接后订阅 SPY/SPX/VIX + 美债收益率(IRX/FVX/TNX) 行情 (每个引擎仅订阅一次)。
+        均为 CBOE 指数, 若账户无指数行情权限则相应字段保持「—」。"""
         if self._indices_subscribed or self._engine is None:
             return
         if not getattr(self._engine, "is_connected", False):
@@ -530,12 +560,16 @@ class OptionCalculator(QWidget):
         sub = getattr(self._engine, "subscribe_stock_tick", None)
         if sub is None:
             return
-        for sym in self._INDEX_BAR_SYMBOLS:
+        rate_syms = tuple(s for _, s, _ in self._RATE_SYMBOLS)
+        for sym in self._INDEX_BAR_SYMBOLS + rate_syms:
             try:
                 self._index_req_ids.append(sub(sym))
             except Exception:
                 pass
         self._indices_subscribed = True
+        # 30s 定时器首帧要等 30s; 连接后先排两次快速更新, 让利率行尽早出值
+        QTimer.singleShot(3000, self._update_rates)
+        QTimer.singleShot(8000, self._update_rates)
 
     def _index_price(self, symbol: str) -> float:
         """指数现价: 优先 last, 回退 bid/ask 中间价。无行情返回 0。"""
@@ -590,6 +624,27 @@ class OptionCalculator(QWidget):
             self._vix_label.setStyleSheet(
                 f"color: {COLOR_TEXT_DIM}; font-size: 15px; font-weight: bold;"
             )
+
+    def _update_rates(self):
+        """刷新美债收益率行 (13周/5年/10年), 30s 一次。无行情/无权限则显示「—」。
+        TNX/FVX 指数=收益率×10 → 按 scale 还原成百分比。"""
+        if self._engine is None or not hasattr(self, "_rate_labels"):
+            return
+        for _label, sym, scale in self._RATE_SYMBOLS:
+            lab = self._rate_labels.get(sym)
+            if lab is None:
+                continue
+            raw = self._index_price(sym)
+            if raw > 0:
+                lab.setText(f"{raw * scale:.3f}%")
+                lab.setStyleSheet(
+                    f"color: {COLOR_TEXT}; font-size: 13px; font-weight: bold;"
+                )
+            else:
+                lab.setText("—")
+                lab.setStyleSheet(
+                    f"color: {COLOR_TEXT_DIM}; font-size: 13px; font-weight: bold;"
+                )
 
     def _live_underlying(self, opt_tick: dict) -> float:
         """标的实时价。优先用高频的标的 tick (__stock__SYM, 随每笔成交跳动),
@@ -900,7 +955,8 @@ class OptionCalculator(QWidget):
 
     def cleanup(self):
         self._timer.stop()
-        # 退订指数行情线 (SPY/SPX/VIX)
+        self._rate_timer.stop()
+        # 退订指数行情线 (SPY/SPX/VIX + 美债 IRX/FVX/TNX)
         unsub = getattr(self._engine, "unsubscribe_tick", None) if self._engine else None
         if unsub:
             for rid in self._index_req_ids:

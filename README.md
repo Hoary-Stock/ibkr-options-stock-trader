@@ -410,6 +410,13 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **计算器右下角指数条加第二行: 美债收益率 13周/5年/10年(刷新 30s)**。
+  第一行仍是 SPY/SPX(+换算)/VIX; 新增第二行经 CBOE 收益率指数订阅: **IRX(13周)/FVX(5年)/TNX(10年)**,
+  显示百分比(TNX/FVX 指数=收益率×10 → `scale=0.1` 还原; IRX≈收益率)。**无标准 2 年期 CBOE 指数**,
+  按用户选择用 **13周(IRX)** 作短端替代。利率变动慢 → 独立 30s 定时器刷新(连接后先排 3s/8s 两次快更出值)。
+  `config.INDEX_SYMBOLS` 加入 IRX/FVX/TNX/TYX(→ `_make_underlying_contract` 按 CBOE/IND 建约)。
+  注: 需 CBOE 指数行情权限, 无则显示「—」; 利率行常驻 3 条行情线(Gateway 行情线紧张时可改 30s 快照)。
+  (`widgets/option_calculator.py`, `config.py`)
 - **2026-06-26** — **修: 期权链切到/切换到期日时自动把最接近现价的行权价居中(不再停在最低档如 0.5)**。
   根因: `scrollToItem` 在刚建/刚切的表上执行时 viewport 高度还是 0 → 居中无效, 表停在最上面(最低行权价)。
   改为**延后一轮事件循环**(`QTimer.singleShot(0, _center_and_snapshot)`)等布局完成再滚, 并用**最新现价**

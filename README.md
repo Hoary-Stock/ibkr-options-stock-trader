@@ -415,6 +415,11 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
   订阅 (`_fetch_stock_price`) 加 **genericTick 106**, 引擎 `tickGeneric` 处理 **tickType 24** → 存
   `_tick_data['iv']`; `_refresh_prices` 把它拼到标题价格右侧 (小数×100 显示百分比)。指数(SPX 等)可能不下发
   则不显示。(`ibkr_engine.py`, `main_window.py`, `widgets/option_chain.py`)
+- **2026-06-26** — **ES 动量指示加「趋势/震荡」regime (5MA 斜率法, 移植 slope.py)**。
+  在原翻转(翻多▲/翻空▼)基础上, 加 Vordinkkk 的 chop/trend 判定: 5周期均线、最近5根斜率同向占比
+  ≥0.8 → 趋势↑/↓ (价格抖动视为噪音), 否则 震荡~ (chop)。组合显示如「翻多▲ · 趋势↑」(强) /
+  「翻空▼ · 震荡~」(谨慎)。`momentum_flip.py` 加 `compute_slope_regime` + `analyze` 合并;
+  期权链标签按 flip+regime 富文本着色 (趋势绿/红, 震荡琥珀)。(`momentum_flip.py`, `widgets/option_chain.py`)
 - **2026-06-26** — **期权链工具条加 ES 动量翻转指示 (Vordinkkk 法; 只看 ES)**。
   在「全部」与「刷新报价」之间显示 **ES** (E-mini S&P 500 连续期货) 的动量翻转: 翻多▲(绿)/翻空▼(红)/
   当前方向 多·空 / 无数据 —。算法移植自 `vordinkkk_momentum`: 1分钟K线, 动量=收盘[t]−收盘[t−10],

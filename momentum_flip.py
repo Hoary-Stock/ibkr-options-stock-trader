@@ -15,6 +15,10 @@ from __future__ import annotations
 # 与 vordinkkk_momentum/config.yaml 一致
 MOMENTUM_PERIOD = 10
 DERIVATIVE_THRESHOLD = 0.4
+# 5MA 斜率法判「趋势 vs 震荡」(slope.py): 5周期均线, 取最近 5 根斜率, 同向占比 >= 0.8 → 趋势
+MA_PERIOD = 5
+SLOPE_WINDOW = 5
+CONSISTENCY_THRESHOLD = 0.8
 
 
 def compute_flip(closes: list[float], period: int = MOMENTUM_PERIOD,
@@ -70,3 +74,66 @@ def compute_flip(closes: list[float], period: int = MOMENTUM_PERIOD,
         "flip": flip,
         "bars_since_flip": bars_since,
     }
+
+
+def compute_slope_regime(closes: list[float], ma_period: int = MA_PERIOD,
+                         slope_window: int = SLOPE_WINDOW,
+                         consistency_threshold: float = CONSISTENCY_THRESHOLD
+                         ) -> dict | None:
+    """5MA 斜率法判「趋势 vs 震荡」(移植 slope.py)。
+
+    取价格 `ma_period` 周期简单均线, 算最近 `slope_window` 根的逐根斜率 (ma[i]-ma[i-1]);
+    同向斜率占比 (consistency) >= 阈值 → 趋势 (TRENDING), 否则震荡 (CHOPPY)。
+    Vordinkkk 用它把「斜率一致时的价格抖动」判为噪音, 斜率不一致即 chop。
+
+    返回 {regime:'TRENDING'/'CHOPPY', direction:'UP'/'DOWN'/'MIXED', consistency}。
+    数据不足返回 None。
+    """
+    n = len(closes)
+    if n < ma_period + slope_window:
+        return None
+
+    ma = [None] * n
+    for i in range(ma_period - 1, n):
+        ma[i] = sum(closes[i - ma_period + 1:i + 1]) / ma_period
+
+    slopes = []
+    for i in range(n - slope_window, n):
+        if i >= 1 and ma[i] is not None and ma[i - 1] is not None:
+            slopes.append(ma[i] - ma[i - 1])
+    if not slopes:
+        return None
+
+    n_pos = sum(1 for s in slopes if s > 0)
+    n_neg = sum(1 for s in slopes if s < 0)
+    total = len(slopes)
+    pos_ratio = n_pos / total
+    neg_ratio = n_neg / total
+    consistency = max(pos_ratio, neg_ratio)
+    regime = "TRENDING" if consistency >= consistency_threshold else "CHOPPY"
+    if pos_ratio > neg_ratio:
+        direction = "UP"
+    elif neg_ratio > pos_ratio:
+        direction = "DOWN"
+    else:
+        direction = "MIXED"
+    return {"regime": regime, "direction": direction, "consistency": consistency}
+
+
+def analyze(closes: list[float]) -> dict | None:
+    """ES 综合分析: 动量翻转 (compute_flip) + 趋势/震荡 (compute_slope_regime)。
+    合并为一个 state dict 供 GUI 显示。数据不足返回 None。"""
+    flip = compute_flip(closes)
+    if flip is None:
+        return None
+    regime = compute_slope_regime(closes)
+    state = dict(flip)
+    if regime:
+        state["regime"] = regime["regime"]
+        state["regime_direction"] = regime["direction"]
+        state["consistency"] = regime["consistency"]
+    else:
+        state["regime"] = None
+        state["regime_direction"] = None
+        state["consistency"] = None
+    return state

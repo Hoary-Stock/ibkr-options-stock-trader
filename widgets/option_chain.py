@@ -3,7 +3,7 @@
 import threading
 from datetime import datetime, timedelta
 
-from momentum_flip import compute_flip
+from momentum_flip import analyze as analyze_es_momentum
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
@@ -114,11 +114,13 @@ class OptionChainWidget(QWidget):
         # ES 动量翻转 (Vordinkkk 法, 1分钟K线): 翻多▲ / 翻空▼ / 持续 / —
         self._momentum_label = QLabel("ES动量 —")
         self._momentum_label.setToolTip(
-            "ES (E-mini S&P 500 连续期货) 动量翻转 — Vordinkkk 法:\n"
-            "· 动量 = 收盘[t] − 收盘[t−10] (1分钟K线)\n"
-            "· 翻转 = 动量穿越0 且 |导数| ≥ 0.4\n"
-            "  翻多▲ = 由空转多; 翻空▼ = 由多转空\n"
-            "· 无翻转时显示当前动量方向 (多/空)"
+            "ES (E-mini S&P 500 连续期货) 动量 — Vordinkkk 法 (1分钟K线):\n"
+            "翻转: 动量(收盘[t]−收盘[t−10]) 穿越0 且 |导数| ≥ 0.4\n"
+            "  翻多▲ = 由空转多; 翻空▼ = 由多转空 (入场信号)\n"
+            "趋势/震荡 (5MA 斜率法): 最近5根 5周期均线斜率\n"
+            "  同向占比 ≥ 80% → 趋势↑/↓ (价格抖动视为噪音)\n"
+            "  否则 → 震荡~ (chop, 无仓不开/谨慎)\n"
+            "组合显示: 如「翻多▲ · 趋势↑」(强) / 「翻空▼ · 震荡~」(谨慎)"
         )
         self._momentum_label.setStyleSheet(
             f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
@@ -235,7 +237,7 @@ class OptionChainWidget(QWidget):
             try:
                 closes = eng.request_es_momentum_bars()
                 if closes:
-                    state = compute_flip(closes)
+                    state = analyze_es_momentum(closes)
             except Exception:
                 state = None
             self._momentum_ready.emit(state)
@@ -243,7 +245,8 @@ class OptionChainWidget(QWidget):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_momentum_ready(self, state):
-        """(GUI 线程) 更新 ES 动量翻转标签。state=None → 无数据。"""
+        """(GUI 线程) 更新 ES 动量标签: 翻转(翻多▲/翻空▼) + 趋势/震荡 regime。
+        state=None → 无数据。"""
         self._mom_fetching = False
         if not state:
             self._momentum_label.setText("ES动量 —")
@@ -251,23 +254,45 @@ class OptionChainWidget(QWidget):
                 f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
             )
             return
+        amber = "#ffab00"   # 震荡(chop) 用琥珀色 = 中性警示
+
+        # 翻转部分 (最actionable, 加粗)
         flip = state.get("flip")
-        sign = state.get("sign", 0)
         if flip == "UP":
-            txt, color, bold = "ES动量翻多 ▲", COLOR_GREEN, True
+            flip_html = f"<span style='color:{COLOR_GREEN};font-weight:bold'>翻多▲</span>"
         elif flip == "DOWN":
-            txt, color, bold = "ES动量翻空 ▼", COLOR_RED, True
-        elif sign > 0:
-            txt, color, bold = "ES动量 多", COLOR_GREEN, False
-        elif sign < 0:
-            txt, color, bold = "ES动量 空", COLOR_RED, False
+            flip_html = f"<span style='color:{COLOR_RED};font-weight:bold'>翻空▼</span>"
         else:
-            txt, color, bold = "ES动量 平", COLOR_TEXT_DIM, False
-        weight = "font-weight:bold;" if bold else ""
-        self._momentum_label.setText(txt)
-        self._momentum_label.setStyleSheet(
-            f"color: {color}; font-size: 12px; padding: 0 8px; {weight}"
+            flip_html = ""
+
+        # 趋势/震荡 regime 部分
+        regime = state.get("regime")
+        rdir = state.get("regime_direction")
+        if regime == "TRENDING" and rdir == "UP":
+            regime_html = f"<span style='color:{COLOR_GREEN}'>趋势↑</span>"
+        elif regime == "TRENDING" and rdir == "DOWN":
+            regime_html = f"<span style='color:{COLOR_RED}'>趋势↓</span>"
+        elif regime == "CHOPPY":
+            regime_html = f"<span style='color:{amber}'>震荡~</span>"
+        else:
+            regime_html = ""
+
+        parts = [p for p in (flip_html, regime_html) if p]
+        if not parts:
+            # 回退: 当前动量方向 (无翻转且 regime 不可用)
+            sign = state.get("sign", 0)
+            if sign > 0:
+                parts.append(f"<span style='color:{COLOR_GREEN}'>多</span>")
+            elif sign < 0:
+                parts.append(f"<span style='color:{COLOR_RED}'>空</span>")
+            else:
+                parts.append(f"<span style='color:{COLOR_TEXT_DIM}'>平</span>")
+
+        inner = " · ".join(parts)
+        self._momentum_label.setText(
+            f"<span style='color:{COLOR_TEXT_DIM}'>ES</span> {inner}"
         )
+        self._momentum_label.setStyleSheet("font-size: 12px; padding: 0 8px;")
 
     def set_trade_stats(self, stats: dict):
         """更新「笔数 · 胜率 · 盈亏比」(刷新报价左侧)。stats 为 TradeStats.snapshot()。"""

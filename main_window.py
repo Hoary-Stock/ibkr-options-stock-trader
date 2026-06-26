@@ -17,7 +17,7 @@ from config import (
     SPX_SESSION_RTH_START, SPX_SESSION_RTH_END,
     DATA_CONNECTION_ERROR_CODES,
 )
-from config import FUTURES_SPECS, FUTURES_MAX_EXPIRIES
+from config import FUTURES_SPECS, FUTURES_MAX_EXPIRIES, FUTURES_REQUIRE_BRACKET
 from models import OptionInfo, OrderAction, OrderType, TradingMode
 from ibkr_engine import IBKREngine
 from paper_engine import PaperEngine
@@ -168,6 +168,8 @@ class MainWindow(QMainWindow):
         self._instrument = "OPT"   # "OPT"(默认) / "STK" / "FUT"
         self._future_expiries: list = []  # 当前期货标的的合约月份 [{expiry,con_id,...}]
         self._chart_windows: list = []  # list[ChartWindow]
+        # 限价开多后, 待成交回报再挂的止盈/止损: {entry_order_id: {option,qty,bracket,outside}}
+        self._pending_buy_brackets: dict[int, dict] = {}
 
         # Detachable price ladder state
         self._ladder_detached = False
@@ -376,9 +378,12 @@ class MainWindow(QMainWindow):
         )
         # 真正成交 → 提示音 (仅真实引擎; 本地模拟不响)
         self.ibkr_engine.bridge.execution_received.connect(self._on_fill_sound)
+        # 期货限价开多成交 → 自动挂上止盈/止损 (两个引擎都监听, 按当前模式生效)
+        self.ibkr_engine.bridge.execution_received.connect(self._on_exec_arm_bracket)
 
         # Paper engine signals
         self.paper_engine.bridge.error_received.connect(self._on_error)
+        self.paper_engine.bridge.execution_received.connect(self._on_exec_arm_bracket)
         self.paper_engine.bridge.account_summary_updated.connect(self.account_bar.update_account)
         self.paper_engine.bridge.pnl_updated.connect(self.account_bar.update_daily_pnl)
         self.paper_engine.bridge.computed_daily_pnl.connect(
@@ -872,6 +877,12 @@ class MainWindow(QMainWindow):
 
     def _on_order_requested(self, option: OptionInfo, action_str: str, price: float):
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
+
+        # 买入是否需附带止盈/止损 (期货强制 / 期权勾「随买入单附带」)。None=拦截, {}=无需挂
+        bracket = self._resolve_buy_bracket(option, action)
+        if bracket is None:
+            return
+
         qty = self.price_ladder.get_quantity()
         outside_rth = self.price_ladder.get_outside_rth()
 
@@ -880,16 +891,28 @@ class MainWindow(QMainWindow):
         if order_id > 0:
             action_text = "买入" if action == OrderAction.BUY else "卖出"
             rth_tag = " [盘外]" if outside_rth else ""
-            self.statusBar().showMessage(
-                f"已提交: {action_text} {qty}{self._unit_for(option)} "
-                f"{option.display_name} @ ${price:.2f}{rth_tag}"
-            )
+            msg = (f"已提交: {action_text} {qty}{self._unit_for(option)} "
+                   f"{option.display_name} @ ${price:.2f}{rth_tag}")
+            # 限价开多: 等成交回报后再挂止盈/止损 (避免挂单未成交时误触发开出反向单)
+            if bracket:
+                self._pending_buy_brackets[order_id] = {
+                    "option": option, "qty": qty,
+                    "bracket": bracket, "outside": outside_rth,
+                }
+                msg += " — 成交后自动挂止盈/止损"
+            self.statusBar().showMessage(msg)
             # Switch to order tab
             self.right_tabs.setCurrentIndex(1)
 
     def _on_market_order_requested(self, option: OptionInfo, action_str: str):
         """Handle market order from price ladder action buttons."""
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
+
+        # 买入是否需附带止盈/止损 (期货强制 / 期权勾「随买入单附带」)。None=拦截, {}=无需挂
+        bracket = self._resolve_buy_bracket(option, action)
+        if bracket is None:
+            return
+
         qty = self.price_ladder.get_quantity()
         outside_rth = self.price_ladder.get_outside_rth()
 
@@ -902,7 +925,151 @@ class MainWindow(QMainWindow):
                 f"已提交: {action_text} {qty}{self._unit_for(option)} "
                 f"{option.display_name}{rth_tag}"
             )
+            # 市价开多附带条件单:
+            #  - 绝对价(期权): 触发价已知, 成交即时 → 立刻挂;
+            #  - 点数(期货): 需成交价作基准 → 等成交回报再挂 (_on_exec_arm_bracket)。
+            if bracket:
+                if bracket.get("by_points"):
+                    self._pending_buy_brackets[order_id] = {
+                        "option": option, "qty": qty,
+                        "bracket": bracket, "outside": outside_rth,
+                    }
+                else:
+                    self._arm_buy_bracket(option, qty, bracket, outside_rth)
             self.right_tabs.setCurrentIndex(1)
+
+    # ── 买入附带止盈/止损 (bracket) ────────────────────────────────────
+
+    @staticmethod
+    def _trigger_price(by_points: bool, kind: str, value: float,
+                       base: float) -> float:
+        """把条件单输入换成**绝对触发价**。
+
+        - ``by_points=False``: value 本身就是绝对触发价, 直接返回;
+        - ``by_points=True`` (期货): value 是点数, 止盈=base+点, 止损=base−点
+          (base = 买入成交价 / 持仓均价)。
+        """
+        if not by_points:
+            return value
+        return round(base + value, 4) if kind == "TP" else round(base - value, 4)
+
+    def _resolve_buy_bracket(self, option: OptionInfo, action: OrderAction):
+        """买入(BUY)时是否需附带止盈/止损条件单。
+
+        - **期货开多**: 强制带 (`FUTURES_REQUIRE_BRACKET`), 止盈+止损都需设好;
+        - **期权/正股**: 勾选点价梯「随买入单附带」才挂, 至少一条腿即可。
+
+        返回值:
+          - ``{}``  → 放行, 无需挂 (非 BUY / 既不强制也未勾附带);
+          - ``dict``→ 放行, 且按此配置挂 ({tp_on,tp_price,sl_on,sl_price,native});
+          - ``None``→ 已拦截 (调用方须中止下单)。
+        """
+        if action != OrderAction.BUY:
+            return {}
+        force = (option.right == "FUT" and FUTURES_REQUIRE_BRACKET)
+        attach = self.price_ladder.attach_to_buy()
+        if not force and not attach:
+            return {}
+        bracket = self.price_ladder.get_bracket(require_both=force)
+        if bracket is None:
+            self.price_ladder.open_cond_panel()
+            if force:
+                self.statusBar().showMessage("已拦截: 期货开仓必须先设置止盈 + 止损")
+                QMessageBox.warning(
+                    self, "期货需带止盈止损",
+                    "期货开仓必须同时设置「止盈」和「止损」才能下单。\n\n"
+                    "请在点价梯下方「条件单」面板勾选 ☑止盈 与 ☑止损 并填写有效触发价, "
+                    "然后再点买入。",
+                )
+            else:
+                self.statusBar().showMessage("已拦截: 勾了「随买入单附带」却未设置止盈/止损")
+                QMessageBox.warning(
+                    self, "需设置止盈/止损",
+                    "已勾选「随买入单附带」, 但未设置有效的止盈/止损。\n\n"
+                    "请在「条件单」面板勾选止盈或止损并填写触发价, "
+                    "或取消「随买入单附带」后再下单。",
+                )
+            return None
+        # 绝对价模式下, 两条腿都在时止盈价须高于止损价 (开多: 止盈在上、止损在下)。
+        # 期货「点数」模式两者都是正偏移, 止盈触发价=base+点 永远 > 止损触发价=base−点, 无需此检查。
+        if (not bracket.get("by_points") and bracket["tp_on"] and bracket["sl_on"]
+                and bracket["tp_price"] <= bracket["sl_price"]):
+            self.price_ladder.open_cond_panel()
+            self.statusBar().showMessage("已拦截: 止盈价须高于止损价")
+            QMessageBox.warning(
+                self, "止盈/止损价不合理",
+                f"开多: 止盈价 (${bracket['tp_price']:.2f}) 应高于 "
+                f"止损价 (${bracket['sl_price']:.2f})。\n请检查触发价。",
+            )
+            return None
+        return bracket
+
+    def _arm_buy_bracket(self, option: OptionInfo, qty: int,
+                         bracket: dict, outside: bool, base: float = 0.0):
+        """给刚开的多仓挂上止盈/止损 (qty = 开仓数量, 可只挂其中一条腿)。
+
+        `base` = 入场价基准, 期货「点数」模式用它把 +点/-点 换算成绝对触发价
+        (止盈=base+点, 止损=base−点); 绝对价模式忽略 base。
+
+        本地模式: 由 ConditionalOrderManager 监控现价, 到价发 SELL 限价单;
+        原生模式: 止盈 = SELL LMT, 止损 = SELL STP LMT (服务器端)。
+        """
+        if not self.ibkr_engine.is_connected:
+            self.statusBar().showMessage("未连接 — 无法挂止盈/止损")
+            return
+        by_points = bracket.get("by_points", False)
+        if by_points and base <= 0:
+            self.statusBar().showMessage("无入场价基准 — 无法按点数换算止盈/止损")
+            return
+        native = bracket.get("native", False)
+        msgs = []
+        placed_native = False
+        if bracket.get("tp_on"):
+            tp = self._trigger_price(by_points, "TP", bracket["tp_price"], base)
+            off = f" (+{bracket['tp_price']:g}点)" if by_points else ""
+            if tp > 0:
+                if native:
+                    oid = self._place_order(option, OrderAction.SELL,
+                                            OrderType.LIMIT, tp, qty, outside)
+                    if oid > 0:
+                        msgs.append(f"止盈(原生限价@{tp:.2f}{off})")
+                        placed_native = True
+                else:
+                    self.cond_manager.arm(option, "TP", tp, tp, qty, outside)
+                    msgs.append(f"止盈(本地≥{tp:.2f}{off})")
+        if bracket.get("sl_on"):
+            sl = self._trigger_price(by_points, "SL", bracket["sl_price"], base)
+            off = f" (-{bracket['sl_price']:g}点)" if by_points else ""
+            if sl > 0:
+                if native:
+                    oid2 = self._active_engine.place_stop_limit_order(
+                        option, OrderAction.SELL, qty, sl, sl, outside_rth=outside)
+                    if oid2 > 0:
+                        msgs.append(f"止损(原生STP LMT@{sl:.2f}{off})")
+                        placed_native = True
+                else:
+                    self.cond_manager.arm(option, "SL", sl, sl, qty, outside)
+                    msgs.append(f"止损(本地≤{sl:.2f}{off})")
+        if msgs:
+            tag = "" if native else " (本地: 仅程序运行时监控)"
+            self.statusBar().showMessage(
+                f"已挂(同{qty}{self._unit_for(option)}): {' + '.join(msgs)}{tag}"
+            )
+            if placed_native:
+                self.right_tabs.setCurrentIndex(1)
+        self._refresh_conditionals()
+
+    def _on_exec_arm_bracket(self, order_id: int, side: str, qty: float,
+                             price: float):
+        """开多成交回报 → 挂上待挂的止盈/止损 (首次成交即挂, 然后移除)。
+        成交价 `price` 作为期货「点数」换算的入场价基准。"""
+        pending = self._pending_buy_brackets.pop(order_id, None)
+        if pending is None:
+            return
+        self._arm_buy_bracket(
+            pending["option"], pending["qty"],
+            pending["bracket"], pending["outside"], base=price,
+        )
 
     def _on_close_position_requested(self, option: OptionInfo):
         """Handle close position from price ladder (期权/正股/期货)。"""
@@ -937,7 +1104,10 @@ class MainWindow(QMainWindow):
     # ── 条件单 (止盈/止损) ─────────────────────────────────────────────
 
     def _on_conditional_requested(self, req: dict):
-        """点价梯「挂条件单」: 按勾选挂止盈/止损 (本地 或 IBKR 原生)。"""
+        """点价梯「挂条件单」(对**当前持仓**): 按勾选挂止盈/止损 (本地 或 IBKR 原生)。
+
+        期货用「点数」表示, 以**当前持仓均价**为基准换算绝对触发价 (无持仓则拦截)。
+        """
         opt = getattr(self.price_ladder, "_option", None)
         if opt is None:
             self.statusBar().showMessage("未选合约 — 无法挂条件单")
@@ -945,32 +1115,51 @@ class MainWindow(QMainWindow):
         if not self.ibkr_engine.is_connected:
             self.statusBar().showMessage("未连接 — 无法挂条件单")
             return
+
+        by_points = req.get("by_points", False)
+        base = 0.0
+        if by_points:
+            pos = (self._active_engine.get_position(opt.to_ibkr_key())
+                   if self._active_engine else None)
+            base = getattr(pos, "avg_price", 0.0) if pos else 0.0
+            if base <= 0:
+                self.statusBar().showMessage(
+                    "无持仓均价 — 期货按点数挂需先持仓 (或用「随买入单附带」在开仓时按成交价挂)"
+                )
+                QMessageBox.warning(
+                    self, "需持仓均价",
+                    "期货「条件单」用点数(相对持仓均价)表示, 但当前无持仓均价可用。\n\n"
+                    "请先持有该期货仓位后再挂, 或勾「随买入单附带」在开仓时按成交价自动挂。",
+                )
+                return
+
         native = req["native"]
         qty = req["qty"]
         outside = req["outside_rth"]
         msgs = []
         if req["tp_on"]:
+            tp = self._trigger_price(by_points, "TP", req["tp_price"], base)
+            off = f" (+{req['tp_price']:g}点)" if by_points else ""
             if native:
                 # 止盈 = 高于市价的卖出限价, 原生即普通 SELL LMT(到价成交)
                 oid = self._place_order(opt, OrderAction.SELL, OrderType.LIMIT,
-                                        req["tp_price"], qty, outside)
+                                        tp, qty, outside)
                 if oid > 0:
-                    msgs.append(f"止盈(原生限价@{req['tp_price']:.2f})")
+                    msgs.append(f"止盈(原生限价@{tp:.2f}{off})")
             else:
-                self.cond_manager.arm(opt, "TP", req["tp_price"],
-                                      req["tp_price"], qty, outside)
-                msgs.append(f"止盈(本地≥{req['tp_price']:.2f})")
+                self.cond_manager.arm(opt, "TP", tp, tp, qty, outside)
+                msgs.append(f"止盈(本地≥{tp:.2f}{off})")
         if req["sl_on"]:
+            sl = self._trigger_price(by_points, "SL", req["sl_price"], base)
+            off = f" (-{req['sl_price']:g}点)" if by_points else ""
             if native:
                 oid = self._active_engine.place_stop_limit_order(
-                    opt, OrderAction.SELL, qty, req["sl_price"],
-                    req["sl_price"], outside_rth=outside)
+                    opt, OrderAction.SELL, qty, sl, sl, outside_rth=outside)
                 if oid > 0:
-                    msgs.append(f"止损(原生STP LMT@{req['sl_price']:.2f})")
+                    msgs.append(f"止损(原生STP LMT@{sl:.2f}{off})")
             else:
-                self.cond_manager.arm(opt, "SL", req["sl_price"],
-                                      req["sl_price"], qty, outside)
-                msgs.append(f"止损(本地≤{req['sl_price']:.2f})")
+                self.cond_manager.arm(opt, "SL", sl, sl, qty, outside)
+                msgs.append(f"止损(本地≤{sl:.2f}{off})")
         if msgs:
             tag = "" if native else " (本地: 仅程序运行时监控)"
             self.statusBar().showMessage("已挂条件单: " + " + ".join(msgs) + tag)

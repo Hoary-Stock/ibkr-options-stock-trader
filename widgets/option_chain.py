@@ -15,7 +15,6 @@ from config import (
     COLOR_ATM_HIGHLIGHT, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
     COLOR_BORDER, COLOR_BUTTON_DISABLED,
     MAX_EXPIRY_TABS_PER_RANGE, MAX_SIMULTANEOUS_STREAMS,
-    CHAIN_STRIKES_AROUND_ATM,
 )
 from models import OptionInfo
 
@@ -41,6 +40,11 @@ class OptionChainWidget(QWidget):
         self._stock_price = 0.0
         self._range_buckets: dict[str, list[str]] = {}  # range_name -> [expirations]
         self._active_range: str = ""
+        self._atm_row: int = 0   # ATM 行索引 (切 Tab 时滚到此处, 优先取价)
+        # 视口取价去抖: 滚动停止 ~250ms 后只对当前可见行拉一次快照 (省行情线)
+        self._snap_timer = QTimer(self)
+        self._snap_timer.setSingleShot(True)
+        self._snap_timer.timeout.connect(self._request_snapshots)
 
         # Cached brushes — reused every refresh instead of allocating a new
         # QBrush/QColor per cell per second.
@@ -177,18 +181,18 @@ class OptionChainWidget(QWidget):
         today = datetime.now().strftime("%Y%m%d")
         self._all_expirations = [e for e in expirations if e >= today]
 
-        # Filter strikes near the money (±CHAIN_STRIKES_AROUND_ATM around ATM)
-        if stock_price > 0:
-            atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - stock_price))
+        # 显示**全部**行权价 (能滚到远端如 SPY 695 put); 不再按 ATM±N 裁剪。
+        # 行情线占用由「按视口取价」控制 (只对当前滚动可见行拉快照), 而非靠少显示。
+        self._strikes = sorted(strikes)
+        if stock_price > 0 and self._strikes:
+            self._atm_row = min(range(len(self._strikes)),
+                                key=lambda i: abs(self._strikes[i] - stock_price))
         else:
-            atm_idx = len(strikes) // 2
-        start = max(0, atm_idx - CHAIN_STRIKES_AROUND_ATM)
-        end = min(len(strikes), atm_idx + CHAIN_STRIKES_AROUND_ATM + 1)
-        self._strikes = strikes[start:end]
+            self._atm_row = len(self._strikes) // 2
 
         print(f"[DEBUG] Option chain: {len(self._all_expirations)} total expirations, "
-              f"{len(self._strikes)} strikes displayed, "
-              f"ATM idx={atm_idx}, stock_price={stock_price}", flush=True)
+              f"{len(self._strikes)} strikes displayed (full), "
+              f"ATM row={self._atm_row}, stock_price={stock_price}", flush=True)
 
         self.title_label.setText(f"期权链 — {symbol}")
 
@@ -319,18 +323,25 @@ class OptionChainWidget(QWidget):
             return f"{dte}D {month_day}"
 
     def _create_table(self, expiry: str) -> QTableWidget:
-        """Create the T-shaped table for one expiry."""
+        """Create the T-shaped table **shell** for one expiry (rows built lazily).
+
+        显示全部行权价后, 单条链可能有几百档 × 多个到期日 Tab。若在加载时一次性
+        把每个 Tab 的行都建出来, 主线程会卡顿。故这里只建表头/列, 行留到该 Tab
+        首次显示时 (`_on_tab_changed` → `_ensure_table_built`) 再填充。
+        """
         headers = [
             "C.Bid", "C.Ask", "C.Last", "C.Vol",
             "Strike",
             "P.Bid", "P.Ask", "P.Last", "P.Vol",
         ]
-        table = QTableWidget(len(self._strikes), len(headers))
+        table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setAlternatingRowColors(False)
+        table._expiry = expiry   # 该 Tab 的到期日 (供懒填充/点击用)
+        table._built = False     # 行是否已填充
 
         # Column widths
         header = table.horizontalHeader()
@@ -340,6 +351,18 @@ class OptionChainWidget(QWidget):
                 table.setColumnWidth(i, 70)
             else:
                 header.setSectionResizeMode(i, QHeaderView.Stretch)
+
+        table.cellClicked.connect(lambda r, c: self._on_cell_clicked(table, r, c))
+        # 滚动该到期日表 → 去抖后只对新进入视口的行拉快照 (省行情线)
+        table.verticalScrollBar().valueChanged.connect(self._on_table_scrolled)
+        return table
+
+    def _ensure_table_built(self, table: QTableWidget):
+        """首次显示该到期日 Tab 时, 填充全部行权价行 (懒加载)。"""
+        if getattr(table, "_built", False):
+            return
+        expiry = getattr(table, "_expiry", "")
+        table.setRowCount(len(self._strikes))
 
         # Populate strikes
         for row, strike in enumerate(self._strikes):
@@ -375,35 +398,80 @@ class OptionChainWidget(QWidget):
                 item.setForeground(QBrush(QColor(COLOR_TEXT_DIM)))
                 table.setItem(row, col, item)
 
-        table.cellClicked.connect(lambda r, c: self._on_cell_clicked(table, r, c))
-
         # Set row height
         for row in range(table.rowCount()):
             table.setRowHeight(row, 28)
 
+        table._built = True
+
         return table
 
+    def _on_table_scrolled(self, _value: int):
+        """表格滚动: 重启去抖定时器, 停下后对可见行拉快照。"""
+        self._snap_timer.start(250)
+
     def _on_tab_changed(self, index: int):
-        """切到新到期日: 自动拉一次快照报价 (一次性, 不占常驻行情线)。"""
+        """切到新到期日: 先把表滚到 ATM, 再对可见行拉快照 (不占常驻行情线)。"""
         if index < 0 or index >= len(self._expirations):
             return
+        table = self.tab_widget.widget(index)
+        if isinstance(table, QTableWidget):
+            self._ensure_table_built(table)
+            self._scroll_table_to_atm(table)
         self._request_snapshots()
 
-    def _request_snapshots(self):
-        """对当前到期日的所有行权价拉一次 one-shot 快照报价。
+    def _scroll_table_to_atm(self, table: QTableWidget):
+        """把表格滚动到 ATM 行居中, 使默认可见区聚焦平值附近。"""
+        if 0 <= self._atm_row < table.rowCount():
+            item = table.item(self._atm_row, 4)
+            if item:
+                table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
 
-        用完即弃 (IBKR 自动取消), **不占常驻行情线** —— 这样切 Tab / 点刷新
-        才不会因持续订阅压垮 Gateway 的行情线上限。快照异步到达, 由显示定时器
-        `_refresh_prices` 在 ~1s 内绘出; 另排几个 singleShot 让它更快显示。
+    def _visible_strike_rows(self, table: QTableWidget) -> list[int]:
+        """当前视口内可见的行索引 (上下各留几行缓冲, 滚动时预取)。
+
+        首次显示时视口高度可能尚未布局好 (rowAt 返回 -1) → 回退到以 ATM 为中心的
+        一个窗口, 保证平值附近先有报价。
+        """
+        n = table.rowCount()
+        if n == 0:
+            return []
+        vp_h = table.viewport().height()
+        top = table.rowAt(0)
+        bottom = table.rowAt(max(vp_h - 1, 0))
+        if top < 0 or bottom < 0 or vp_h <= 0:
+            # 视口未就绪: 以 ATM 为中心取一窗口 (约半个行情线预算的行数)
+            half = max(8, MAX_SIMULTANEOUS_STREAMS // 4)
+            lo = max(0, self._atm_row - half)
+            hi = min(n - 1, self._atm_row + half)
+            return list(range(lo, hi + 1))
+        buf = 4
+        lo = max(0, top - buf)
+        hi = min(n - 1, bottom + buf)
+        return list(range(lo, hi + 1))
+
+    def _request_snapshots(self):
+        """对当前到期日**视口内可见**的行权价拉一次 one-shot 快照报价。
+
+        用完即弃 (IBKR 自动取消), **不占常驻行情线**。只取当前滚动可见的行
+        (而非整条链), 这样既能滚到任意远端行权价取价, 又不会因一次性订阅几百档
+        压垮 Gateway 行情线上限。快照异步到达, 由 `_refresh_prices` 绘出;
+        另排几个 singleShot 让它更快显示。
         """
         if not self._engine or not hasattr(self._engine, "snapshot_option_tick"):
             return
         idx = self.tab_widget.currentIndex()
         if idx < 0 or idx >= len(self._expirations):
             return
+        table = self.tab_widget.widget(idx)
+        if not isinstance(table, QTableWidget):
+            return
         expiry = self._expirations[idx]
         count = 0
-        for strike in self._strikes:
+        for row in self._visible_strike_rows(table):
+            if row >= len(self._strikes):
+                continue
+            strike = self._strikes[row]
             for right in ("C", "P"):
                 if count >= MAX_SIMULTANEOUS_STREAMS:
                     break
@@ -449,6 +517,8 @@ class OptionChainWidget(QWidget):
         table = self.tab_widget.widget(idx)
         if not isinstance(table, QTableWidget):
             return
+        if not getattr(table, "_built", False):
+            return  # 行尚未懒填充, 无可更新单元格
 
         expiry = self._expirations[idx]
 

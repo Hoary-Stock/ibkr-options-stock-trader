@@ -503,6 +503,54 @@ class IBKRApp(EWrapper, EClient):
             orderId, orderState.status, 0, 0, 0
         )
 
+    @staticmethod
+    def _option_from_contract(contract):
+        """从 ibapi Contract 构造 OptionInfo (供完成单恢复; 支持 期权/正股/期货/组合)。"""
+        st = contract.secType
+        if st == "OPT":
+            return OptionInfo(
+                symbol=contract.symbol,
+                expiry=contract.lastTradeDateOrContractMonth,
+                strike=contract.strike, right=contract.right,
+                con_id=contract.conId,
+            )
+        if st == "FUT":
+            return OptionInfo(
+                symbol=contract.symbol,
+                expiry=contract.lastTradeDateOrContractMonth,
+                strike=0.0, right="FUT", con_id=contract.conId,
+            )
+        if st == "STK":
+            return OptionInfo(symbol=contract.symbol, expiry="", strike=0.0,
+                              right="STK", con_id=contract.conId)
+        if st == "BAG":
+            return OptionInfo(symbol=contract.symbol, expiry="", strike=0.0,
+                              right="COMBO", con_id=contract.conId)
+        return None
+
+    def completedOrder(self, contract, order, orderState):
+        """重启后恢复当日**已完成**(成交/撤销)的委托 —— 复用 `open_order_received`
+        进委托面板, `_on_open_order` 会按 `orderState.status` 映射成 已成交/已撤销。
+        跨会话的完成单 `orderId` 可能为 0, 用稳定的 `permId` 兜底作主键。"""
+        option = self._option_from_contract(contract)
+        if option is None:
+            return
+        action = OrderAction.BUY if order.action == "BUY" else OrderAction.SELL
+        price = order.lmtPrice if order.orderType == "LMT" else 0.0
+        order_type = OrderType.LIMIT if order.orderType == "LMT" else OrderType.MARKET
+        oid = order.orderId or order.permId
+        try:
+            qty = int(float(order.totalQuantity))
+        except (ValueError, TypeError):
+            qty = 0
+        self.bridge.open_order_received.emit(
+            oid, option, action.value, qty, price, order_type.value,
+            orderState.status,
+        )
+
+    def completedOrdersEnd(self):
+        print("[COMPLETED ORDERS] 当日完成单拉取完毕", flush=True)
+
     def execDetails(self, reqId, contract, execution):
         # 累计今日成交现金流 (卖 +, 买 −; 含合约乘数), 用于自算今日盈亏。历史回放(reqId≥0)
         # 与实时成交(reqId=-1)都计入, 按 execId 去重。
@@ -887,6 +935,14 @@ class IBKREngine:
         # 这样重启后也能算上重启前的手续费, 不只本会话。
         try:
             self._app.reqExecutions(self._app.next_req_id(), ExecutionFilter())
+        except Exception:
+            pass
+
+        # 拉当日**已完成委托**(成交/撤销) → 重启后委托面板也能看到历史委托, 不只当前挂单。
+        # 注: IBKR 仅提供「上次服务器重置以来」的完成单 (约当日), 无法取更久历史。
+        # apiOnly=False 含 TWS 手动单, 一并显示。
+        try:
+            self._app.reqCompletedOrders(False)
         except Exception:
             pass
 
@@ -1282,10 +1338,18 @@ class IBKREngine:
     # ── Account Summary ──────────────────────────────────────────────
 
     def request_account_summary(self):
-        """Request account summary (non-blocking)."""
+        """订阅账户摘要 (流式, 非阻塞)。
+
+        **幂等**: `reqAccountSummary` 是**流式订阅** —— 订一次后 IBKR 会持续推送更新
+        (约每 3 分钟或值变化时), 无需重订。`account_bar` 每 3 秒会调用本方法, 原实现
+        每次都 `cancel + 重订` → 在 Gateway 上造成严重 churn (EMsgPacer 不停"发请求/发取消"、
+        NonAwtClientQueue 任务堆积)。现已订阅 (`_account_summary_req_id` 非空) 则直接返回,
+        不再 churn。重连会新建 `IBKRApp` → req_id 自动复位, 故会重新订阅。
+        """
         if not self._app or not self._connected:
             return
-        self.cancel_account_summary()
+        if self._app._account_summary_req_id is not None:
+            return  # 已订阅, 流式推送中, 不再 churn
         req_id = self._app.next_req_id()
         self._app._account_summary_req_id = req_id
         tags = "NetLiquidation,TotalCashValue,BuyingPower,UnrealizedPnL,RealizedPnL"
@@ -1308,7 +1372,8 @@ class IBKREngine:
         """
         if not self._app or not self._connected:
             return
-        self.cancel_currency_balances()
+        if self._app._ledger_req_id is not None:
+            return  # 已订阅 (流式), 幂等 — 同 request_account_summary, 避免每 3 秒 churn
         req_id = self._app.next_req_id()
         self._app._ledger_req_id = req_id
         self._app.reqAccountSummary(req_id, "All", "$LEDGER:ALL")

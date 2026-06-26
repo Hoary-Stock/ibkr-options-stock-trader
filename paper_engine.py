@@ -105,6 +105,9 @@ class PaperEngine:
     def subscribe_option_tick(self, option):
         return self.ibkr.subscribe_option_tick(option)
 
+    def subscribe_stock_tick(self, symbol):
+        return self.ibkr.subscribe_stock_tick(symbol)
+
     def snapshot_option_tick(self, option):
         return self.ibkr.snapshot_option_tick(option)
 

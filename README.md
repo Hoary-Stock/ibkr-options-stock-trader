@@ -23,6 +23,8 @@
 | 期权点价 GUI (TWS, 旧版) | `start.bat` (`pythonw main.py`) | 10 | `main.py` | — |
 | 期权组合分析器 (Gateway, 新版) | `start_combo_gateway.bat` (`pythonw combo_analyzer_gw.py`) | 12 | `combo_analyzer_gw.py` | — |
 | 期权组合分析器 (TWS, 旧版) | `start_combo.bat` (`pythonw combo_analyzer.py`) | 12 | `combo_analyzer.py` | — |
+| 宏观行情监控 (Gateway) | `start_macro_gateway.bat` (设 `IBKR_USE_GATEWAY=1` + `pythonw macro_monitor.py`) | 13 | `macro_monitor.py` | — |
+| 宏观行情监控 (TWS) | `start_macro.bat` (`pythonw macro_monitor.py`) | 13 | `macro_monitor.py` | — |
 
 > **正股/期货交易已并入期权点价 GUI**:顶栏「类型」三选一(期权/正股/期货)即可切换,
 > 复用点价梯/持仓/委托。原独立正股 client(`stock_trader.py` / `stock_trader_gw.py`)及其
@@ -53,6 +55,9 @@ ibkr_trader/
 ├── combo_analyzer_gw.py    # 期权组合分析器入口 — Gateway 新版 (设 IBKR_USE_GATEWAY=1, 复用 ComboAnalyzerWindow, 标题加[GW])
 ├── start_combo.bat         # 组合分析器启动脚本 (TWS 旧版)
 ├── start_combo_gateway.bat # 组合分析器启动脚本 (Gateway 新版)
+├── macro_monitor.py        # 宏观行情监控入口 (clientId=13, 只读): 美债利率(CBOE指数)+原油/金银(连续期货), 当前价+1/3/6/12月区间高低
+├── start_macro.bat         # 宏观行情监控启动脚本 (TWS)
+├── start_macro_gateway.bat # 宏观行情监控启动脚本 (Gateway, 设 IBKR_USE_GATEWAY=1)
 ├── combo_positions.json    # 自动生成: 组合持仓分组 (IBKR 不保留分组, 本地持久化)
 ├── main_window.py          # 期权 GUI 主窗口 MainWindow — 组装所有 widget + 信号连线
 ├── ibkr_engine.py          # IBKR API 引擎 (EWrapper/EClient + 下单/撤单 + Qt 信号桥)  ★核心
@@ -61,6 +66,7 @@ ibkr_trader/
 ├── models.py               # 纯数据模型 (dataclass + Enum), 无 Qt/IBKR 依赖
 ├── config.py               # 全部常量 (连接/费率/颜色/tick/图表/交易时段)
 ├── single_instance.py      # 启动辅助: 杀掉同脚本的旧进程以释放 clientId
+├── crash_handler.py        # 全局崩溃捕获 (未处理异常/线程异常/硬崩溃/Qt致命 → 落日志, 不静默闪退)
 ├── start.bat               # 期权 GUI 启动脚本 (TWS 旧版)
 ├── start_gateway.bat       # 期权 GUI 启动脚本 (Gateway 新版)
 ├── check_spx_options.py    # 独立诊断脚本: 探测 SPX 期权合约/交易时段
@@ -69,6 +75,7 @@ ibkr_trader/
 ├── logs/                   # 运行日志 + 拒单日志 (自动生成)
 │   ├── app_YYYY-MM-DD.log          # 期权 GUI 控制台输出
 │   ├── combo_app_YYYY-MM-DD.log    # 组合分析器控制台输出
+│   ├── macro_app[_gw]_YYYY-MM-DD.log   # 宏观行情监控控制台输出
 │   └── order_rejects_YYYY-MM-DD.jsonl  # 拒单详情 (每行一个 JSON)
 └── widgets/
     ├── __init__.py
@@ -184,7 +191,8 @@ ibkr_trader/
   `tickOptionComputation`(IV + Greeks + 标的价 undPrice, 写入 `_tick_data[key]` 供计算器轮询;
   `subscribe_option_tick` 对期权请求 generic tick `106` 以确保 IV 下发)。
 - 历史:`historicalData`/`historicalDataEnd`/`historicalDataUpdate`(K 线流)。
-- 订单:`orderStatus`、`openOrder`、`execDetails`、`commissionReport`。
+- 订单:`orderStatus`、`openOrder`、`completedOrder`/`completedOrdersEnd`(重启后恢复当日已完成委托)、
+  `execDetails`、`commissionReport`。
 - 账户/持仓:`accountSummary(End)`、`position(End)`、`pnl`、`pnlSingle`。
 - 深度:`updateMktDepth` / `updateMktDepthL2`。
 
@@ -203,7 +211,10 @@ ibkr_trader/
   `place_combo_order`(多腿组合)、`cancel_order`、`cancel_all_orders`、`close_position`。
 - 拒单处理:`_on_order_error`(非用户撤单/纯警告才报错)、`_log_rejection`(追加写
   `logs/order_rejects_*.jsonl`,含拒单时刻盘口/持仓/在途订单快照)、`_on_order_status`、`_on_execution`、
-  `_on_open_order`(重连恢复 TWS 中已有挂单)。
+  `_on_open_order`(重连/重启恢复 TWS 中**仍在挂的**订单, 也复用给完成单恢复)。
+- 委托历史恢复:连接时 `reqOpenOrders`(当前挂单) + **`reqCompletedOrders(False)`(当日已成交/已撤销委托)**,
+  `completedOrder` 经 `_option_from_contract`(支持 期权/正股/期货/组合)复用 `open_order_received` 进委托面板;
+  跨会话完成单 `orderId` 可能为 0, 用 `permId` 兜底作主键。IBKR 仅提供「上次服务器重置以来」(约当日)的完成单。
 
 ### 4.4 模拟引擎 `paper_engine.py` (440 行)
 
@@ -221,7 +232,10 @@ ibkr_trader/
 - 交互槽:`_on_connect/_on_disconnect`、`_on_symbol_changed`(同步多腿面板标的)、
   `_on_mode_changed`(真实/模拟切换,同步多腿面板引擎)、`_on_center_tab_changed`(切到「多腿组合」懒加载链)、
   `_load_option_chain`、`_fetch_stock_price`(链头显示标的实时价)、`_on_option_selected`、
-  `_on_contract_searched`/`_load_validated_contract`、`_on_order_requested`/`_on_market_order_requested`、
+  `_on_contract_searched`/`_load_validated_contract`、`_on_order_requested`/`_on_market_order_requested`
+  (买入前 `_resolve_buy_bracket` 决定是否附带止盈/止损: 期货强制、期权勾「随买入单附带」时;
+  `_arm_buy_bracket` 挂出、`_trigger_price` 把期货点数换算绝对价、`_pending_buy_brackets` +
+  `_on_exec_arm_bracket` 在成交回报后挂)、
   `_on_close_position_requested`、`_on_cancel_all_requested`/`_on_cancel_order`、
   `_on_open_chart`(懒加载 ChartWindow)、
   `_on_detach_ladder`/`_on_reattach_ladder`(点价梯独立窗口)、`_update_session_indicator`(SPX GTH/RTH/Curb)、
@@ -233,10 +247,10 @@ ibkr_trader/
 |------|-----------|
 | `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
 | `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。 |
-| `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。 |
+| `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
-| `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。 |
-| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);右侧**美东时间实时时钟**(`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地);每 `ACCOUNT_REFRESH_MS` (3s) 刷新账户摘要 + `request_currency_balances()`。 |
+| `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。**重启后自动加载当日已完成委托**(引擎 `reqCompletedOrders`,见 §4.3)。 |
+| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);右侧**美东时间实时时钟**(`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地);每 `ACCOUNT_REFRESH_MS` (3s) 调 `request_account_summary()` + `request_currency_balances()`,但这两者已**幂等**(订一次流式订阅, 之后调用直接返回, 不再 cancel+重订), 故定时器只是兜底、不再给 Gateway 制造 churn。 |
 | `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;期权 GUI 嵌在 `AccountBar`、正股 client 放顶栏。 |
 | `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·试算」**:顶部单选切换两个方向,共享一组参数(K/IV/r/到期):**①「期权价→标的价」**(原功能)改**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「期权要值目标价时标的需到的价位」,对比当前标的算需变动金额/百分比(↑绿/↓红),Put 目标价超 `K·e^(-rT)` 显示「无解」;**②「标的价→期权价」**(新增)改**假设标的价**,正算 Black-Scholes 期权价并与盘口中间价比对(相对盘口涨跌, ↑绿/↓红, 到期则取内在价值)。换合约时自动用实时值播种(目标价取盘口中价、假设标的取当前标的),「↺ 用实时值填充」可手动重置。正股伪合约两列均显示「仅期权适用」。 |
 | `quantity_selector.py` (31) | 1–100 张数量微调器,emit `quantity_changed`。 |
@@ -396,6 +410,62 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **点价梯滚轮可够到任意挂单价 + 期权链显示全部行权价(按视口取价)+ 切标的不再卡顿 + 计算器下方大盘指数条**。
+  ① **点价梯边缘自动扩展**: 滚轮滚到顶/底边缘时向该方向追加 `LADDER_EXTEND_CHUNK` 档(只增不重建,
+  现价始终在范围内 → 不触发 `_refresh` 自动重建、不闪烁), 故现价 1.3 也能滚到 5 挂限价; 顶部插入后
+  复位滚动条保持视野; 上限 `LADDER_MAX_ROWS=1600`。新增 config `LADDER_ROW_HEIGHT/_EXTEND_CHUNK/_MAX_ROWS`。
+  ② **期权链显示全部行权价**: `load_chain` 不再按 ATM±N 裁剪(原 10/15 档 → 够不到 SPY 695 put);
+  改显示整条链, 行情线占用改由「**按视口取价**」控制 —— 表格行**懒加载**(切到该到期日 Tab 才建行),
+  快照只对**当前滚动可见行**拉取(去抖 250ms), 切 Tab 先滚到 ATM 居中。解决「远端滚不到 / 多到期日空表」。
+  ③ **切标的不再卡顿(pythonw 灰屏)**: 根因是 `price_ladder.set_option` 在 GUI 线程做 IBKR socket
+  订阅/退订(Gateway 繁忙时 `socket.send` 阻塞数秒)。改到**后台线程**(代数计数器保证只留最近一次切换的
+  订阅、快速连切不泄漏行情线); 叠加期权链懒加载, 切标的瞬间完成。
+  ④ **计算器下方大盘指数条**: SPY/SPX 现价 + 换算(SPX≈SPY×10)在左, VIX(按水平着色)在右,
+  经 `subscribe_stock_tick` 订阅(SPX/VIX 为 IND 合约), 无 CBOE 指数权限时显示「—」。
+  (`widgets/price_ladder.py`, `widgets/option_chain.py`, `widgets/option_calculator.py`, `config.py`)
+- **2026-06-25** — **新增宏观行情监控 `macro_monitor.py`(独立程序, clientId=13, 只读)**。监控
+  **美债各期限利率**(CBOE 收益率指数 IRX 13周/FVX 5年/TNX 10年/TYX 30年; TNX/FVX/TYX 指数=收益率×10
+  故 `scale=0.1` 还原)+ **原油/黄金/白银**(连续期货 CONTFUT: CL/GC/SI), 每项显示**当前价 +
+  1月/3月/6月/1年区间最高/最低**(由日线历史本地算, **不画曲线**)。复用 `IBKREngine` 连接(独立
+  clientId=13, 跟随 USE_GATEWAY 选端口), 自定义 IND/CONTFUT 合约直接驱动 `engine._app` 的
+  `reqMktData`(现价, 读 `_tick_data`)与 `reqHistoricalData`(`_hist_data` 阻塞取数, 窗口取末尾
+  21/63/126/252 根日线)。**默认连实盘端口**取真实行情(只读不下单; 模拟盘常缺期货/指数行情)。
+  新增 `config.IBKR_MACRO_CLIENT_ID=13`、`start_macro.bat`/`start_macro_gateway.bat`。
+  注: 指数/期货行情需相应权限, 无则显示「—」; 收益率口径不同可改 `INSTRUMENTS` 的 `scale`。
+  (`macro_monitor.py`, `config.py`, `start_macro*.bat`)
+- **2026-06-25** — **减轻 Gateway 压力: 账户摘要/各币种现金订阅改幂等(消除每 3 秒 cancel+重订 churn)**。
+  根因(看 Gateway 日志):`request_account_summary` 与 `request_currency_balances` 每次调用都
+  `cancelAccountSummary + reqAccountSummary` 重订, 而 `account_bar` 每 3 秒调一次 → Gateway 上
+  "EMsgPacer 不停发请求/发取消、NonAwtClientQueue 任务堆积(tasks 138)"。但 `reqAccountSummary` 是
+  **流式订阅**(订一次持续推送, 约每 3 分钟或值变化时), 无需重订。改为**幂等**(已订阅则直接返回,
+  与既有 `request_pnl` 一致; 重连新建 `IBKRApp` → req_id 复位 → 自动重订)。净值/现金更新节奏改由
+  IBKR 流式推送(略慢于原来的 3 秒强刷), 但未实现/今日盈亏仍由 `reqPnL` 流持续驱动, 不受影响。
+  (`ibkr_engine.py`)
+- **2026-06-25** — **重启后自动加载当日历史委托(已成交/已撤销), 不只当前挂单**。连接时除
+  `reqOpenOrders` 外加 `reqCompletedOrders(False)`;新增 `completedOrder`/`completedOrdersEnd` 回调,
+  经新助手 `_option_from_contract`(期权/正股/期货/组合)复用 `open_order_received` → `_on_open_order`
+  进委托面板(按 `orderState.status` 映射 已成交/已撤销),跨会话完成单 `orderId` 为 0 时用 `permId` 兜底主键。
+  注:IBKR 仅提供「上次服务器重置以来」(约当日)的完成单, 无法取更久历史; 本地模拟模式无 IBKR 历史。
+  (`ibkr_engine.py`)
+- **2026-06-25** — **全局崩溃捕获: 交易时不再静默闪退, 崩溃必落日志**。新增 `crash_handler.py`,
+  入口(`main.py`/`main_gw.py`)在日志重定向后 `install_crash_handler(sys.stderr)` 安装:
+  ① `sys.excepthook` —— PyQt 槽函数抛异常时**记录完整 traceback + 非模态弹窗提示, 事件循环继续**
+  (默认 PyQt5 会直接 abort 整个进程 = 闪退, 这是"交易中突然消失"的主因之一);
+  ② `threading.excepthook` —— 工作线程(连接/加载/reader)异常落日志;
+  ③ `faulthandler` + Qt `qInstallMessageHandler` —— C 层 segfault/abort、Qt `QtFatal` 也 dump 栈到日志。
+  以后任何崩溃都能在 `logs/app[_gw]_*.log` 找到现场。(`crash_handler.py`, `main.py`, `main_gw.py`)
+- **2026-06-25** — **条件单两种用法 + 期货用「点数」表示 + 期货开多强制带止盈止损**。
+  ① **两种条件单**: a)「挂条件单」按钮对**当前持仓**挂(原有, 按面板「数量」); b) 新增点价梯
+  「**随买入单附带**」勾选框 —— 用买入/市价买入开仓时**按买入数量**自动附带同样的止盈/止损。
+  ② **期货用点数**: 期货合约时条件单输入框语义切到「止盈 +点 / 止损 −点」(相对入场价),
+  附带到买入时入场价=**成交价**(故期货市价/限价都等成交回报后才挂)、对持仓挂时入场价=**持仓均价**;
+  如买入 7140、止盈 100/止损 50 → 实际 7240 止盈、7090 止损(`_trigger_price` 换算, README 示例)。
+  ③ **期货开多强制带止盈+止损**(`config.FUTURES_REQUIRE_BRACKET`, 默认 True): 期货 BUY 前
+  `_resolve_buy_bracket` 校验, 未设好则弹窗拦截 + 自动展开条件单面板; 期权/正股仅在勾「随买入单附带」时附带。
+  限价单经 `_pending_buy_brackets` 等成交回报 `_on_exec_arm_bracket`(两引擎都监听)再挂, 避免未成交时误触发。
+  新增点价梯 `attach_to_buy()`/`get_bracket(require_both)`(带 `by_points`)/`open_cond_panel()`/
+  `_sync_cond_input_mode()`; 主窗口 `_trigger_price`/`_resolve_buy_bracket`/`_arm_buy_bracket`。
+  (`config.py`, `widgets/price_ladder.py`, `main_window.py`)
 - **2026-06-25** — **计算器右列加「标的价→期权价」方向(双向 what-if)**。右列顶部加单选切换:
   原「期权价→标的价」(反解所需标的价)保留;新增「标的价→期权价」—— 输入**假设的正股/指数价格**,
   用 Black-Scholes 正算该价位下的期权价,并与当前盘口中间价比对(相对涨跌 ↑绿/↓红, 到期取内在价值)。

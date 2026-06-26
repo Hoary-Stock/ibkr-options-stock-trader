@@ -133,6 +133,8 @@ class OptionCalculator(QWidget):
         self._mid = 0.0          # 最新盘口中间价 (用于比较)
         self._greeks: dict = {}  # 最新模型 greeks (展示用)
         self._solver_seeded = False  # 右列是否已用实时值初始化 (每次换合约重置)
+        self._index_req_ids: list[int] = []   # 大盘指数条订阅 (SPY/SPX/VIX)
+        self._indices_subscribed = False      # 当前引擎是否已订阅指数行情
 
         self._build_ui()
 
@@ -183,8 +185,48 @@ class OptionCalculator(QWidget):
         self._build_left_column(left_col)
         self._build_right_column(right_col)
 
+        self._build_index_bar(root)
+
         self._apply_follow_state(True)
         self._show_placeholder()
+
+    def _build_index_bar(self, root: QVBoxLayout):
+        """计算器下方: 实时大盘指数条。
+        左侧 SPY / SPX 现价 + 换算关系 (SPX ≈ SPY×10); 右侧 VIX。
+        数据来自 __stock__{SPY,SPX,VIX} 行情, 连接后由刷新定时器自动订阅。"""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {COLOR_BORDER};")
+        root.addWidget(sep)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+
+        # 左: SPY / SPX 现价 + 换算关系
+        self._spy_label = QLabel("SPY —")
+        self._spx_label = QLabel("SPX —")
+        for lab in (self._spy_label, self._spx_label):
+            lab.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-size: 13px; font-weight: bold;"
+            )
+        self._conv_label = QLabel("")
+        self._conv_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px;")
+        bar.addWidget(self._spy_label)
+        bar.addWidget(self._spx_label)
+        bar.addWidget(self._conv_label)
+        bar.addStretch(1)
+
+        # 右: VIX (按水平着色: <15 平静绿 / >=25 恐慌红 / 其余中性)
+        vix_cap = QLabel("VIX")
+        vix_cap.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+        self._vix_label = QLabel("—")
+        self._vix_label.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 15px; font-weight: bold;"
+        )
+        bar.addWidget(vix_cap)
+        bar.addWidget(self._vix_label)
+
+        root.addLayout(bar)
 
     @staticmethod
     def _make_spin(decimals, maximum, step, suffix="", on_change=None):
@@ -399,6 +441,10 @@ class OptionCalculator(QWidget):
     # ── Wiring ───────────────────────────────────────────────────────────
 
     def set_engine(self, engine):
+        # 换引擎 (连接/重连/模拟↔实盘切换) → 旧 reqId 失效, 重新订阅指数行情
+        if engine is not self._engine:
+            self._indices_subscribed = False
+            self._index_req_ids = []
         self._engine = engine
 
     def set_option(self, option: OptionInfo):
@@ -436,6 +482,9 @@ class OptionCalculator(QWidget):
 
     def _refresh(self):
         """定时刷新: 拉取实时 IV/标的价/盘口, 重算剩余时间, 计算理论价。"""
+        # 大盘指数条独立于是否选中期权, 始终刷新
+        self._update_indices()
+
         if self._option is None or self._option.right not in ("C", "P"):
             return
 
@@ -466,6 +515,81 @@ class OptionCalculator(QWidget):
 
         self._recompute()
         self._solve()
+
+    # ── 大盘指数条 (SPY / SPX / VIX) ─────────────────────────────────────
+
+    _INDEX_BAR_SYMBOLS = ("SPY", "SPX", "VIX")
+
+    def _ensure_index_subscriptions(self):
+        """连接后订阅 SPY/SPX/VIX 行情 (每个引擎仅订阅一次)。
+        SPX/VIX 为 CBOE 指数, 若账户无指数行情权限则相应字段保持「—」。"""
+        if self._indices_subscribed or self._engine is None:
+            return
+        if not getattr(self._engine, "is_connected", False):
+            return
+        sub = getattr(self._engine, "subscribe_stock_tick", None)
+        if sub is None:
+            return
+        for sym in self._INDEX_BAR_SYMBOLS:
+            try:
+                self._index_req_ids.append(sub(sym))
+            except Exception:
+                pass
+        self._indices_subscribed = True
+
+    def _index_price(self, symbol: str) -> float:
+        """指数现价: 优先 last, 回退 bid/ask 中间价。无行情返回 0。"""
+        if self._engine is None:
+            return 0.0
+        t = self._engine.get_tick(f"__stock__{symbol}") or {}
+        last = t.get("last", 0.0) or 0.0
+        if last > 0:
+            return last
+        bid = t.get("bid", 0.0) or 0.0
+        ask = t.get("ask", 0.0) or 0.0
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return bid or ask or 0.0
+
+    def _update_indices(self):
+        """刷新底部指数条: SPY/SPX 现价 + 换算关系, 右侧 VIX。"""
+        self._ensure_index_subscriptions()
+        if self._engine is None:
+            return
+
+        spy = self._index_price("SPY")
+        spx = self._index_price("SPX")
+        vix = self._index_price("VIX")
+
+        self._spy_label.setText(f"SPY {spy:.2f}" if spy > 0 else "SPY —")
+        self._spx_label.setText(f"SPX {spx:.2f}" if spx > 0 else "SPX —")
+
+        # 换算关系: SPX ≈ SPY×10 (SPY 约为标普指数的 1/10)
+        if spy > 0 and spx > 0:
+            self._conv_label.setText(
+                f"SPX≈SPY×10  (SPY×10={spy * 10:.1f}, 实测 {spx / spy:.2f}×)"
+            )
+        elif spy > 0:
+            self._conv_label.setText(f"SPY×10≈{spy * 10:.1f}")
+        else:
+            self._conv_label.setText("")
+
+        if vix > 0:
+            if vix < 15:
+                color = COLOR_GREEN      # 平静
+            elif vix >= 25:
+                color = COLOR_RED        # 恐慌
+            else:
+                color = COLOR_ACCENT     # 中性
+            self._vix_label.setText(f"{vix:.2f}")
+            self._vix_label.setStyleSheet(
+                f"color: {color}; font-size: 15px; font-weight: bold;"
+            )
+        else:
+            self._vix_label.setText("—")
+            self._vix_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 15px; font-weight: bold;"
+            )
 
     def _live_underlying(self, opt_tick: dict) -> float:
         """标的实时价。优先用高频的标的 tick (__stock__SYM, 随每笔成交跳动),
@@ -776,3 +900,12 @@ class OptionCalculator(QWidget):
 
     def cleanup(self):
         self._timer.stop()
+        # 退订指数行情线 (SPY/SPX/VIX)
+        unsub = getattr(self._engine, "unsubscribe_tick", None) if self._engine else None
+        if unsub:
+            for rid in self._index_req_ids:
+                try:
+                    unsub(rid)
+                except Exception:
+                    pass
+        self._index_req_ids = []

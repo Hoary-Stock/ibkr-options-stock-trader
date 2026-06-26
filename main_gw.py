@@ -32,6 +32,10 @@ if sys.stdout is None or sys.stderr is None:
 else:
     os.system("")  # Enable ANSI on Windows (console mode only)
 
+# 全局崩溃捕获: 未处理异常/Qt致命/硬崩溃都落日志, 槽函数异常不再静默闪退
+from crash_handler import install_crash_handler
+install_crash_handler(sys.stderr)
+
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon

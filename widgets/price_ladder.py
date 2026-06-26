@@ -12,6 +12,7 @@ Layout (top to bottom):
 """
 
 import re
+import threading
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -23,7 +24,8 @@ from PyQt5.QtGui import QColor, QPainter, QBrush, QFont
 
 from config import (
     TICK_SIZE_SMALL, TICK_SIZE_LARGE, TICK_THRESHOLD, TICK_SIZE_OVERRIDES,
-    LADDER_ROWS, COLOR_BUY, COLOR_SELL, COLOR_TEXT, COLOR_TEXT_DIM,
+    LADDER_ROWS, LADDER_ROW_HEIGHT, LADDER_EXTEND_CHUNK, LADDER_MAX_ROWS,
+    COLOR_BUY, COLOR_SELL, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_BUTTON_DISABLED, COLOR_BG_DARK, COLOR_BORDER, COLOR_BG,
     COLOR_BG_PANEL, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
     COLOR_DEPTH_BID, COLOR_DEPTH_ASK, COLOR_MY_ORDER, FUTURES_SPECS,
@@ -324,10 +326,17 @@ class PriceLadder(QWidget):
 
         # Own tick subscription for the currently displayed option
         self._tick_req_id: int | None = None
+        # 换合约时把订阅/退订的 IBKR socket 调用放到后台线程, 避免 Gateway 繁忙时
+        # socket.send 卡住 GUI 线程 (表现为切标的时窗口"未响应"灰屏)。代数计数器
+        # 保证只有最近一次切换的订阅被保留, 快速连切不会泄漏行情线。
+        self._sub_generation = 0
 
         # Cache last known valid bid/ask to survive momentary data gaps
         self._last_bid = 0.0
         self._last_ask = 0.0
+
+        # 滚轮滚到边缘时自动扩展档位; 该标志在扩展/复位滚动条期间屏蔽重入
+        self._extending = False
 
         self._build_ui()
 
@@ -684,6 +693,11 @@ class PriceLadder(QWidget):
         self.scroll_area.setWidget(self.rows_container)
         main_layout.addWidget(self.scroll_area)
 
+        # 滚到顶/底边缘 → 自动向该方向扩展更多价格档 (够到远离现价的挂单价)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_ladder_scrolled
+        )
+
     def _make_pos_label(self, title: str, value: str) -> tuple[QLabel, QLabel]:
         title_lbl = QLabel(title)
         title_lbl.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px; border: none;")
@@ -749,9 +763,22 @@ class PriceLadder(QWidget):
         v.setContentsMargins(8, 6, 8, 6)
         v.setSpacing(4)
 
-        hint = QLabel("止盈/止损 (平多·SELL): 到价才发限价单到 IBKR")
-        hint.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px; border: none;")
-        v.addWidget(hint)
+        self._cond_hint = QLabel("止盈/止损 (平多·SELL): 到价才发限价单到 IBKR")
+        self._cond_hint.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 10px; border: none;")
+        v.addWidget(self._cond_hint)
+
+        # 两种条件单: ①「挂条件单」按钮 = 对**当前持仓**(按下面「数量」);
+        #            ② 勾此项 = 用点价梯**买入**开仓时, 按**买入数量**自动附带同样的止盈/止损。
+        self.attach_buy_check = QCheckBox("随买入单附带 (按买入数量自动挂)")
+        self.attach_buy_check.setToolTip(
+            "勾选: 用点价梯「买入/市价买入」开仓时, 自动按**买入数量**挂上方设定的止盈/止损。\n"
+            "不勾选: 「挂条件单」按钮只对**当前持仓**按下面「数量」挂。\n"
+            "(期货开多始终强制带止盈+止损, 无论此项是否勾选)"
+        )
+        self.attach_buy_check.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 11px; border: none;"
+        )
+        v.addWidget(self.attach_buy_check)
 
         def _price_spin():
             sp = QDoubleSpinBox()
@@ -770,7 +797,8 @@ class PriceLadder(QWidget):
         self.tp_check = QCheckBox("止盈")
         self.tp_check.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 11px; font-weight: bold; border: none;")
         tp_row.addWidget(self.tp_check)
-        tp_row.addWidget(QLabel("触发价"))
+        self._tp_price_label = QLabel("触发价")
+        tp_row.addWidget(self._tp_price_label)
         self.tp_price_spin = _price_spin()
         tp_row.addWidget(self.tp_price_spin)
         tp_row.addStretch()
@@ -781,7 +809,8 @@ class PriceLadder(QWidget):
         self.sl_check = QCheckBox("止损")
         self.sl_check.setStyleSheet(f"color: {COLOR_RED}; font-size: 11px; font-weight: bold; border: none;")
         sl_row.addWidget(self.sl_check)
-        sl_row.addWidget(QLabel("触发价"))
+        self._sl_price_label = QLabel("触发价")
+        sl_row.addWidget(self._sl_price_label)
         self.sl_price_spin = _price_spin()
         sl_row.addWidget(self.sl_price_spin)
         sl_row.addStretch()
@@ -830,11 +859,63 @@ class PriceLadder(QWidget):
 
         return frame
 
+    def open_cond_panel(self):
+        """展开「条件单」面板 (期货拦截时提示用户填止盈/止损)。"""
+        if not self.cond_toggle_btn.isChecked():
+            self.cond_toggle_btn.setChecked(True)  # toggled → _on_cond_toggle 展开
+
+    def attach_to_buy(self) -> bool:
+        """是否「随买入单附带」条件单 (按买入数量自动挂)。"""
+        return self.attach_buy_check.isChecked()
+
+    def _is_futures(self) -> bool:
+        return self._option is not None and self._option.right == "FUT"
+
+    def _sync_cond_input_mode(self):
+        """按当前合约切换条件单输入语义: 期货=「+点/-点」(相对买入/持仓价),
+        其它=「触发价」(绝对价)。仅改标签与提示, 不动已填数值。"""
+        if not hasattr(self, "_tp_price_label"):
+            return
+        if self._is_futures():
+            self._tp_price_label.setText("止盈 +点")
+            self._sl_price_label.setText("止损 -点")
+            self._cond_hint.setText("期货: 止盈/止损按**点数**(相对买入/持仓均价); 平多·SELL")
+        else:
+            self._tp_price_label.setText("触发价")
+            self._sl_price_label.setText("触发价")
+            self._cond_hint.setText("止盈/止损 (平多·SELL): 到价才发限价单到 IBKR")
+
+    def get_bracket(self, require_both: bool = False) -> dict | None:
+        """读条件单面板, 供「附加到买入单」用。返回
+        `{tp_on, tp_price, sl_on, sl_price, native, by_points}`, 无有效腿则 None。
+        `by_points=True` (期货) 时 tp_price/sl_price 是**点数偏移**, 否则是绝对触发价。
+
+        - ``require_both=True``  (期货强制): 止盈+止损都勾选且数值 >0, 否则 None;
+        - ``require_both=False`` (期权可选附带): 至少一条腿有效即可。
+        """
+        tp_on = self.tp_check.isChecked()
+        sl_on = self.sl_check.isChecked()
+        tp = round(self.tp_price_spin.value(), 2)
+        sl = round(self.sl_price_spin.value(), 2)
+        tp_valid = tp_on and tp > 0
+        sl_valid = sl_on and sl > 0
+        if require_both:
+            if not (tp_valid and sl_valid):
+                return None
+        elif not (tp_valid or sl_valid):
+            return None
+        return {
+            "tp_on": tp_valid, "tp_price": tp,
+            "sl_on": sl_valid, "sl_price": sl,
+            "native": self.cond_native_check.isChecked(),
+            "by_points": self._is_futures(),
+        }
+
     def _on_cond_toggle(self, checked: bool):
         self.cond_panel.setVisible(checked)
         self.cond_toggle_btn.setText("条件单 ▴" if checked else "条件单 ▾")
-        # 打开时用现价播种触发价输入框 (方便微调)
-        if checked and self._option and self._engine:
+        # 打开时用现价播种触发价输入框 (方便微调)。期货是「点数」语义, 不按现价播种。
+        if checked and self._option and self._engine and not self._is_futures():
             tick = self._engine.get_tick(self._option.to_ibkr_key())
             cur = tick.get("last", 0) or ((tick.get("bid", 0) + tick.get("ask", 0)) / 2
                                           if tick.get("bid") and tick.get("ask") else 0)
@@ -855,11 +936,13 @@ class PriceLadder(QWidget):
             return
         tp_price = round(self.tp_price_spin.value(), 2)
         sl_price = round(self.sl_price_spin.value(), 2)
+        by_points = self._is_futures()
+        unit = "点数" if by_points else "触发价"
         if tp_on and tp_price <= 0:
-            QMessageBox.warning(self, "止盈价无效", "请填写止盈触发价")
+            QMessageBox.warning(self, "止盈无效", f"请填写止盈{unit}")
             return
         if sl_on and sl_price <= 0:
-            QMessageBox.warning(self, "止损价无效", "请填写止损触发价")
+            QMessageBox.warning(self, "止损无效", f"请填写止损{unit}")
             return
         self.conditional_requested.emit({
             "tp_on": tp_on, "tp_price": tp_price,
@@ -867,6 +950,7 @@ class PriceLadder(QWidget):
             "qty": self.cond_qty_spin.value(),
             "native": self.cond_native_check.isChecked(),
             "outside_rth": self.get_outside_rth(),
+            "by_points": by_points,
         })
 
     def set_conditionals(self, conds: list):
@@ -917,6 +1001,8 @@ class PriceLadder(QWidget):
         self._option = option
         self.contract_label.setText(option.display_name)
         self.search_input.setText("")
+        # 期货条件单用「点数」表示 (相对买入/持仓均价); 其它用绝对触发价
+        self._sync_cond_input_mode()
 
         # Reset depth data
         self._depth_bids.clear()
@@ -926,19 +1012,40 @@ class PriceLadder(QWidget):
         self._last_ask = 0.0
 
         if self._engine:
-            # Cancel previous tick subscription
-            if self._tick_req_id is not None:
-                self._engine.unsubscribe_tick(self._tick_req_id)
-                self._tick_req_id = None
-
-            # Subscribe to market depth
-            self._engine.subscribe_market_depth(option)
-
-            # Subscribe to tick data independently (don't rely on option chain)
-            self._tick_req_id = self._engine.subscribe_option_tick(option)
+            # 退订旧行情 + 订阅新行情都走后台线程: 这些是 IBKR socket 调用,
+            # Gateway 繁忙时会阻塞数秒, 放后台可让切标的瞬间完成、GUI 不卡。
+            self._sub_generation += 1
+            gen = self._sub_generation
+            eng = self._engine
+            old_req = self._tick_req_id
+            self._tick_req_id = None
+            threading.Thread(
+                target=self._resubscribe_worker,
+                args=(eng, option, old_req, gen),
+                daemon=True,
+            ).start()
 
         self._rebuild_ladder()
         self.option_loaded.emit()
+
+    def _resubscribe_worker(self, eng, option, old_req, gen: int):
+        """后台线程: 退订旧 tick + 订阅新合约的盘口/tick。
+        仅当本次仍是最近一次切换 (代数匹配) 才保留 reqId, 否则立即退订, 防泄漏。"""
+        try:
+            if old_req is not None:
+                eng.unsubscribe_tick(old_req)
+            eng.subscribe_market_depth(option)
+            rid = eng.subscribe_option_tick(option)
+        except Exception:
+            return
+        if gen == self._sub_generation:
+            self._tick_req_id = rid
+        else:
+            # 已被更晚的切换取代 → 退订这条, 避免占用行情线
+            try:
+                eng.unsubscribe_tick(rid)
+            except Exception:
+                pass
 
     def _center_price(self) -> float:
         """点价梯居中价 — bid/ask 都在取中值, 否则取存在的一侧, 再退到 last。
@@ -993,14 +1100,79 @@ class PriceLadder(QWidget):
 
         # Build rows (high to low)
         for price in prices:
-            row = PriceLadderRow(price)
-            row.price_left_clicked.connect(lambda p: self._on_buy(p))
-            row.price_right_clicked.connect(lambda p: self._on_sell(p))
+            row = self._make_row(price)
             self._rows.append(row)
             self.rows_layout.addWidget(row)
 
         # Scroll to center
         QTimer.singleShot(100, self._scroll_to_center)
+
+    def _make_row(self, price: float) -> "PriceLadderRow":
+        """建一行价格档并接好买/卖点击信号 (建梯与边缘扩展共用)。"""
+        row = PriceLadderRow(price)
+        row.price_left_clicked.connect(lambda p: self._on_buy(p))
+        row.price_right_clicked.connect(lambda p: self._on_sell(p))
+        return row
+
+    def _on_ladder_scrolled(self, value: int):
+        """滚动条到达顶/底边缘 → 向该方向扩展更多价格档。
+
+        采用「只增不重建」: 现价始终落在 [最低档, 最高档] 之间, 故 `_refresh`
+        的自动重建判定 (现价超出可见范围才重建) 不会被触发, 不会把扩展抹掉,
+        也不会闪烁。`_extending` 屏蔽扩展期间复位滚动条带来的重入。
+        """
+        if self._extending or not self._rows:
+            return
+        vbar = self.scroll_area.verticalScrollBar()
+        if vbar.maximum() <= 0:
+            return  # 内容还不足一屏, 无需扩展
+        edge = LADDER_ROW_HEIGHT * 2
+        if value <= vbar.minimum() + edge:
+            self._extend_ladder(up=True)
+        elif value >= vbar.maximum() - edge:
+            self._extend_ladder(up=False)
+
+    def _extend_ladder(self, up: bool):
+        """向上 (更高价) 或向下 (更低价) 追加 LADDER_EXTEND_CHUNK 个档位。"""
+        if len(self._rows) >= LADDER_MAX_ROWS:
+            return
+        ts, tl = self._tick_sizes()
+        self._extending = True
+        try:
+            if up:
+                cur = self._rows[0].price
+                added = 0
+                for _ in range(LADDER_EXTEND_CHUNK):
+                    tick = ts if cur < TICK_THRESHOLD else tl
+                    cur = round(cur + tick, 2)
+                    row = self._make_row(cur)
+                    self.rows_layout.insertWidget(0, row)
+                    self._rows.insert(0, row)
+                    added += 1
+                # 顶部新增 added 行 → 内容整体下移; 复位滚动条保持视觉位置不跳
+                shift = added * LADDER_ROW_HEIGHT
+                QTimer.singleShot(0, lambda s=shift: self._preserve_after_prepend(s))
+            else:
+                cur = self._rows[-1].price
+                for _ in range(LADDER_EXTEND_CHUNK):
+                    tick = ts if cur < TICK_THRESHOLD else tl
+                    cur = round(cur - tick, 2)
+                    if cur <= 0:
+                        break
+                    row = self._make_row(cur)
+                    self.rows_layout.addWidget(row)
+                    self._rows.append(row)
+        finally:
+            self._extending = False
+
+    def _preserve_after_prepend(self, shift: int):
+        """顶部插入新行后, 把滚动条下移 shift 像素, 让用户视野停在原处。"""
+        vbar = self.scroll_area.verticalScrollBar()
+        self._extending = True
+        try:
+            vbar.setValue(min(vbar.value() + shift, vbar.maximum()))
+        finally:
+            self._extending = False
 
     def _scroll_to_center(self):
         if self._rows:

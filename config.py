@@ -13,6 +13,7 @@ IBKR_GW_PAPER_PORT = 4002  # IB Gateway 默认: 模拟盘
 IBKR_CLIENT_ID = 10        # Options GUI (avoid collision with tradebot=1,2)
 IBKR_STOCK_CLIENT_ID = 11  # Stock trader client (stock_trader.py)
 IBKR_COMBO_CLIENT_ID = 12  # Combo analyzer (combo_analyzer.py)
+IBKR_MACRO_CLIENT_ID = 13  # Macro monitor (macro_monitor.py): 美债利率/原油/金银, 只读行情
 
 # ── 新版本开关 (Gateway + 更轻的行情订阅) ────────────────────────────
 # 设环境变量 IBKR_USE_GATEWAY=1 → 连 IB Gateway (端口 4001/4002) 而非 TWS
@@ -35,6 +36,9 @@ TICK_SIZE_SMALL = 0.01   # For options priced < $3
 TICK_SIZE_LARGE = 0.05   # For options priced >= $3
 TICK_THRESHOLD = 3.0     # Price threshold for tick size switch
 LADDER_ROWS = 201        # Price levels (±100 from center; $2.00 at $0.01 tick)
+LADDER_ROW_HEIGHT = 26   # 每个价格档行高 (须与 PriceLadderRow 固定高度一致)
+LADDER_EXTEND_CHUNK = 40 # 滚轮滚到顶/底边缘时, 一次向该方向追加的档位数
+LADDER_MAX_ROWS = 1600   # 点价梯最多档位数 (防止反复滚动无限扩展占内存)
 
 # Non-Penny-Pilot overrides (index options like SPX)
 TICK_SIZE_OVERRIDES = {
@@ -152,6 +156,10 @@ FUTURES_SPECS = {
 FUTURES_SYMBOLS = list(FUTURES_SPECS.keys())
 # 期货模式下合约月份下拉显示的最多档数 (近月起算, 含 ~3 个月后的季月)
 FUTURES_MAX_EXPIRIES = 5
+
+# 期货开多(BUY)强制带止盈+止损: 未在「条件单」面板设置好二者就拦截下单,
+# 通过后下单并自动挂上 (市价单立即挂; 限价单等成交回报后再挂)。设 False 关闭强制。
+FUTURES_REQUIRE_BRACKET = True
 
 # ── Default Symbols ──────────────────────────────────────────────────
 DEFAULT_SYMBOLS = ["SPY", "SPX", "QQQ", "IWM", "AAPL", "TSLA", "NVDA", "AMZN", "META"]

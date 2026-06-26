@@ -16,3 +16,6 @@ conditional_orders.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# 个人开发启动脚本 (含本机绝对路径, 不进公开仓库)
+claude_dev.bat

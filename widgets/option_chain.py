@@ -3,6 +3,8 @@
 import threading
 from datetime import datetime, timedelta
 
+from momentum_flip import compute_flip
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
@@ -30,6 +32,7 @@ class OptionChainWidget(QWidget):
     option_selected = pyqtSignal(object)  # OptionInfo
     # 后台 reqContractDetails 取到某到期日真实行权价后, 回到 GUI 线程填表
     _strikes_ready = pyqtSignal(str, str, object, bool)  # symbol, expiry, strikes, ok
+    _momentum_ready = pyqtSignal(object)  # ES 动量翻转 state (compute_flip 结果或 None)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -49,6 +52,12 @@ class OptionChainWidget(QWidget):
         self._real_strikes: dict[str, list] = {}
         self._fetching_strikes: set = set()   # 正在后台取的到期日, 防重复请求
         self._strikes_ready.connect(self._on_strikes_ready)
+        # ES 动量翻转监测 (60s 后台拉 ES 连续期货 1分钟K线计算; 与品种无关, 只看 ES)
+        self._mom_fetching = False
+        self._momentum_ready.connect(self._on_momentum_ready)
+        self._mom_timer = QTimer(self)
+        self._mom_timer.timeout.connect(self._fetch_momentum)
+        self._mom_timer.start(60_000)
         # 视口取价去抖: 滚动停止 ~250ms 后只对当前可见行拉一次快照 (省行情线)
         self._snap_timer = QTimer(self)
         self._snap_timer.setSingleShot(True)
@@ -101,6 +110,20 @@ class OptionChainWidget(QWidget):
             range_layout.addWidget(btn)
 
         range_layout.addStretch()
+
+        # ES 动量翻转 (Vordinkkk 法, 1分钟K线): 翻多▲ / 翻空▼ / 持续 / —
+        self._momentum_label = QLabel("ES动量 —")
+        self._momentum_label.setToolTip(
+            "ES (E-mini S&P 500 连续期货) 动量翻转 — Vordinkkk 法:\n"
+            "· 动量 = 收盘[t] − 收盘[t−10] (1分钟K线)\n"
+            "· 翻转 = 动量穿越0 且 |导数| ≥ 0.4\n"
+            "  翻多▲ = 由空转多; 翻空▼ = 由多转空\n"
+            "· 无翻转时显示当前动量方向 (多/空)"
+        )
+        self._momentum_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
+        )
+        range_layout.addWidget(self._momentum_label)
 
         # 今日已平仓交易统计 (刷新报价左侧): 笔数 / 胜率 / 盈亏比 (不列明细)
         self._stats_label = QLabel("笔数 — · 胜率 — · 盈亏比 —")
@@ -191,6 +214,60 @@ class OptionChainWidget(QWidget):
 
     def set_engine(self, engine):
         self._engine = engine
+        # 连接后尽快出一次 ES 动量 (不等 60s 首个定时器)
+        QTimer.singleShot(2000, self._fetch_momentum)
+
+    # ── ES 动量翻转 ─────────────────────────────────────────────────────
+
+    def _fetch_momentum(self):
+        """后台拉 ES 连续期货 1分钟K线 → 算动量翻转 → 信号回 GUI 更新标签。"""
+        if self._mom_fetching or self._engine is None:
+            return
+        if not getattr(self._engine, "is_connected", False):
+            return
+        if not hasattr(self._engine, "request_es_momentum_bars"):
+            return
+        self._mom_fetching = True
+        eng = self._engine
+
+        def work():
+            state = None
+            try:
+                closes = eng.request_es_momentum_bars()
+                if closes:
+                    state = compute_flip(closes)
+            except Exception:
+                state = None
+            self._momentum_ready.emit(state)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_momentum_ready(self, state):
+        """(GUI 线程) 更新 ES 动量翻转标签。state=None → 无数据。"""
+        self._mom_fetching = False
+        if not state:
+            self._momentum_label.setText("ES动量 —")
+            self._momentum_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
+            )
+            return
+        flip = state.get("flip")
+        sign = state.get("sign", 0)
+        if flip == "UP":
+            txt, color, bold = "ES动量翻多 ▲", COLOR_GREEN, True
+        elif flip == "DOWN":
+            txt, color, bold = "ES动量翻空 ▼", COLOR_RED, True
+        elif sign > 0:
+            txt, color, bold = "ES动量 多", COLOR_GREEN, False
+        elif sign < 0:
+            txt, color, bold = "ES动量 空", COLOR_RED, False
+        else:
+            txt, color, bold = "ES动量 平", COLOR_TEXT_DIM, False
+        weight = "font-weight:bold;" if bold else ""
+        self._momentum_label.setText(txt)
+        self._momentum_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; padding: 0 8px; {weight}"
+        )
 
     def set_trade_stats(self, stats: dict):
         """更新「笔数 · 胜率 · 盈亏比」(刷新报价左侧)。stats 为 TradeStats.snapshot()。"""
@@ -760,4 +837,6 @@ class OptionChainWidget(QWidget):
     def cleanup(self):
         """Cleanup subscriptions."""
         self._refresh_timer.stop()
+        self._mom_timer.stop()
+        self._snap_timer.stop()
         self._unsubscribe_all()

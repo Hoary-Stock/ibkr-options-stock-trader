@@ -1428,6 +1428,42 @@ class IBKREngine:
                 pass
             self._app._hist_data.pop(req_id, None)
 
+    def request_es_momentum_bars(self, duration: str = "7200 S",
+                                 bar_size: str = "1 min",
+                                 timeout: float = 15.0) -> list[float]:
+        """ES 连续期货 (CONTFUT@CME) 的 close 序列, 供动量翻转监测 (默认近 2 小时 1 分钟)。
+
+        ES 是期货 → 必须用 CONTFUT 合约 (不能走 STK 的 `_make_underlying_contract`)。
+        阻塞 (内部 Event.wait), **调用方须放后台线程**。失败/无权限返回 []。"""
+        if not self._app or not self._connected:
+            return []
+        spec = FUTURES_SPECS.get("ES")
+        exchange = spec[0] if spec else "CME"
+        c = Contract()
+        c.symbol = "ES"
+        c.secType = "CONTFUT"
+        c.exchange = exchange
+        c.currency = "USD"
+        req_id = self._app.next_req_id()
+        self._app._hist_data[req_id] = {
+            "bars": [], "event": threading.Event(), "error": None,
+        }
+        try:
+            self._app.reqHistoricalData(
+                reqId=req_id, contract=c, endDateTime="", durationStr=duration,
+                barSizeSetting=bar_size, whatToShow="TRADES", useRTH=0,
+                formatDate=1, keepUpToDate=False, chartOptions=[],
+            )
+        except Exception:
+            self._app._hist_data.pop(req_id, None)
+            return []
+        ok = self._app._hist_data[req_id]["event"].wait(timeout)
+        state = self._app._hist_data.pop(req_id, None) or {}
+        if not ok or state.get("error"):
+            return []
+        return [b["close"] for b in state.get("bars", [])
+                if b.get("close", 0)]
+
     def request_option_historical_data(
         self, symbol: str, expiry: str, strike: float, right: str,
         bar_size: str, duration: str, what_to_show: str = "TRADES",

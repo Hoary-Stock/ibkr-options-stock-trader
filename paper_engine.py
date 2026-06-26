@@ -130,6 +130,10 @@ class PaperEngine:
     def get_trade_stats(self):
         return self._trade_stats.snapshot()
 
+    def request_es_momentum_bars(self, duration="7200 S", bar_size="1 min",
+                                 timeout=15.0):
+        return self.ibkr.request_es_momentum_bars(duration, bar_size, timeout)
+
     def get_con_id(self, symbol):
         return self.ibkr.get_con_id(symbol)
 

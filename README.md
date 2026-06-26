@@ -410,6 +410,13 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **期权链工具条加 ES 动量翻转指示 (Vordinkkk 法; 只看 ES)**。
+  在「全部」与「刷新报价」之间显示 **ES** (E-mini S&P 500 连续期货) 的动量翻转: 翻多▲(绿)/翻空▼(红)/
+  当前方向 多·空 / 无数据 —。算法移植自 `vordinkkk_momentum`: 1分钟K线, 动量=收盘[t]−收盘[t−10],
+  翻转=动量穿越0 且 |导数|≥0.4 (`momentum_flip.py`)。新增引擎 `request_es_momentum_bars` (CONTFUT@CME
+  1分钟 close 序列, 阻塞→后台线程); 期权链每 60s 后台拉取计算, 经信号回 GUI 更新。与当前期权品种无关,
+  始终只观测 ES。无 CME 期货行情权限则显示「—」。(`momentum_flip.py`, `ibkr_engine.py`, `paper_engine.py`,
+  `widgets/option_chain.py`)
 - **2026-06-26** — **期权链「刷新报价」左侧显示今日交易统计: 笔数 / 胜率 / 盈亏比 (不列明细)**。
   新增 `trade_stats.py` 的 `TradeStats` —— 按「持平→再持平」一个完整回合 (开+平算1笔) 做回合制 FIFO
   统计: **笔数**=已平仓回合数, **胜率**=盈利笔数/总笔数, **盈亏比**=平均盈利/平均亏损 (无亏损→显示 ∞)。

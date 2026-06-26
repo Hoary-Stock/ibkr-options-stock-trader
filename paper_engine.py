@@ -16,6 +16,7 @@ from models import (
     OptionInfo, OrderInfo, PositionInfo,
     OrderAction, OrderStatus, OrderType, TradingMode,
 )
+from trade_stats import TradeStats
 
 
 class PaperSignalBridge(QObject):
@@ -44,6 +45,7 @@ class PaperSignalBridge(QObject):
     open_order_received = pyqtSignal(int, object, str, int, float, str, str)
     order_rejected = pyqtSignal(int, int, str)
     pnl_single_updated = pyqtSignal(int, float, float, float, float)
+    trade_stats_updated = pyqtSignal(object)  # 已平仓交易统计 snapshot
 
 
 class PaperEngine:
@@ -63,6 +65,8 @@ class PaperEngine:
         self._positions: dict[str, PositionInfo] = {}
         self._starting_capital = PAPER_STARTING_CAPITAL
         self._realized_pnl = 0.0
+        # 已平仓交易统计 (笔数/胜率/盈亏比) — 本次运行累计 (模拟无当日历史回放)
+        self._trade_stats = TradeStats()
 
         # Timer to check fills periodically
         self._fill_timer = QTimer()
@@ -122,6 +126,9 @@ class PaperEngine:
 
     def get_tick(self, key):
         return self.ibkr.get_tick(key)
+
+    def get_trade_stats(self):
+        return self._trade_stats.snapshot()
 
     def get_con_id(self, symbol):
         return self.ibkr.get_con_id(symbol)
@@ -444,6 +451,13 @@ class PaperEngine:
         """Update positions after a fill."""
         key = order.option.to_ibkr_key()
         qty_change = order.quantity if order.action == OrderAction.BUY else -order.quantity
+
+        # 已平仓交易统计 (回合制 FIFO; 模拟乘数按 ×100 与本引擎一致)
+        self._trade_stats.record_fill(
+            key, "BOT" if order.action == OrderAction.BUY else "SLD",
+            float(order.quantity), fill_price, 100.0, order.commission,
+        )
+        self.bridge.trade_stats_updated.emit(self._trade_stats.snapshot())
 
         if key in self._positions:
             pos = self._positions[key]

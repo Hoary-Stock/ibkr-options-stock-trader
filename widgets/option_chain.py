@@ -102,6 +102,19 @@ class OptionChainWidget(QWidget):
 
         range_layout.addStretch()
 
+        # 今日已平仓交易统计 (刷新报价左侧): 笔数 / 胜率 / 盈亏比 (不列明细)
+        self._stats_label = QLabel("笔数 — · 胜率 — · 盈亏比 —")
+        self._stats_label.setToolTip(
+            "今日已平仓交易统计 (开+平算1笔):\n"
+            "· 笔数 = 已平仓回合数\n"
+            "· 胜率 = 盈利笔数 / 总笔数\n"
+            "· 盈亏比 = 平均盈利 / 平均亏损"
+        )
+        self._stats_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
+        )
+        range_layout.addWidget(self._stats_label)
+
         # 手动刷新按钮: 拉一次快照报价 (不占常驻行情线, 避免持续订阅压垮 Gateway)
         self._refresh_btn = QPushButton("🔄 刷新报价")
         self._refresh_btn.setFixedHeight(26)
@@ -178,6 +191,34 @@ class OptionChainWidget(QWidget):
 
     def set_engine(self, engine):
         self._engine = engine
+
+    def set_trade_stats(self, stats: dict):
+        """更新「笔数 · 胜率 · 盈亏比」(刷新报价左侧)。stats 为 TradeStats.snapshot()。"""
+        if not stats:
+            return
+        count = int(stats.get("count", 0) or 0)
+        if count <= 0:
+            self._stats_label.setText("笔数 0 · 胜率 — · 盈亏比 —")
+            self._stats_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
+            )
+            return
+        wr = stats.get("win_rate", 0.0) or 0.0
+        plr = stats.get("pl_ratio", None)   # None = 无亏损回合 → ∞
+        wr_color = COLOR_GREEN if wr >= 0.5 else COLOR_RED
+        if plr is None:
+            plr_txt, plr_color = "∞", COLOR_GREEN
+        else:
+            plr_txt = f"{plr:.2f}"
+            plr_color = COLOR_GREEN if plr >= 1.0 else COLOR_RED
+        self._stats_label.setText(
+            f"<span style='color:{COLOR_TEXT_DIM}'>笔数</span> {count} · "
+            f"<span style='color:{COLOR_TEXT_DIM}'>胜率</span> "
+            f"<span style='color:{wr_color};font-weight:bold'>{wr * 100:.0f}%</span> · "
+            f"<span style='color:{COLOR_TEXT_DIM}'>盈亏比</span> "
+            f"<span style='color:{plr_color};font-weight:bold'>{plr_txt}</span>"
+        )
+        self._stats_label.setStyleSheet("font-size: 12px; padding: 0 8px;")
 
     def load_chain(self, symbol: str, expirations: list[str], strikes: list[float],
                    stock_price: float = 0):

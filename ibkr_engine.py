@@ -30,6 +30,7 @@ from models import (
     OptionInfo, OrderInfo, PositionInfo, PortfolioPosition,
     OrderAction, OrderStatus, OrderType, TradingMode,
 )
+from trade_stats import TradeStats
 
 
 # Known PM-settled weekly option trading classes for index symbols, used as
@@ -88,6 +89,9 @@ class IBKRSignalBridge(QObject):
 
     # Per-position PnL (reqPnLSingle): conId, pos, dailyPnL, unrealizedPnL, value
     pnl_single_updated = pyqtSignal(int, float, float, float, float)
+
+    # 已平仓交易统计 (笔数/胜率/盈亏比) — snapshot dict
+    trade_stats_updated = pyqtSignal(object)
 
 
 # ── IBKR API App ─────────────────────────────────────────────────────
@@ -156,6 +160,8 @@ class IBKRApp(EWrapper, EClient):
         self._exec_cf: dict[str, float] = {}
         self._posval: dict[int, float] = {}
         self._comm_by_execid: dict[str, float] = {}
+        # 已平仓交易统计 (笔数/胜率/盈亏比), 由 execDetails 喂入 (含当日历史回放), 每日重置
+        self._trade_stats = TradeStats()
 
         # One-time market data warning flag
         self._mkt_data_warned: bool = False
@@ -581,8 +587,22 @@ class IBKRApp(EWrapper, EClient):
         shares = float(execution.shares)
         price = float(execution.price)
         sign = 1.0 if execution.side == "SLD" else -1.0   # 卖出进现金 / 买入出现金
+        is_new_exec = execution.execId not in self._exec_cf   # 防同一 execId 重复计入
         self._exec_cf[execution.execId] = sign * price * shares * mult
         self._emit_computed_daily()
+
+        # 已平仓交易统计 (笔数/胜率/盈亏比): 喂入本笔成交 (历史回放 reqId>=0 也计入 →
+        # 覆盖「今日全部」)。按 conId 分合约做回合制 FIFO; 佣金用估算。
+        try:
+            con_id = int(getattr(contract, "conId", 0) or 0)
+        except (ValueError, TypeError):
+            con_id = 0
+        if con_id and is_new_exec:
+            est_comm = max(COMMISSION_PER_CONTRACT * shares, COMMISSION_MIN)
+            self._trade_stats.record_fill(
+                con_id, execution.side, shares, price, mult, est_comm
+            )
+            self.bridge.trade_stats_updated.emit(self._trade_stats.snapshot())
 
         # reqId >= 0 → reqExecutions 的当日历史回放: 不触发成交音/持仓事件, 否则启动时会把
         # 今天每笔成交的提示音全播一遍。实时成交由 IBKR 以 reqId = -1 推送。
@@ -595,6 +615,7 @@ class IBKRApp(EWrapper, EClient):
     def execDetailsEnd(self, reqId):
         # 当日历史成交拉取完毕 → 推一次自算今日盈亏 (即便今天无成交, 也给出 0 基线)
         self._emit_computed_daily()
+        self.bridge.trade_stats_updated.emit(self._trade_stats.snapshot())
 
     def commissionReport(self, commissionReport):
         """累计今日手续费 (按 execId 去重)。每笔成交后到达;`reqExecutions` 连接时也会
@@ -615,6 +636,7 @@ class IBKRApp(EWrapper, EClient):
             self._exec_cf.clear()
             self._posval.clear()
             self._comm_by_execid.clear()
+            self._trade_stats.reset()   # 交易统计也按日重置 (笔数/胜率/盈亏比)
 
     def _emit_computed_daily(self):
         """今日盈亏 = 今日成交现金流 + 当前持仓市值 − 今日手续费 (已扣费)。"""
@@ -1337,6 +1359,12 @@ class IBKREngine:
         if self._app:
             return self._app._tick_data.get(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
         return {"bid": 0.0, "ask": 0.0, "last": 0.0}
+
+    def get_trade_stats(self) -> dict:
+        """已平仓交易统计快照 (笔数/胜率/盈亏比)。未连接返回空统计。"""
+        if self._app:
+            return self._app._trade_stats.snapshot()
+        return TradeStats().snapshot()
 
     # ── Historical Data ─────────────────────────────────────────────
 

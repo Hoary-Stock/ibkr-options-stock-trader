@@ -410,6 +410,14 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-26** — **期权链「刷新报价」左侧显示今日交易统计: 笔数 / 胜率 / 盈亏比 (不列明细)**。
+  新增 `trade_stats.py` 的 `TradeStats` —— 按「持平→再持平」一个完整回合 (开+平算1笔) 做回合制 FIFO
+  统计: **笔数**=已平仓回合数, **胜率**=盈利笔数/总笔数, **盈亏比**=平均盈利/平均亏损 (无亏损→显示 ∞)。
+  由成交流喂入: 真实引擎在 `execDetails` 喂 (含 `reqExecutions` 当日**历史回放** → 覆盖「今日全部含重启前」,
+  按 execId 去重防双计, 每日随盈亏一起重置); 模拟引擎在 `_update_position` 喂 (本次运行累计)。佣金用估算
+  (够分类盈亏)。两引擎各一套, 经 `trade_stats_updated` 信号 + 主窗口按**当前活动引擎**过滤后, 推到期权链
+  `set_trade_stats` (胜率<50%/盈亏比<1 标红, 否则绿)。(`trade_stats.py`, `ibkr_engine.py`, `paper_engine.py`,
+  `widgets/option_chain.py`, `main_window.py`)
 - **2026-06-26** — **修: error 321 "Invalid account code" —— 用 managedAccounts 取权威账户**。
   reqPnL/reqPnLSingle 之前只从 `accountSummary` 取账户名, 多账户/账户组时会被最后一行覆盖成
   reqPnL **不接受**的代码 → 321 刷状态栏。改为实现 EWrapper 的 **`managedAccounts`** 回调(连接即

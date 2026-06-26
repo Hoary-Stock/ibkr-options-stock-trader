@@ -380,10 +380,19 @@ class MainWindow(QMainWindow):
         self.ibkr_engine.bridge.execution_received.connect(self._on_fill_sound)
         # 期货限价开多成交 → 自动挂上止盈/止损 (两个引擎都监听, 按当前模式生效)
         self.ibkr_engine.bridge.execution_received.connect(self._on_exec_arm_bracket)
+        # 已平仓交易统计 (笔数/胜率/盈亏比) → 期权链刷新报价左侧。
+        # 两个引擎都连着 (模拟也用真实引擎取行情), 故只显示**当前活动引擎**的统计,
+        # 避免模拟模式下显示真实账户的当日成交统计。
+        self.ibkr_engine.bridge.trade_stats_updated.connect(
+            lambda s: self._on_trade_stats(s, self.ibkr_engine)
+        )
 
         # Paper engine signals
         self.paper_engine.bridge.error_received.connect(self._on_error)
         self.paper_engine.bridge.execution_received.connect(self._on_exec_arm_bracket)
+        self.paper_engine.bridge.trade_stats_updated.connect(
+            lambda s: self._on_trade_stats(s, self.paper_engine)
+        )
         self.paper_engine.bridge.account_summary_updated.connect(self.account_bar.update_account)
         self.paper_engine.bridge.pnl_updated.connect(self.account_bar.update_daily_pnl)
         self.paper_engine.bridge.computed_daily_pnl.connect(
@@ -435,6 +444,8 @@ class MainWindow(QMainWindow):
         self.account_bar.set_engine(self._active_engine)
         self.calculator.set_engine(self._active_engine)
         self.strategy_panel.set_engine(self._active_engine)
+        # 交易统计跟随当前引擎 (真实引擎连接后会回放当日成交 → 自动推 today 统计)
+        self.option_chain.set_trade_stats(self._active_engine.get_trade_stats())
         # 若当前正停在「多腿组合」Tab, 立即加载期权链
         if self.center_tabs.currentWidget() is self.strategy_panel:
             self.strategy_panel.ensure_loaded()
@@ -468,6 +479,11 @@ class MainWindow(QMainWindow):
     def _on_fill_sound(self, order_id: int, side: str, qty: float, price: float):
         """真正成交回报 → 播放提示音 (后台线程, 不阻塞 GUI)。"""
         play_fill(side)
+
+    def _on_trade_stats(self, snapshot: dict, source):
+        """交易统计更新 → 仅显示当前活动引擎的 (模拟/实盘各自一套)。"""
+        if source is self._active_engine:
+            self.option_chain.set_trade_stats(snapshot)
 
     def _on_account_summary_end(self):
         """After first account summary, request PnL (needs account name)."""
@@ -617,6 +633,7 @@ class MainWindow(QMainWindow):
             self.account_bar.set_engine(self._active_engine)
             self.calculator.set_engine(self._active_engine)
             self.strategy_panel.set_engine(self._active_engine)
+            self.option_chain.set_trade_stats(self._active_engine.get_trade_stats())
 
     def _on_reconnect_requested(self, mode_value: str):
         """Handle hot switch: disconnect and reconnect to different port."""

@@ -65,6 +65,9 @@ class PaperEngine:
         self._positions: dict[str, PositionInfo] = {}
         self._starting_capital = PAPER_STARTING_CAPITAL
         self._realized_pnl = 0.0
+        # 今日累计手续费 (本次运行所有成交的估算佣金之和; 与真实引擎口径一致地经
+        # computed_daily_pnl 的手续费分量上报, 驱动右上角「今日手续费」显示)。
+        self._today_commission = 0.0
         # 已平仓交易统计 (笔数/胜率/盈亏比) — 本次运行累计 (模拟无当日历史回放)
         self._trade_stats = TradeStats()
 
@@ -203,7 +206,7 @@ class PaperEngine:
         unrealized = self._calc_unrealized_pnl()
         daily = unrealized + self._realized_pnl
         self.bridge.pnl_updated.emit(daily, unrealized, self._realized_pnl)
-        self.bridge.computed_daily_pnl.emit(daily, 0.0)
+        self.bridge.computed_daily_pnl.emit(daily, self._today_commission)
 
     def cancel_pnl(self):
         pass
@@ -455,6 +458,9 @@ class PaperEngine:
         """Update positions after a fill."""
         key = order.option.to_ibkr_key()
         qty_change = order.quantity if order.action == OrderAction.BUY else -order.quantity
+
+        # 今日手续费累计 (每笔成交按下单时估算的佣金计入, 与真实引擎口径一致)
+        self._today_commission += order.commission
 
         # 已平仓交易统计 (回合制 FIFO; 模拟乘数按 ×100 与本引擎一致)
         self._trade_stats.record_fill(

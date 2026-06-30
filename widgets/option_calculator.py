@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import json
 import math
+import threading
+import urllib.request
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox,
@@ -126,6 +129,9 @@ def years_to_expiry(expiry: str) -> float:
 class OptionCalculator(QWidget):
     """期权理论价计算器面板。"""
 
+    # 2 年期收益率经后台线程从 Yahoo 拉取, 用信号回 GUI 线程更新标签 (值为 % ; <0 表失败)
+    _rate2y_ready = pyqtSignal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._engine = None
@@ -135,8 +141,13 @@ class OptionCalculator(QWidget):
         self._solver_seeded = False  # 右列是否已用实时值初始化 (每次换合约重置)
         self._index_req_ids: list[int] = []   # 大盘指数条订阅 (SPY/SPX/VIX)
         self._indices_subscribed = False      # 当前引擎是否已订阅指数行情
+        self._fetching_2y = False             # 2 年期 Yahoo 拉取进行中 (防并发重入)
 
         self._build_ui()
+
+        self._rate2y_ready.connect(self._on_rate2y_ready)
+        # 启动后尽早拉一次 2 年期 (Yahoo, 不依赖 IBKR 连接), 之后随 _update_rates 每 30s 刷新
+        QTimer.singleShot(2000, self._fetch_2y_yield)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -233,14 +244,31 @@ class OptionCalculator(QWidget):
 
         root.addLayout(bar)
 
-        # 第二行: 美债收益率 (13周 / 5年 / 10年)。刷新慢 (30s), 利率变动慢无需高频。
-        # 13周(IRX) 作为短端档位 (无标准 2 年期 CBOE 指数, 用 IRX 替代)。
+        # 第二行: 美债收益率 (2年 / 5年 / 10年)。刷新慢 (30s), 利率变动慢无需高频。
+        # 2年走 Yahoo `2YY=F` (延迟行情, 标注「延迟」); 5年/10年走 IBKR CBOE 指数。
         rate_bar = QHBoxLayout()
         rate_bar.setSpacing(10)
         rate_cap = QLabel("美债")
         rate_cap.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
         rate_bar.addWidget(rate_cap)
         self._rate_labels: dict[str, QLabel] = {}
+
+        # 2 年期 (Yahoo, 延迟) — 放在最前作短端档位
+        cap2y = QLabel("2年")
+        cap2y.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+        self._rate2y_label = QLabel("—")
+        self._rate2y_label.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 13px; font-weight: bold;"
+        )
+        self._rate2y_label.setToolTip("2 年期美债收益率 · Yahoo 2YY=F · 延迟行情")
+        delay_tag = QLabel("延迟")
+        delay_tag.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 9px;")
+        delay_tag.setToolTip("Yahoo Finance 延迟数据 (非实时)")
+        rate_bar.addWidget(cap2y)
+        rate_bar.addWidget(self._rate2y_label)
+        rate_bar.addWidget(delay_tag)
+
+        # 5年 / 10年 (IBKR CBOE 指数)
         for label, sym, _scale in self._RATE_SYMBOLS:
             cap = QLabel(label)
             cap.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
@@ -545,14 +573,18 @@ class OptionCalculator(QWidget):
     # ── 大盘指数条 (SPY / SPX / VIX) ─────────────────────────────────────
 
     _INDEX_BAR_SYMBOLS = ("SPY", "SPX", "VIX")
-    # 美债收益率档位: (显示标签, CBOE 指数代码, 显示换算 scale)。
-    # TNX/FVX 指数=收益率×10 → ×0.1 还原为百分比; IRX≈收益率 → ×1.0。
-    # 13周(IRX) 用作短端 (无标准 2 年期 CBOE 指数)。
-    _RATE_SYMBOLS = (("13周", "IRX", 1.0), ("5年", "FVX", 0.1), ("10年", "TNX", 0.1))
+    # 美债收益率档位 (走 IBKR CBOE 指数的部分): (显示标签, CBOE 指数代码, 显示换算 scale)。
+    # TNX/FVX 指数=收益率×10 → ×0.1 还原为百分比。
+    # 短端 2 年期: CBOE 无标准 2 年收益率指数, 改从 Yahoo `2YY=F` (CBOE 2 年期收益率期货,
+    # 值即收益率%) 后台拉取, 单列处理 (见 _fetch_2y_yield), 故不在此元组内。
+    _RATE_SYMBOLS = (("5年", "FVX", 0.1), ("10年", "TNX", 0.1))
+    # Yahoo Finance 2 年期收益率期货 (延迟行情) 的 chart 接口
+    _YAHOO_2Y_URL = "https://query1.finance.yahoo.com/v8/finance/chart/2YY=F?interval=1d&range=1d"
 
     def _ensure_index_subscriptions(self):
-        """连接后订阅 SPY/SPX/VIX + 美债收益率(IRX/FVX/TNX) 行情 (每个引擎仅订阅一次)。
-        均为 CBOE 指数, 若账户无指数行情权限则相应字段保持「—」。"""
+        """连接后订阅 SPY/SPX/VIX + 美债收益率(FVX/TNX) 行情 (每个引擎仅订阅一次)。
+        均为 CBOE 指数, 若账户无指数行情权限则相应字段保持「—」。
+        2 年期不在此列 (走 Yahoo, 见 _fetch_2y_yield)。"""
         if self._indices_subscribed or self._engine is None:
             return
         if not getattr(self._engine, "is_connected", False):
@@ -626,8 +658,10 @@ class OptionCalculator(QWidget):
             )
 
     def _update_rates(self):
-        """刷新美债收益率行 (13周/5年/10年), 30s 一次。无行情/无权限则显示「—」。
-        TNX/FVX 指数=收益率×10 → 按 scale 还原成百分比。"""
+        """刷新美债收益率行 (2年/5年/10年), 30s 一次。无行情/无权限则显示「—」。
+        2年走 Yahoo (后台线程); 5年/10年走 IBKR CBOE 指数 (TNX/FVX=收益率×10 → 按 scale 还原)。"""
+        # 2 年期: Yahoo 延迟行情, 不依赖 IBKR 连接, 每次刷新都后台拉一次
+        self._fetch_2y_yield()
         if self._engine is None or not hasattr(self, "_rate_labels"):
             return
         for _label, sym, scale in self._RATE_SYMBOLS:
@@ -645,6 +679,47 @@ class OptionCalculator(QWidget):
                 lab.setStyleSheet(
                     f"color: {COLOR_TEXT_DIM}; font-size: 13px; font-weight: bold;"
                 )
+
+    def _fetch_2y_yield(self):
+        """后台拉取 2 年期美债收益率 (Yahoo `2YY=F`, 延迟行情)。
+        在 daemon 线程发 HTTP, 结果经 _rate2y_ready 信号回 GUI 线程; 失败发 <0。"""
+        if self._fetching_2y:
+            return
+        self._fetching_2y = True
+
+        def work():
+            val = -1.0
+            try:
+                req = urllib.request.Request(
+                    self._YAHOO_2Y_URL, headers={"User-Agent": "Mozilla/5.0"}
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                meta = data["chart"]["result"][0]["meta"]
+                price = meta.get("regularMarketPrice")
+                if price is not None and price > 0:
+                    val = float(price)   # 2YY=F 即收益率%, 无需换算
+            except Exception:
+                val = -1.0
+            self._rate2y_ready.emit(val)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_rate2y_ready(self, value: float):
+        """(GUI 线程) 收到 2 年期收益率 → 更新标签。value<0 表拉取失败, 保留上次显示。"""
+        self._fetching_2y = False
+        if not hasattr(self, "_rate2y_label"):
+            return
+        if value > 0:
+            self._rate2y_label.setText(f"{value:.3f}%")
+            self._rate2y_label.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-size: 13px; font-weight: bold;"
+            )
+        elif self._rate2y_label.text() == "—":
+            # 仍无有效值 (首拉失败): 保持「—」
+            self._rate2y_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 13px; font-weight: bold;"
+            )
 
     def _live_underlying(self, opt_tick: dict) -> float:
         """标的实时价。优先用高频的标的 tick (__stock__SYM, 随每笔成交跳动),
@@ -956,7 +1031,7 @@ class OptionCalculator(QWidget):
     def cleanup(self):
         self._timer.stop()
         self._rate_timer.stop()
-        # 退订指数行情线 (SPY/SPX/VIX + 美债 IRX/FVX/TNX)
+        # 退订指数行情线 (SPY/SPX/VIX + 美债 FVX/TNX; 2 年走 Yahoo 无需退订)
         unsub = getattr(self._engine, "unsubscribe_tick", None) if self._engine else None
         if unsub:
             for rid in self._index_req_ids:

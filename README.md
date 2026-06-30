@@ -84,8 +84,8 @@ ibkr_trader/
     ├── price_ladder.py      # 点价梯 (5 列深度摆盘 + 点击下单 + 持仓摘要)  ★核心
     ├── position_panel.py    # 持仓面板 (期权 + 正股/ETF, P/L + 今日盈亏)
     ├── order_panel.py       # 委托面板 (挂单/历史, 撤单, 拒单标红)
-    ├── account_bar.py       # 账户摘要条 (净值/现金/购买力/盈亏 + 各币种现金)
-    ├── currency_balance.py  # 各币种现金余额条 (EUR/USD/..., 期权GUI+正股复用)
+    ├── account_bar.py       # 账户摘要条 (两行: 资金摘要 / 账户名+美东时钟)
+    ├── currency_balance.py  # 各币种现金余额条 (正股 client 用; 期权 GUI 账户栏已不再嵌)
     ├── option_calculator.py # 期权理论价计算器 (Black-Scholes, 右下角, 随实时IV+时间刷新)
     ├── currency_dialog.py   # 外汇兑换对话框 (USD ↔ HKD/CNH/EUR/...)
     ├── quantity_selector.py # 数量选择小部件 (1–100 张)
@@ -250,8 +250,8 @@ ibkr_trader/
 | `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选。 |
 | `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。**重启后自动加载当日已完成委托**(引擎 `reqCompletedOrders`,见 §4.3)。 |
-| `account_bar.py` (≈210) | 账户摘要条;净值/现金/购买力/盈亏 + 内嵌 `CurrencyBalanceBar`(各币种现金);右侧**美东时间实时时钟**(`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地);每 `ACCOUNT_REFRESH_MS` (3s) 调 `request_account_summary()` + `request_currency_balances()`,但这两者已**幂等**(订一次流式订阅, 之后调用直接返回, 不再 cancel+重订), 故定时器只是兜底、不再给 Gateway 制造 churn。 |
-| `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;期权 GUI 嵌在 `AccountBar`、正股 client 放顶栏。 |
+| `account_bar.py` (≈270) | 账户摘要条,**两行布局**(窄屏单行会截断,故拆开):**第一行**=资金摘要(总资产/可用/购买力/未实现/今日盈亏 + 右侧**今日手续费**,`on_computed_daily` 取 `computed_daily_pnl` 信号的手续费分量,真实=IBKR commissionReport 日内累计,模拟=各笔估算佣金累计);**第二行**=账户名(左)+ **美东时间实时时钟**(右,`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地)。**币种余额条已从账户栏移除**(`on_currency_balance` 保留为空槽,数据仍在引擎侧流动,不动主窗口信号接线)。每 `ACCOUNT_REFRESH_MS` (3s) 调 `request_account_summary()` + `request_currency_balances()`,但这两者已**幂等**(订一次流式订阅, 之后调用直接返回, 不再 cancel+重订), 故定时器只是兜底、不再给 Gateway 制造 churn。 |
+| `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;**现仅正股 client 顶栏在用**(期权 GUI 账户栏已不再嵌)。 |
 | `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·试算」**:顶部单选切换两个方向,共享一组参数(K/IV/r/到期):**①「期权价→标的价」**(原功能)改**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「期权要值目标价时标的需到的价位」,对比当前标的算需变动金额/百分比(↑绿/↓红),Put 目标价超 `K·e^(-rT)` 显示「无解」;**②「标的价→期权价」**(新增)改**假设标的价**,正算 Black-Scholes 期权价并与盘口中间价比对(相对盘口涨跌, ↑绿/↓红, 到期则取内在价值)。换合约时自动用实时值播种(目标价取盘口中价、假设标的取当前标的),「↺ 用实时值填充」可手动重置。正股伪合约两列均显示「仅期权适用」。 |
 | `quantity_selector.py` (31) | 1–100 张数量微调器,emit `quantity_changed`。 |
 | `strategy_defs.py` (196) | 纯数据:`StrategyType` 枚举 + `LegTemplate`/`StrategyTemplate` + `STRATEGY_REGISTRY`(牛/熊市价差、蝶式、铁鹰、铁蝶、跨式、宽跨、日历价差、自定义)。 |
@@ -410,6 +410,21 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-06-30** — **利率行短端 13周(IRX) → 2年(Yahoo `2YY=F`, 延迟) + 账户栏改两行、删币种条**。
+  ① **计算器利率行**: 短端档位从 13周(IRX) 换成 **2 年期**。CBOE 无标准 2 年收益率指数, 故改从
+  Yahoo Finance `2YY=F`(CBOE 2 年期收益率期货, `regularMarketPrice` 即收益率%、无需换算)经
+  **daemon 线程**拉取(`_fetch_2y_yield`, urllib 超时 6s), 结果用 `_rate2y_ready` 信号回 GUI 线程,
+  标签旁标注「**延迟**」(Yahoo 非实时)。5年/10年仍走 IBKR CBOE 指数。`_RATE_SYMBOLS` 去掉 IRX、
+  `INDEX_SYMBOLS` 注释更新(IRX 仍留作 IND 注册)。
+  ② **账户摘要条改两行**(窄屏单行会截断): 第一行=资金摘要(总资产/可用/购买力/未实现/今日盈亏/手续费),
+  第二行=账户名(左)+ 美东时钟(右)。**移除币种余额条**(`on_currency_balance` 留空槽, 不动主窗口信号接线)。
+  (`widgets/option_calculator.py`, `widgets/account_bar.py`, `config.py`)
+- **2026-06-29** — **账户摘要条右上角(时钟左侧)新增「今日手续费」统计**。复用已有 `computed_daily_pnl`
+  信号的**手续费分量**(今日盈亏分量仍弃用)。真实模式: IBKR `commissionReport` 按 `execId` 去重、日内
+  累计、跨日清零, 重启后经 `reqExecutions` 补齐当日历史成交手续费; 模拟模式: `PaperEngine` 新增
+  `_today_commission` 累计每笔成交估算佣金, 经同一信号上报(原来恒推 0)。`account_bar.on_computed_daily`
+  改为只用 commission 分量驱动新标签(NaN/DBL_MAX 守护); `stop()` 切换/断开时清回「--」。
+  (`widgets/account_bar.py`, `paper_engine.py`)
 - **2026-06-26** — **期权链标题在标的价右侧显示标的 IV (如 `SPY $730.76  IV 18.2%`)**。
   标的隐含波动率 = IBKR 对该标的计算的「期权隐含波动率」(TWS 的 Implied Vol %)。做法: 期权链的标的行情
   订阅 (`_fetch_stock_price`) 加 **genericTick 106**, 引擎 `tickGeneric` 处理 **tickType 24** → 存

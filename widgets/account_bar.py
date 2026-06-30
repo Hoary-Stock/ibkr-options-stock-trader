@@ -4,7 +4,7 @@ import math
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QFrame,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
 )
 from PyQt5.QtCore import QTimer
 
@@ -13,7 +13,6 @@ from config import (
     COLOR_GREEN, COLOR_RED, COLOR_ACCENT, COLOR_BORDER,
     ACCOUNT_REFRESH_MS,
 )
-from widgets.currency_balance import CurrencyBalanceBar
 
 
 class AccountBar(QWidget):
@@ -53,7 +52,9 @@ class AccountBar(QWidget):
         self._update_clock()
 
     def _build_ui(self):
-        self.setFixedHeight(36)
+        # 两行布局: 窄屏下单行排不下会截断, 故把账户名与时钟下移到第二行,
+        # 第一行只放资金摘要。币种余额条已移除 (按需可经 on_currency_balance 重新接回)。
+        self.setFixedHeight(56)
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {COLOR_BG_DARK};
@@ -61,58 +62,72 @@ class AccountBar(QWidget):
             }}
         """)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 2, 12, 2)
-        layout.setSpacing(20)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 2, 12, 2)
+        outer.setSpacing(2)
 
-        # Account label
-        self.account_label = QLabel("账户: --")
-        self.account_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
-        layout.addWidget(self.account_label)
-
-        # Separator
-        layout.addWidget(self._make_sep())
+        # ── 第一行: 资金摘要 (总资产 / 可用 / 购买力 / 未实现 / 今日盈亏 / 手续费) ──
+        row1 = QHBoxLayout()
+        row1.setSpacing(20)
 
         # Net liquidation
         self.net_liq_label = QLabel("总资产: --")
         self.net_liq_label.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px; font-weight: bold; border: none;")
-        layout.addWidget(self.net_liq_label)
+        row1.addWidget(self.net_liq_label)
 
-        layout.addWidget(self._make_sep())
+        row1.addWidget(self._make_sep())
 
         # Total cash
         self.cash_label = QLabel("可用资金: --")
         self.cash_label.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px; border: none;")
-        layout.addWidget(self.cash_label)
+        row1.addWidget(self.cash_label)
 
-        layout.addWidget(self._make_sep())
+        row1.addWidget(self._make_sep())
 
         # Buying power
         self.bp_label = QLabel("购买力: --")
         self.bp_label.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px; border: none;")
-        layout.addWidget(self.bp_label)
+        row1.addWidget(self.bp_label)
 
-        layout.addWidget(self._make_sep())
+        row1.addWidget(self._make_sep())
 
         # Unrealized P&L
         self.unrealized_label = QLabel("未实现盈亏: --")
         self.unrealized_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
-        layout.addWidget(self.unrealized_label)
+        row1.addWidget(self.unrealized_label)
 
-        layout.addWidget(self._make_sep())
+        row1.addWidget(self._make_sep())
 
         # Daily P&L
         self.daily_pnl_label = QLabel("今日盈亏: --")
         self.daily_pnl_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
-        layout.addWidget(self.daily_pnl_label)
+        row1.addWidget(self.daily_pnl_label)
 
-        layout.addWidget(self._make_sep())
+        row1.addWidget(self._make_sep())
 
-        # Per-currency cash balances (EUR/USD/...)
-        self.currency_bar = CurrencyBalanceBar()
-        layout.addWidget(self.currency_bar)
+        # 今日总手续费 — 来自 computed_daily_pnl 信号的手续费分量
+        # (真实模式: IBKR commissionReport 按 execId 去重、日内累计、跨日清零;
+        #  模拟模式: 各笔成交估算佣金累计)。
+        self.comm_label = QLabel("今日手续费: --")
+        self.comm_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;"
+        )
+        self.comm_label.setToolTip("今日累计手续费 (round-trip 双边均计)")
+        row1.addWidget(self.comm_label)
 
-        layout.addStretch()
+        row1.addStretch()
+        outer.addLayout(row1)
+
+        # ── 第二行: 账户名 (左) + 美东时钟 (右) ──
+        row2 = QHBoxLayout()
+        row2.setSpacing(20)
+
+        # Account label
+        self.account_label = QLabel("账户: --")
+        self.account_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
+        row2.addWidget(self.account_label)
+
+        row2.addStretch()
 
         # 美东时间实时时钟 (替代原「换汇」按钮)
         self.clock_label = QLabel("🕐 --:--:--")
@@ -121,7 +136,9 @@ class AccountBar(QWidget):
             f"border: none; font-family: 'Consolas', 'Menlo', monospace;"
         )
         self.clock_label.setToolTip("美东时间 (America/New_York)")
-        layout.addWidget(self.clock_label)
+        row2.addWidget(self.clock_label)
+
+        outer.addLayout(row2)
 
     def _make_sep(self) -> QFrame:
         sep = QFrame()
@@ -141,9 +158,6 @@ class AccountBar(QWidget):
     def stop(self):
         """Stop periodic refresh."""
         self._refresh_timer.stop()
-        # Clear per-currency balances so a disconnect / account switch doesn't
-        # leave a stale EUR/USD reading on screen.
-        self.currency_bar.clear_balances()
         # 让重连后账户摘要的未实现盈亏可再次作初始回退, 直到新的 reqPnL 流接管。
         self._unrealized_from_stream = False
         # 重连会重新拉取当日成交/手续费重算, 先清零避免叠加旧会话的值。
@@ -157,13 +171,16 @@ class AccountBar(QWidget):
             (self.net_liq_label, "总资产: --"),
             (self.cash_label, "可用资金: --"),
             (self.bp_label, "购买力: --"),
+            (self.comm_label, "今日手续费: --"),
         ):
             lab.setText(txt)
             lab.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
 
     def on_currency_balance(self, currency: str, cash: float):
-        """Forward a per-currency cash balance to the embedded display."""
-        self.currency_bar.on_balance(currency, cash)
+        """各币种现金余额槽 — 币种显示条已从账户栏移除, 这里保留空槽以免改动
+        主窗口的信号接线 (currency_balance_updated → 此槽)。数据仍在引擎侧流动,
+        将来要恢复显示时在此重新渲染即可。"""
+        return
 
     def update_account(self, tag: str, value: str, currency: str, account: str):
         """Handle account_summary_updated signal."""
@@ -200,9 +217,21 @@ class AccountBar(QWidget):
             self._realized_pnl = val
 
     def on_computed_daily(self, total: float, commission: float):
-        """已弃用: 自算今日盈亏会在成交/持仓与账户不匹配时严重出错(曾误显示巨额盈利)。
-        今日盈亏改回直接用 IBKR 的 dailyPnL(由 update_daily_pnl 驱动)。"""
-        return
+        """今日盈亏部分已弃用 (自算在成交/持仓与账户不匹配时会严重出错, 曾误显示巨额盈利,
+        今日盈亏改回直接用 IBKR 的 dailyPnL, 由 update_daily_pnl 驱动)。
+        但**手续费分量仍可信** (真实模式来自 IBKR commissionReport 按 execId 去重、日内
+        累计、跨日清零), 用它驱动右上角「今日手续费」显示。"""
+        try:
+            comm = float(commission)
+        except (ValueError, TypeError):
+            return
+        if math.isnan(comm) or abs(comm) > 1e300:
+            return
+        self._today_commission = comm
+        self.comm_label.setText(f"今日手续费: ${comm:,.2f}")
+        self.comm_label.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 12px; font-weight: bold; border: none;"
+        )
 
     def update_daily_pnl(self, daily: float, unrealized: float, realized: float):
         """Handle pnl_updated signal. 今日盈亏 = IBKR reqPnL 的 dailyPnL;

@@ -412,6 +412,10 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-07-09** — **修退出崩溃: OptionChartWindow 缺 `cleanup()`**。主窗口 closeEvent 对
+  `_chart_windows` 里所有图表统一调 `cleanup()`, 期权分时图窗口只有 closeEvent 没有该方法 →
+  开着期权分时图退出程序时 AttributeError, 后续 cond_manager/engine 的清理与断开被跳过
+  (18:13 实盘日志捕获)。补 `cleanup()`(停轮询+丢弃迟到数据)。(`widgets/option_chart_window.py`)
 - **2026-07-09** — **修条件单三缺陷 (实盘拒单日志定位)**。7/9 实测: 标的价条件单触发正常,
   但用户已手动平仓 → 照原数量发市价卖单 = 开裸空 → IBKR 201 保证金拒单; 另有 7/8 已到期的
   TSLA 条件单残留、次日标的到价时触发被拒 "Order is already expired", 且同一条件被重复挂两条。

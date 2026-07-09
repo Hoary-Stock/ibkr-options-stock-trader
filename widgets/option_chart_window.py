@@ -281,6 +281,13 @@ class OptionChartWindow(QMainWindow):
 
     # ── 生命周期 ──────────────────────────────────────────────────────
 
+    def cleanup(self):
+        """与 ChartWindow 同名接口 — 主窗口 closeEvent 对 `_chart_windows`
+        里所有图表统一调用 (缺此方法曾致退出时 AttributeError, 后续
+        cond_manager/engine 清理被跳过)。"""
+        self._closed = True
+        self._timer.stop()
+
     def closeEvent(self, event):
         self._closed = True
         self._timer.stop()

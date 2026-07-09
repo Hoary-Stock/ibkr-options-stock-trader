@@ -48,6 +48,23 @@ def _beep(is_buy: bool):
         pass
 
 
+def play_alert():
+    """自选到价警报音 (非阻塞): sounds/ALERT.(wav|mp3) 优先, 否则三连高音蜂鸣。"""
+    def run():
+        path = _find("ALERT")
+        try:
+            if path:
+                _play_file(path)
+            else:
+                import winsound
+                for _ in range(3):
+                    winsound.Beep(1568, 130)   # G6 三连音, 与成交音区分
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True, name="watch-alert-sound").start()
+
+
 def play_fill(side: str):
     """成交时播放提示音 (非阻塞)。
 

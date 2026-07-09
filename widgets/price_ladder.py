@@ -311,6 +311,7 @@ class PriceLadder(QWidget):
     conditional_requested = pyqtSignal(object)         # dict: 止盈/止损条件单请求
     conditional_cancel_requested = pyqtSignal(int)     # cond_id
     option_loaded = pyqtSignal()                       # set_option 后 (刷新条件单显示)
+    watch_requested = pyqtSignal(object)               # OptionInfo: 加入自选监控
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -334,6 +335,12 @@ class PriceLadder(QWidget):
         # Cache last known valid bid/ask to survive momentary data gaps
         self._last_bid = 0.0
         self._last_ask = 0.0
+        # 同理缓存盘口量与深度档 (IBKR 深度流空档/size 推 0 时红绿量条会整体
+        # 消失几秒; 无新数据时保持上一份盘口显示, 换合约才清)
+        self._last_bid_sz = 0
+        self._last_ask_sz = 0
+        self._last_bid_map: dict[float, int] = {}
+        self._last_ask_map: dict[float, int] = {}
 
         # 滚轮滚到边缘时自动扩展档位; 该标志在扩展/复位滚动条期间屏蔽重入
         self._extending = False
@@ -697,6 +704,30 @@ class PriceLadder(QWidget):
         self.scroll_area.verticalScrollBar().valueChanged.connect(
             self._on_ladder_scrolled
         )
+
+        # ── 左下角: 把当前合约加入自选监控 (watch list) ──
+        watch_row = QHBoxLayout()
+        watch_row.setContentsMargins(0, 2, 0, 0)
+        self.watch_btn = QPushButton("☆ 加自选")
+        self.watch_btn.setFixedHeight(22)
+        self.watch_btn.setCursor(Qt.PointingHandCursor)
+        self.watch_btn.setToolTip("把当前合约加入右侧「自选监控」(实时看价, 可设到价警报)")
+        self.watch_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_BG_DARK}; color: {COLOR_TEXT_DIM};
+                border: 1px solid {COLOR_BORDER}; border-radius: 3px;
+                padding: 1px 10px; font-size: 11px;
+            }}
+            QPushButton:hover {{ color: {COLOR_TEXT}; border-color: {COLOR_TEXT_DIM}; }}
+        """)
+        self.watch_btn.clicked.connect(self._on_watch_clicked)
+        watch_row.addWidget(self.watch_btn)
+        watch_row.addStretch()
+        main_layout.addLayout(watch_row)
+
+    def _on_watch_clicked(self):
+        if self._option is not None:
+            self.watch_requested.emit(self._option)
 
     def _make_pos_label(self, title: str, value: str) -> tuple[QLabel, QLabel]:
         title_lbl = QLabel(title)
@@ -1070,6 +1101,10 @@ class PriceLadder(QWidget):
         self._depth_available = False
         self._last_bid = 0.0
         self._last_ask = 0.0
+        self._last_bid_sz = 0
+        self._last_ask_sz = 0
+        self._last_bid_map = {}
+        self._last_ask_map = {}
 
         if self._engine:
             # 退订旧行情 + 订阅新行情都走后台线程: 这些是 IBKR socket 调用,
@@ -1320,14 +1355,33 @@ class PriceLadder(QWidget):
         # Always ensure current bid/ask from tick data are visible
         # (unconditional — overrides or fills in depth gaps)
         # Snap to tick grid so the key matches row.price exactly.
-        bid_sz = tick.get("bid_size", 0)
-        ask_sz = tick.get("ask_size", 0)
+        # 盘口量为 0/缺失时沿用上次有效值 (数据空档不清红绿量条)
+        bid_sz = tick.get("bid_size", 0) or 0
+        ask_sz = tick.get("ask_size", 0) or 0
+        if bid_sz > 0:
+            self._last_bid_sz = bid_sz
+        else:
+            bid_sz = self._last_bid_sz
+        if ask_sz > 0:
+            self._last_ask_sz = ask_sz
+        else:
+            ask_sz = self._last_ask_sz
         if bid > 0:
             bid_key = snap(bid)
             bid_depth_map[bid_key] = max(bid_depth_map.get(bid_key, 0), bid_sz, 1)
         if ask > 0:
             ask_key = snap(ask)
             ask_depth_map[ask_key] = max(ask_depth_map.get(ask_key, 0), ask_sz, 1)
+
+        # 深度档整体空档 (L2 流批量 delete / 断流) → 保持上一份盘口, 有新数据才替换
+        if bid_depth_map:
+            self._last_bid_map = dict(bid_depth_map)
+        elif self._last_bid_map:
+            bid_depth_map = self._last_bid_map
+        if ask_depth_map:
+            self._last_ask_map = dict(ask_depth_map)
+        elif self._last_ask_map:
+            ask_depth_map = self._last_ask_map
 
         max_bid = max((s for s in bid_depth_map.values()), default=1)
         max_ask = max((s for s in ask_depth_map.values()), default=1)

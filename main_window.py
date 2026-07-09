@@ -22,6 +22,7 @@ from models import OptionInfo, OrderAction, OrderType, TradingMode
 from ibkr_engine import IBKREngine
 from paper_engine import PaperEngine
 from conditional_orders import ConditionalOrderManager
+from watchlist import WatchListManager
 from sound_alerts import play_fill
 from widgets.symbol_bar import SymbolBar
 from widgets.option_chain import OptionChainWidget
@@ -31,6 +32,7 @@ from widgets.order_panel import OrderPanel
 from widgets.account_bar import AccountBar
 from widgets.option_calculator import OptionCalculator
 from widgets.strategy_window import StrategyPanel
+from widgets.watch_panel import WatchPanel
 # ChartWindow is imported lazily (first chart open) — it pulls in
 # numpy + pyqtgraph (~25MB), which shouldn't load at startup
 
@@ -167,6 +169,14 @@ class MainWindow(QMainWindow):
             positions_ready=lambda: self._active_engine.positions_synced,
         )
 
+        # 自选监控 (watch list): 实时看价 + 到价警报, 持久化 watchlist.json
+        self.watch_manager = WatchListManager(self)
+        self.watch_manager.configure(
+            get_tick=lambda key: self._active_engine.get_tick(key),
+            subscribe=lambda opt: self._active_engine.subscribe_option_tick(opt),
+            unsubscribe=lambda req_id: self._active_engine.unsubscribe_tick(req_id),
+        )
+
         self._current_symbol = "SPY"
         self._current_option: OptionInfo | None = None
         self._instrument = "OPT"   # "OPT"(默认) / "STK" / "FUT"
@@ -274,10 +284,16 @@ class MainWindow(QMainWindow):
         self.right_splitter.setChildrenCollapsible(False)
         self.bottom_splitter.addWidget(self.right_splitter)
 
-        self.bottom_splitter.setSizes([380, 500])
-        # 下方横向: 点价梯与右侧面板按 4:5 比例联动缩放
+        # 最右: 自选监控面板 (实时价 + 到价警报)
+        self.watch_panel = WatchPanel()
+        self.watch_panel.set_manager(self.watch_manager)
+        self.bottom_splitter.addWidget(self.watch_panel)
+
+        self.bottom_splitter.setSizes([380, 500, 220])
+        # 下方横向: 点价梯 / 持仓委托 / 自选监控 按 4:5:2 比例联动缩放
         self.bottom_splitter.setStretchFactor(0, 4)
         self.bottom_splitter.setStretchFactor(1, 5)
+        self.bottom_splitter.setStretchFactor(2, 2)
         self.bottom_splitter.setChildrenCollapsible(False)
         self.main_splitter.addWidget(self.bottom_splitter)
 
@@ -340,6 +356,10 @@ class MainWindow(QMainWindow):
         self.cond_manager.triggered.connect(self._on_conditional_triggered)
         self.cond_manager.failed.connect(self._on_conditional_failed)
         self.cond_manager.voided.connect(self._on_conditional_voided)
+
+        # 自选监控
+        self.price_ladder.watch_requested.connect(self._on_watch_add)
+        self.watch_manager.alerted.connect(self._on_watch_alerted)
         # 点价梯换合约后刷新该合约的条件单显示
         self.price_ladder.option_loaded.connect(self._refresh_conditionals)
 
@@ -469,6 +489,8 @@ class MainWindow(QMainWindow):
 
         # 恢复本地条件单 (从磁盘) 并重新订阅各合约行情
         self.cond_manager.resume()
+        # 恢复自选监控 (加载时自动清理过期合约) 并订阅行情
+        self.watch_manager.resume()
 
         # 按当前交易品种加载 (期权链 / 正股伪合约 / 期货合约)
         self._load_current_instrument()
@@ -480,6 +502,7 @@ class MainWindow(QMainWindow):
         self.account_bar.stop()
         # 退订条件单行情 (保留条件单本身, 重连后 resume)
         self.cond_manager.suspend()
+        self.watch_manager.suspend()
         self.statusBar().setStyleSheet(
             f"QStatusBar {{ color: {COLOR_RED}; }}"
         )
@@ -1232,6 +1255,23 @@ class MainWindow(QMainWindow):
             f"({cond.option.display_name}) 已自动作废: {reason}"
         )
 
+    # ── 自选监控 (watch list) ─────────────────────────────────────────
+
+    def _on_watch_add(self, option: OptionInfo):
+        if not self.ibkr_engine.is_connected:
+            self.statusBar().showMessage("未连接 — 无法加自选")
+            return
+        if self.watch_manager.add(option):
+            self.statusBar().showMessage(
+                f"已加入自选监控: {option.display_name} (右侧面板可设到价警报)")
+        else:
+            self.statusBar().showMessage(f"{option.display_name} 已在自选列表中")
+
+    def _on_watch_alerted(self, item, direction: str, price: float):
+        sign = "≥ 高于" if direction == "above" else "≤ 低于"
+        self.statusBar().showMessage(
+            f"⚠ 到价警报: {item.option.display_name} 现价 {price:.2f} {sign}警报价")
+
     # ── Chart Window ─────────────────────────────────────────────────
 
     def _on_open_chart(self):
@@ -1545,6 +1585,8 @@ class MainWindow(QMainWindow):
         self.strategy_panel.cleanup()
 
         self.cond_manager.cleanup()
+        self.watch_manager.cleanup()
+        self.watch_panel.cleanup()
         self.account_bar.cleanup()
         self.option_chain.cleanup()
         self.price_ladder.cleanup()

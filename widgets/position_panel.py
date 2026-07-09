@@ -224,7 +224,12 @@ class PositionPanel(QWidget):
                 "market_value": pp.market_value,
                 "pnl": pp.unrealized_pnl,
                 "pnl_pct": pp.pnl_pct,
-                "commission": 0,  # IBKR portfolio positions don't track commission locally
+                "commission": (
+                    # 真实引擎: 该合约今日实际佣金 (commissionReport 按 execId 去重);
+                    # 旧实现硬编码 0 → 「费$」后缀从不显示
+                    self._engine.get_position_commission(key)
+                    if hasattr(self._engine, "get_position_commission") else 0
+                ),
                 "daily": pp.daily_pnl if pp.has_pnl_data else None,
                 "has_pnl": pp.has_pnl_data,  # API 持仓: reqPnLSingle 到达前显示"--"而非 0
                 "option": None,

@@ -17,7 +17,7 @@ import threading
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QScrollArea, QFrame,
-    QLineEdit, QCheckBox, QMessageBox, QSpinBox, QDoubleSpinBox,
+    QLineEdit, QCheckBox, QMessageBox, QSpinBox, QDoubleSpinBox, QComboBox,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QBrush, QFont
@@ -528,7 +528,7 @@ class PriceLadder(QWidget):
         self.cond_toggle_btn.setCheckable(True)
         self.cond_toggle_btn.setFixedHeight(24)
         self.cond_toggle_btn.setCursor(Qt.PointingHandCursor)
-        self.cond_toggle_btn.setToolTip("挂止盈/止损条件单(到价才发限价单到 IBKR)")
+        self.cond_toggle_btn.setToolTip("挂止盈/止损条件单, 或标的价触发市价卖出(本地监控, 到价才发单)")
         self.cond_toggle_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {COLOR_BG_DARK}; color: {COLOR_ACCENT};
@@ -816,6 +816,35 @@ class PriceLadder(QWidget):
         sl_row.addStretch()
         v.addLayout(sl_row)
 
+        # 标的价触发行 (监控标的价 → 到价市价卖出该期权; 仅期权适用)
+        self.ul_row_widget = QWidget()
+        self.ul_row_widget.setStyleSheet("border: none;")
+        ul_row = QHBoxLayout(self.ul_row_widget)
+        ul_row.setContentsMargins(0, 0, 0, 0)
+        ul_row.setSpacing(4)
+        self.ul_check = QCheckBox("标的价")
+        self.ul_check.setToolTip(
+            "监控**标的**价格(如 SPX), 到达触发价即对本期权发**市价卖出**(按下方「数量」)。\n"
+            "例: 买了 SPX 7500C, 设「≥ 7510」→ SPX 涨到 7510 自动市价卖出。\n"
+            "本地监控(仅程序运行时有效), 触发后走市价单。"
+        )
+        self.ul_check.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 11px; font-weight: bold; border: none;")
+        ul_row.addWidget(self.ul_check)
+        self.ul_dir_combo = QComboBox()
+        self.ul_dir_combo.addItem("≥ 涨到", "UP")
+        self.ul_dir_combo.addItem("≤ 跌到", "DOWN")
+        self.ul_dir_combo.setFixedWidth(76)
+        self.ul_dir_combo.setStyleSheet(
+            f"QComboBox {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 3px; padding: 2px; }}"
+        )
+        ul_row.addWidget(self.ul_dir_combo)
+        self.ul_price_spin = _price_spin()
+        ul_row.addWidget(self.ul_price_spin)
+        ul_row.addWidget(QLabel("→市价卖"))
+        ul_row.addStretch()
+        v.addWidget(self.ul_row_widget)
+
         # 数量 + 原生 + 挂单
         opt_row = QHBoxLayout()
         opt_row.addWidget(QLabel("数量"))
@@ -876,6 +905,12 @@ class PriceLadder(QWidget):
         其它=「触发价」(绝对价)。仅改标签与提示, 不动已填数值。"""
         if not hasattr(self, "_tp_price_label"):
             return
+        # 标的价触发行仅期权适用 (监控标的价卖出期权); 期货/正股隐藏
+        is_opt = self._option is not None and self._option.right in ("C", "P")
+        if hasattr(self, "ul_row_widget"):
+            self.ul_row_widget.setVisible(is_opt)
+            if not is_opt:
+                self.ul_check.setChecked(False)
         if self._is_futures():
             self._tp_price_label.setText("止盈 +点")
             self._sl_price_label.setText("止损 -点")
@@ -924,6 +959,14 @@ class PriceLadder(QWidget):
                     self.tp_price_spin.setValue(round(cur * 1.2, 2))
                 if self.sl_price_spin.value() == 0:
                     self.sl_price_spin.setValue(round(cur * 0.85, 2))
+            # 标的价触发: 用当前标的价播种, 方向按 CALL=涨到/PUT=跌到 默认
+            if self._option.right in ("C", "P"):
+                self.ul_dir_combo.setCurrentIndex(1 if self._option.right == "P" else 0)
+                und = self._engine.get_tick(f"__stock__{self._option.symbol}")
+                und_px = und.get("last", 0) or ((und.get("bid", 0) + und.get("ask", 0)) / 2
+                                                if und.get("bid") and und.get("ask") else 0)
+                if und_px > 0 and self.ul_price_spin.value() == 0:
+                    self.ul_price_spin.setValue(round(und_px, 2))
 
     def _on_arm_conditional(self):
         if not self._option:
@@ -931,11 +974,13 @@ class PriceLadder(QWidget):
             return
         tp_on = self.tp_check.isChecked()
         sl_on = self.sl_check.isChecked()
-        if not tp_on and not sl_on:
-            QMessageBox.warning(self, "未勾选", "请至少勾选「止盈」或「止损」其中之一")
+        ul_on = self.ul_check.isChecked() and not self._is_futures()
+        if not tp_on and not sl_on and not ul_on:
+            QMessageBox.warning(self, "未勾选", "请至少勾选「止盈」/「止损」/「标的价」其中之一")
             return
         tp_price = round(self.tp_price_spin.value(), 2)
         sl_price = round(self.sl_price_spin.value(), 2)
+        ul_price = round(self.ul_price_spin.value(), 2)
         by_points = self._is_futures()
         unit = "点数" if by_points else "触发价"
         if tp_on and tp_price <= 0:
@@ -944,9 +989,14 @@ class PriceLadder(QWidget):
         if sl_on and sl_price <= 0:
             QMessageBox.warning(self, "止损无效", f"请填写止损{unit}")
             return
+        if ul_on and ul_price <= 0:
+            QMessageBox.warning(self, "标的价无效", "请填写标的触发价")
+            return
         self.conditional_requested.emit({
             "tp_on": tp_on, "tp_price": tp_price,
             "sl_on": sl_on, "sl_price": sl_price,
+            "ul_on": ul_on, "ul_price": ul_price,
+            "ul_dir": self.ul_dir_combo.currentData(),
             "qty": self.cond_qty_spin.value(),
             "native": self.cond_native_check.isChecked(),
             "outside_rth": self.get_outside_rth(),
@@ -967,10 +1017,20 @@ class PriceLadder(QWidget):
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(4)
-            color = COLOR_GREEN if c.kind == "TP" else COLOR_RED
-            arrow = "≥" if c.kind == "TP" else "≤"
-            lbl = QLabel(f"{c.kind_label} SELL {c.quantity} {arrow}{c.trigger_price:.2f} "
-                         f"→限{c.limit_price:.2f} [本地]")
+            if c.kind == "UL":
+                color = COLOR_ACCENT
+            elif c.kind == "TP":
+                color = COLOR_GREEN
+            else:
+                color = COLOR_RED
+            arrow = "≥" if c._trigger_dir() == "UP" else "≤"
+            if c.kind == "UL":
+                # 标的价触发 → 市价卖出
+                lbl = QLabel(f"标的 {arrow}{c.trigger_price:.2f} → 市价卖 {c.quantity} [本地]")
+            else:
+                dst = "市价" if c.market else f"限{c.limit_price:.2f}"
+                lbl = QLabel(f"{c.kind_label} SELL {c.quantity} {arrow}{c.trigger_price:.2f} "
+                             f"→{dst} [本地]")
             lbl.setStyleSheet(f"color: {color}; font-size: 10px; border: none;")
             h.addWidget(lbl)
             h.addStretch()
@@ -1386,9 +1446,12 @@ class PriceLadder(QWidget):
                     f"color: {color}; font-size: 12px; font-weight: bold; border: none;"
                 )
 
-                # Commission
+                # Commission — 经引擎统一接口取: 真实模式=该合约今日实际佣金
+                # (commissionReport); 模拟模式=本地估算累计。旧实现读
+                # pos.total_commission, 真实模式恒 0 (get_position 不填佣金)。
                 _, comm_val = self.pos_unrealized_label
-                comm = pos.total_commission
+                get_comm = getattr(self._engine, "get_position_commission", None)
+                comm = get_comm(key) if get_comm else pos.total_commission
                 comm_val.setText(f"-{comm:.2f}")
                 comm_val.setStyleSheet(
                     f"color: {COLOR_TEXT_DIM}; font-size: 12px; font-weight: bold; border: none;"

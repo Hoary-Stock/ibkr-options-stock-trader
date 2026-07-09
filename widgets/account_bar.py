@@ -37,6 +37,10 @@ class AccountBar(QWidget):
         # (其常为 -- / 未含费)。computed_daily_pnl 信号送来 (已扣费总额, 今日手续费)。
         self._daily_computed = None     # 自算今日盈亏 (已扣费)
         self._today_commission = 0.0    # 今日累计手续费 (仅用于标注)
+        # reqPnL 流是否给出过**有效的 dailyPnL**。给出过就不再用 已实现+未实现 兜底:
+        # 两者口径不同 (dailyPnL 较昨收; 兜底把隔夜仓的历史浮亏也算进"今日"),
+        # dailyPnL 偶尔推 DBL_MAX(NaN) 时若切去兜底, 显示会在两个数之间跳。
+        self._daily_from_stream = False
 
         self._build_ui()
 
@@ -101,6 +105,11 @@ class AccountBar(QWidget):
         # Daily P&L
         self.daily_pnl_label = QLabel("今日盈亏: --")
         self.daily_pnl_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 12px; border: none;")
+        self.daily_pnl_label.setToolTip(
+            "IBKR dailyPnL: 较昨日收盘的今日盈亏 (已含手续费)。\n"
+            "含隔夜仓今日的价格变动, 但不含其今日之前的浮盈亏 —\n"
+            "所以可能 ≠ 已实现+未实现 (后者按开仓成本算)。"
+        )
         row1.addWidget(self.daily_pnl_label)
 
         row1.addWidget(self._make_sep())
@@ -160,6 +169,7 @@ class AccountBar(QWidget):
         self._refresh_timer.stop()
         # 让重连后账户摘要的未实现盈亏可再次作初始回退, 直到新的 reqPnL 流接管。
         self._unrealized_from_stream = False
+        self._daily_from_stream = False
         # 重连会重新拉取当日成交/手续费重算, 先清零避免叠加旧会话的值。
         self._today_commission = 0.0
         self._daily_computed = None
@@ -234,11 +244,15 @@ class AccountBar(QWidget):
         )
 
     def update_daily_pnl(self, daily: float, unrealized: float, realized: float):
-        """Handle pnl_updated signal. 今日盈亏 = IBKR reqPnL 的 dailyPnL;
-        **实测本账户 dailyPnL 常年不可用(DBL_MAX→NaN), 故用 已实现+未实现 兜底**
-        (IBKR 的 realizedPnL 已含手续费)。NaN 时保留上一次好值, 避免闪烁/归 0。"""
+        """Handle pnl_updated signal. 今日盈亏 = IBKR reqPnL 的 dailyPnL (较昨收, 含费);
+        dailyPnL 不可用(DBL_MAX→NaN)且**本会话从未有效过**时才用 已实现+未实现 兜底
+        (IBKR 的 realizedPnL 已含手续费)。一旦 dailyPnL 有效过, NaN 时保留上一次
+        dailyPnL 好值、不再切兜底 —— 兜底口径不同 (它把隔夜仓在今日之前的浮亏
+        也算进"今日"), 两口径混用会让今日盈亏在两个相差很大的数之间跳。"""
         eff_daily = daily
-        if math.isnan(eff_daily) and not math.isnan(realized):
+        if not math.isnan(daily):
+            self._daily_from_stream = True
+        elif not self._daily_from_stream and not math.isnan(realized):
             eff_daily = realized + (0.0 if math.isnan(unrealized) else unrealized)
         if not math.isnan(eff_daily):
             self._daily_pnl = eff_daily

@@ -30,6 +30,7 @@ class OptionChainWidget(QWidget):
     """T-shaped option chain with expiry tabs and date range filter."""
 
     option_selected = pyqtSignal(object)  # OptionInfo
+    chart_requested = pyqtSignal(object)  # OptionInfo — 双击合约: 打开今日 1 分钟图
     # 后台 reqContractDetails 取到某到期日真实行权价后, 回到 GUI 线程填表
     _strikes_ready = pyqtSignal(str, str, object, bool)  # symbol, expiry, strikes, ok
     _momentum_ready = pyqtSignal(object)  # ES 动量翻转 state (compute_flip 结果或 None)
@@ -507,6 +508,10 @@ class OptionChainWidget(QWidget):
                 header.setSectionResizeMode(i, QHeaderView.Stretch)
 
         table.cellClicked.connect(lambda r, c: self._on_cell_clicked(table, r, c))
+        # 双击 → 该期权今日 1 分钟图 (双击的首次单击已按单击处理, 载入点价梯不冲突)
+        table.cellDoubleClicked.connect(
+            lambda r, c: self._on_cell_double_clicked(table, r, c)
+        )
         # 滚动该到期日表 → 去抖后只对新进入视口的行拉快照 (省行情线)
         table.verticalScrollBar().valueChanged.connect(self._on_table_scrolled)
         return table
@@ -834,15 +839,15 @@ class OptionChainWidget(QWidget):
                     opt.ask = tick.get("ask", 0)
                     opt.last = tick.get("last", 0)
 
-    def _on_cell_clicked(self, table: QTableWidget, row: int, col: int):
-        """Click on a cell -> emit option_selected."""
+    def _option_at(self, table: QTableWidget, row: int, col: int):
+        """按表格 (row, col) 解析出对应 OptionInfo (左侧列=Call, 右侧列=Put)。"""
         strikes = getattr(table, "_strikes", self._strikes)
         if row < 0 or row >= len(strikes):
-            return
+            return None
 
         idx = self.tab_widget.currentIndex()
         if idx < 0 or idx >= len(self._expirations):
-            return
+            return None
 
         strike = strikes[row]
         expiry = self._expirations[idx]
@@ -856,9 +861,19 @@ class OptionChainWidget(QWidget):
             right = "C"  # Strike column -> default to Call
 
         key = f"{self._symbol}_{expiry}_{right}_{strike}"
-        opt = self._options.get(key)
+        return self._options.get(key)
+
+    def _on_cell_clicked(self, table: QTableWidget, row: int, col: int):
+        """Click on a cell -> emit option_selected."""
+        opt = self._option_at(table, row, col)
         if opt:
             self.option_selected.emit(opt)
+
+    def _on_cell_double_clicked(self, table: QTableWidget, row: int, col: int):
+        """双击合约 -> 打开该期权今日 1 分钟图。"""
+        opt = self._option_at(table, row, col)
+        if opt:
+            self.chart_requested.emit(opt)
 
     def update_stock_price(self, price: float):
         """Update ATM highlighting when stock price changes."""

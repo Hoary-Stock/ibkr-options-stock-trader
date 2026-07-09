@@ -259,40 +259,78 @@ class ComboLegInfo:
 
 @dataclass
 class ConditionalOrder:
-    """本地/原生「条件单」(止盈 TP / 止损 SL)。
+    """本地/原生「条件单」(止盈 TP / 止损 SL / 标的价触发 UL)。
 
-    含义:价格到达 trigger_price 后,挂出一张 limit_price 的限价单。
-    - native=False(本地): 到价前**不发到 IBKR**,由本程序监控现价、到价才提交限价单
+    含义:监控价格到达 trigger_price 后,挂出一张卖单(限价或市价)。
+    - native=False(本地): 到价前**不发到 IBKR**,由本程序监控现价、到价才提交订单
       (规避「同合约不能双向挂单」201, 但只在程序运行时有效)。
     - native=True: 立即用 IBKR 原生 STP LMT 挂到服务器(关程序也有效, 受 201 限制)。
 
-    TP(止盈): 现价 **>=** trigger 时触发(向上); SL(止损): 现价 **<=** trigger 时触发(向下)。
+    **监控哪只价格 (`watch`)**:
+    - ``"SELF"`` (默认): 监控**期权自身**价格 (止盈/止损用)。
+    - ``"UNDER"``: 监控**标的**价格 (如买了 SPX 7500C, 标的 SPX 到 7510 就卖)。
+
+    **触发方向 (`direction`)**: ``"UP"`` = 现价 **>=** trigger; ``"DOWN"`` = 现价 **<=** trigger。
+    为空时按 kind 推导 (TP=UP 向上 / SL=DOWN 向下)。
+
+    **下单类型 (`market`)**: False=限价单 (limit_price); True=市价单 (忽略 limit_price)。
+
     当前面向「平多」: action 固定 SELL(可后续扩展买入侧)。
     """
     cond_id: int
     option: "OptionInfo"
-    kind: str                 # "TP"(止盈) / "SL"(止损)
+    kind: str                 # "TP"(止盈) / "SL"(止损) / "UL"(标的价触发)
     action: str = "SELL"      # 平多 → 卖出
     trigger_price: float = 0.0
-    limit_price: float = 0.0   # 触发后挂的限价 (默认 = trigger_price)
+    limit_price: float = 0.0   # 触发后挂的限价 (market=True 时忽略)
     quantity: int = 1
     native: bool = False       # True=IBKR 原生 STP LMT; False=本地监控
     outside_rth: bool = False
+    watch: str = "SELF"        # "SELF"=监控期权自身价 / "UNDER"=监控标的价
+    direction: str = ""        # "UP"(>=) / "DOWN"(<="); 空则按 kind 推导
+    market: bool = False       # True=触发后发市价单; False=限价单
     armed_time: datetime = field(default_factory=datetime.now)
 
     @property
     def key(self) -> str:
+        """分组键 (按期权归类, 供点价梯列表筛选/显示)。"""
+        return self.option.to_ibkr_key()
+
+    @property
+    def watch_key(self) -> str:
+        """**监控**行情用的 key: 标的触发看标的 (`__stock__SYM`), 否则看期权自身。"""
+        if self.watch == "UNDER":
+            return f"__stock__{self.option.symbol}"
         return self.option.to_ibkr_key()
 
     @property
     def kind_label(self) -> str:
-        return "止盈" if self.kind == "TP" else "止损"
+        return {"TP": "止盈", "SL": "止损", "UL": "标的价"}.get(self.kind, self.kind)
+
+    def _trigger_dir(self) -> str:
+        """实际触发方向: 显式 direction 优先, 否则按 kind 推导 (TP=UP / SL=DOWN)。"""
+        if self.direction in ("UP", "DOWN"):
+            return self.direction
+        return "UP" if self.kind == "TP" else "DOWN"
 
     def is_triggered(self, price: float) -> bool:
-        """现价是否已达触发条件 (TP 向上 / SL 向下)。"""
+        """现价是否已达触发条件 (UP 向上穿越 / DOWN 向下穿越)。"""
         if price <= 0:
             return False
-        return price >= self.trigger_price if self.kind == "TP" else price <= self.trigger_price
+        if self._trigger_dir() == "UP":
+            return price >= self.trigger_price
+        return price <= self.trigger_price
+
+    def is_expired(self, today: str) -> bool:
+        """期权合约是否已过期 (expiry 严格早于 today, 均为 YYYYMMDD)。
+
+        仅对期权判断; 正股 (expiry 空) / 期货 (YYYYMM) 不在此作废。
+        过期条件单若不清理, 会在之后某天标的到价时触发, 被 IBKR 以
+        "Order is already expired" 拒单。
+        """
+        o = self.option
+        return (o.right in ("C", "P") and len(o.expiry) == 8
+                and o.expiry < today)
 
     def to_dict(self) -> dict:
         o = self.option
@@ -304,6 +342,7 @@ class ConditionalOrder:
             "trigger_price": self.trigger_price, "limit_price": self.limit_price,
             "quantity": self.quantity, "native": self.native,
             "outside_rth": self.outside_rth,
+            "watch": self.watch, "direction": self.direction, "market": self.market,
         }
 
     @staticmethod
@@ -320,6 +359,8 @@ class ConditionalOrder:
             limit_price=d.get("limit_price", 0.0),
             quantity=d.get("quantity", 1), native=d.get("native", False),
             outside_rth=d.get("outside_rth", False),
+            watch=d.get("watch", "SELF"), direction=d.get("direction", ""),
+            market=d.get("market", False),
         )
 
 

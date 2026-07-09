@@ -89,6 +89,10 @@ class PaperEngine:
         return self._positions
 
     @property
+    def positions_synced(self) -> bool:
+        return True  # 本地撮合持仓即时可用, 无快照等待
+
+    @property
     def orders(self) -> dict[int, OrderInfo]:
         return self._orders
 
@@ -226,6 +230,12 @@ class PaperEngine:
                 pos.current_price = current
             total += pos.net_pnl
         return total
+
+    def get_position_commission(self, option_key: str) -> float:
+        """该合约累计估算佣金 (本地撮合每笔成交累计) — 与真实引擎同名接口,
+        供点价梯/持仓面板统一取「手续费」显示。"""
+        pos = self._positions.get(option_key)
+        return pos.total_commission if pos else 0.0
 
     def _calc_cost_basis(self) -> float:
         total = 0.0

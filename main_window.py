@@ -157,10 +157,14 @@ class MainWindow(QMainWindow):
         self.cond_manager = ConditionalOrderManager(self)
         self.cond_manager.configure(
             get_tick=lambda key: self._active_engine.get_tick(key),
-            place=lambda opt, action, lmt, qty, outside: self._place_order(
-                opt, OrderAction(action), OrderType.LIMIT, lmt, qty, outside),
+            place=lambda opt, action, lmt, qty, outside, market: self._place_order(
+                opt, OrderAction(action),
+                OrderType.MARKET if market else OrderType.LIMIT, lmt, qty, outside),
             subscribe=lambda opt: self._active_engine.subscribe_option_tick(opt),
             unsubscribe=lambda req_id: self._active_engine.unsubscribe_tick(req_id),
+            subscribe_under=lambda symbol: self._active_engine.subscribe_stock_tick(symbol),
+            get_position_qty=lambda key: self._active_engine.get_position_qty(key),
+            positions_ready=lambda: self._active_engine.positions_synced,
         )
 
         self._current_symbol = "SPY"
@@ -168,6 +172,8 @@ class MainWindow(QMainWindow):
         self._instrument = "OPT"   # "OPT"(默认) / "STK" / "FUT"
         self._future_expiries: list = []  # 当前期货标的的合约月份 [{expiry,con_id,...}]
         self._chart_windows: list = []  # list[ChartWindow]
+        # 期权 1 分图**单实例**: 双击新合约自动关掉旧合约的图 (停止其轮询取数)
+        self._option_chart = None  # OptionChartWindow | None
         # 限价开多后, 待成交回报再挂的止盈/止损: {entry_order_id: {option,qty,bracket,outside}}
         self._pending_buy_brackets: dict[int, dict] = {}
 
@@ -309,6 +315,8 @@ class MainWindow(QMainWindow):
 
         # Option chain -> price ladder
         self.option_chain.option_selected.connect(self._on_option_selected)
+        # Option chain 双击 -> 该期权今日 1 分钟图
+        self.option_chain.chart_requested.connect(self._on_open_option_chart)
 
         # Price ladder -> order (limit orders from price clicks)
         self.price_ladder.order_requested.connect(self._on_order_requested)
@@ -331,6 +339,7 @@ class MainWindow(QMainWindow):
         self.cond_manager.changed.connect(self._refresh_conditionals)
         self.cond_manager.triggered.connect(self._on_conditional_triggered)
         self.cond_manager.failed.connect(self._on_conditional_failed)
+        self.cond_manager.voided.connect(self._on_conditional_voided)
         # 点价梯换合约后刷新该合约的条件单显示
         self.price_ladder.option_loaded.connect(self._refresh_conditionals)
 
@@ -1179,6 +1188,14 @@ class MainWindow(QMainWindow):
             else:
                 self.cond_manager.arm(opt, "SL", sl, sl, qty, outside)
                 msgs.append(f"止损(本地≤{sl:.2f}{off})")
+        # 标的价触发 → 市价卖出 (本地监控标的价, 仅期权适用)
+        if req.get("ul_on") and opt.right in ("C", "P"):
+            ul = round(req.get("ul_price", 0.0), 2)
+            direction = req.get("ul_dir", "UP")
+            arrow = "≥" if direction == "UP" else "≤"
+            self.cond_manager.arm(opt, "UL", ul, 0.0, qty, outside,
+                                  watch="UNDER", direction=direction, market=True)
+            msgs.append(f"标的{arrow}{ul:.2f}→市价卖{qty}")
         if msgs:
             tag = "" if native else " (本地: 仅程序运行时监控)"
             self.statusBar().showMessage("已挂条件单: " + " + ".join(msgs) + tag)
@@ -1209,6 +1226,12 @@ class MainWindow(QMainWindow):
         self.statusBar().setStyleSheet(f"QStatusBar {{ color: #ff9800; }}")
         self.statusBar().showMessage(f"条件单 {cond.kind_label} 触发但{msg}")
 
+    def _on_conditional_voided(self, cond, reason: str):
+        self.statusBar().showMessage(
+            f"条件单 #{cond.cond_id} {cond.kind_label} "
+            f"({cond.option.display_name}) 已自动作废: {reason}"
+        )
+
     # ── Chart Window ─────────────────────────────────────────────────
 
     def _on_open_chart(self):
@@ -1228,6 +1251,47 @@ class MainWindow(QMainWindow):
         chart.destroyed.connect(lambda: self._chart_windows.remove(chart)
                                 if chart in self._chart_windows else None)
         chart.show_and_load()
+
+    def _on_open_option_chart(self, option):
+        """期权链双击某合约 → 打开该期权**今日 1 分钟图** (轻量独立窗口, 懒导入)。
+
+        **单实例**: 同时只保留一个期权分时图 —— 双击新合约先关掉旧合约的窗口
+        (close → closeEvent 停轮询定时器, WA_DeleteOnClose 销毁释放);
+        双击**同一**合约则把已开的窗口带到前台, 不重开。"""
+        if not self.ibkr_engine.is_connected:
+            QMessageBox.warning(self, "未连接", "请先连接到 IBKR")
+            return
+
+        old = self._option_chart
+        if old is not None:
+            try:
+                if old._option.to_ibkr_key() == option.to_ibkr_key():
+                    old.raise_()
+                    old.activateWindow()
+                    return
+                old.close()  # 停止取数并销毁 (destroyed → _on_option_chart_destroyed)
+            except RuntimeError:
+                pass  # C++ 对象已销毁 (窗口早被用户关掉), 直接开新的
+            self._option_chart = None
+
+        from widgets.option_chart_window import OptionChartWindow
+
+        chart = OptionChartWindow(
+            engine=self.ibkr_engine,   # 行情/历史数据一律走真实引擎 (模拟模式亦然)
+            option=option,
+            parent=None,               # independent window
+        )
+        self._option_chart = chart
+        self._chart_windows.append(chart)
+        chart.destroyed.connect(lambda: self._on_option_chart_destroyed(chart))
+        chart.show_and_load()
+
+    def _on_option_chart_destroyed(self, chart):
+        """期权分时图销毁 (关闭/被新合约替换) → 从跟踪列表与单实例引用中移除。"""
+        if chart in self._chart_windows:
+            self._chart_windows.remove(chart)
+        if self._option_chart is chart:
+            self._option_chart = None
 
     # ── Detachable Price Ladder ──────────────────────────────────────
 

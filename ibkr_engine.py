@@ -160,6 +160,9 @@ class IBKRApp(EWrapper, EClient):
         self._exec_cf: dict[str, float] = {}
         self._posval: dict[int, float] = {}
         self._comm_by_execid: dict[str, float] = {}
+        # execId -> conId (execDetails 记录), 用于把 commissionReport 的佣金
+        # 归到具体合约 → 点价梯/持仓面板显示该合约今日实际已付手续费
+        self._exec_conid: dict[str, int] = {}
         # 已平仓交易统计 (笔数/胜率/盈亏比), 由 execDetails 喂入 (含当日历史回放), 每日重置
         self._trade_stats = TradeStats()
 
@@ -604,6 +607,8 @@ class IBKRApp(EWrapper, EClient):
             con_id = int(getattr(contract, "conId", 0) or 0)
         except (ValueError, TypeError):
             con_id = 0
+        if con_id:
+            self._exec_conid[execution.execId] = con_id
         if con_id and is_new_exec:
             est_comm = max(COMMISSION_PER_CONTRACT * shares, COMMISSION_MIN)
             self._trade_stats.record_fill(
@@ -643,6 +648,7 @@ class IBKRApp(EWrapper, EClient):
             self._exec_cf.clear()
             self._posval.clear()
             self._comm_by_execid.clear()
+            self._exec_conid.clear()
             self._trade_stats.reset()   # 交易统计也按日重置 (笔数/胜率/盈亏比)
 
     def _emit_computed_daily(self):
@@ -843,6 +849,9 @@ class IBKREngine:
         # this session, so without this the 平仓 button can't close a position
         # left over from before a crash/restart. Keyed by position_key.
         self._ibkr_positions: dict[str, PortfolioPosition] = {}
+        # 初始持仓快照 (reqPositions → positionEnd) 是否已到 — 条件单触发前
+        # 校验持仓以此为前提, 避免刚连接、快照未到时把有仓误判为空仓
+        self._positions_synced = False
 
         # Order IDs the user asked to cancel (suppress reject popup for these)
         self._user_cancel_ids: set[int] = set()
@@ -866,6 +875,15 @@ class IBKREngine:
         self.bridge.open_order_received.connect(self._on_open_order)
         self.bridge.error_received.connect(self._on_order_error)
         self.bridge.portfolio_position_received.connect(self._on_portfolio_position)
+        self.bridge.portfolio_positions_end.connect(self._on_positions_synced)
+
+    def _on_positions_synced(self):
+        self._positions_synced = True
+
+    @property
+    def positions_synced(self) -> bool:
+        """初始持仓快照是否已收完 (positionEnd 已到)。"""
+        return self._positions_synced
 
     @property
     def is_connected(self) -> bool:
@@ -904,6 +922,26 @@ class IBKREngine:
         return PositionInfo(
             option=opt, quantity=int(pp.quantity), avg_price=pp.avg_price,
         )
+
+    def get_position_commission(self, option_key: str) -> float:
+        """该合约**今日**累计已付手续费 (IBKR commissionReport 实际值, 按 execId 去重)。
+
+        供点价梯/持仓面板显示。旧实现读 `get_position().total_commission`, 但真实模式
+        的 PositionInfo 由 reqPositions 构造、从不填佣金 → 恒显示 0 (bug)。
+        注意口径: 只含**今日**成交的佣金 (IBKR 仅回放当日 execution); 隔夜仓的开仓
+        佣金已计入 IBKR avgCost, 不重复出现在这里。"""
+        pp = self._ibkr_positions.get(option_key)
+        if not pp or not self._app or not pp.con_id:
+            return 0.0
+        app = self._app
+        try:
+            # list() 拷贝: reader 线程可能并发写入这两个 dict
+            return sum(
+                comm for eid, comm in list(app._comm_by_execid.items())
+                if app._exec_conid.get(eid) == pp.con_id
+            )
+        except RuntimeError:
+            return 0.0
 
     @property
     def orders(self) -> dict[int, OrderInfo]:
@@ -1098,6 +1136,7 @@ class IBKREngine:
             except Exception:
                 pass
         self._connected = False
+        self._positions_synced = False  # 重连后等新快照 (positionEnd) 再信任持仓
         self.bridge.disconnected.emit()
 
     def reconnect(self, mode: TradingMode) -> bool:

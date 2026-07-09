@@ -159,8 +159,11 @@ class OptionChartWindow(QMainWindow):
         self._price_plot.showGrid(x=True, y=True, alpha=0.15)
         self._price_plot.hideAxis("bottom")
 
+        # solid=True: 涨跌都实心填充、主体不描边 — 全天 390 根 1min 高密度下
+        # 空心轮廓+cosmetic 描边会把相邻柱糊成一片 (柱子黏连)
         self._candles = CandlestickItem(
-            color_up=CHART_COLOR_CANDLE_UP, color_down=CHART_COLOR_CANDLE_DOWN
+            color_up=CHART_COLOR_CANDLE_UP, color_down=CHART_COLOR_CANDLE_DOWN,
+            solid=True,
         )
         self._price_plot.addItem(self._candles)
 

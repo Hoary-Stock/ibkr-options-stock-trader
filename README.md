@@ -412,6 +412,12 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-07-09** — **修期权分时图蜡烛「黏连」**。`CandlestickItem` 原样式 = 阳线空心轮廓 +
+  主体 1px cosmetic 描边; 全天 ~390 根 1min 挤在 ~900px 时每根仅 ~2px, 描边不随缩放变细,
+  轮廓与影线糊成一片、分不出实心主体和细线。加 `solid=True` 模式: 涨跌主体都**纯填充不描边**
+  (影线仍 1px 细线, 十字星画横线), 期权分时图启用; 正股 ChartWindow 保持原空心样式不变。
+  离屏渲染 390 根/60 根两档验证: 放大后为标准「实心主体+细影线」。
+  (`widgets/candlestick_item.py`, `widgets/option_chart_window.py`)
 - **2026-07-09** — **修退出崩溃: OptionChartWindow 缺 `cleanup()`**。主窗口 closeEvent 对
   `_chart_windows` 里所有图表统一调 `cleanup()`, 期权分时图窗口只有 closeEvent 没有该方法 →
   开着期权分时图退出程序时 AttributeError, 后续 cond_manager/engine 的清理与断开被跳过

@@ -17,14 +17,20 @@ class CandlestickItem(pg.GraphicsObject):
     - Body: rectangle from open to close, 50% of bar spacing
     - Up candles: hollow (outline only), Down candles: filled
     - All pen widths in pixels (cosmetic), not data coordinates
+
+    solid=True 切换为「标准实心」样式: 涨跌主体都**只用填充、不描边**,
+    影线仍为 1px 细线。高密度图 (如全天 390 根 1min, 每根仅 ~2px) 下,
+    cosmetic 描边不随缩放变细, 空心轮廓+描边会把相邻柱糊成一片;
+    纯填充的主体宽度跟随数据坐标缩放, 柱间空隙始终可见。
     """
 
-    def __init__(self, color_up="#00c853", color_down="#ff1744"):
+    def __init__(self, color_up="#00c853", color_down="#ff1744", solid=False):
         super().__init__()
         self._picture = QPicture()
         self._data = []
         self._color_up = QColor(color_up)
         self._color_down = QColor(color_down)
+        self._solid = solid
         self._bounding_rect = QRectF(0, 0, 1, 1)
 
     def set_data(self, data: list[dict]):
@@ -66,6 +72,7 @@ class CandlestickItem(pg.GraphicsObject):
         body_pen_down.setWidthF(1.0)
         body_pen_down.setCosmetic(True)
 
+        brush_up = QBrush(self._color_up)
         brush_down = QBrush(self._color_down)
 
         all_lows = []
@@ -79,31 +86,32 @@ class CandlestickItem(pg.GraphicsObject):
             all_highs.append(h)
 
             if c >= o:
-                # Up candle: hollow body (outline only)
-                painter.setPen(wick_pen_up)
-                painter.setBrush(Qt.NoBrush)
-                # Wick
-                painter.drawLine(QPointF(x, l), QPointF(x, h))
-                # Body
-                painter.setPen(body_pen_up)
-                body_top = c
-                body_bot = o
+                wick_pen, body_pen, brush = wick_pen_up, body_pen_up, brush_up
+                hollow = not self._solid   # 默认样式: 阳线空心
+                body_top, body_bot = c, o
             else:
-                # Down candle: filled body
-                painter.setPen(wick_pen_down)
-                painter.setBrush(brush_down)
-                # Wick
-                painter.drawLine(QPointF(x, l), QPointF(x, h))
-                # Body
-                painter.setPen(body_pen_down)
-                body_top = o
-                body_bot = c
+                wick_pen, body_pen, brush = wick_pen_down, body_pen_down, brush_down
+                hollow = False             # 阴线始终实心
+                body_top, body_bot = o, c
 
+            # Wick
+            painter.setPen(wick_pen)
+            painter.drawLine(QPointF(x, l), QPointF(x, h))
+
+            # Body
             body_h = body_top - body_bot
             if body_h < 1e-8:
                 # Doji — 1px horizontal line at body width
+                painter.setPen(body_pen)
                 painter.drawLine(QPointF(x - w, o), QPointF(x + w, o))
+            elif self._solid:
+                # 实心样式: 纯填充不描边 (cosmetic 描边在高密度下会糊柱)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(brush)
+                painter.drawRect(QRectF(x - w, body_bot, w * 2, body_h))
             else:
+                painter.setPen(body_pen)
+                painter.setBrush(Qt.NoBrush if hollow else brush)
                 painter.drawRect(QRectF(x - w, body_bot, w * 2, body_h))
 
         painter.end()

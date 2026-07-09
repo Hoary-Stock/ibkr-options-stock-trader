@@ -266,12 +266,15 @@ class MainWindow(QMainWindow):
         self.price_ladder = PriceLadder()
         self.bottom_splitter.addWidget(self.price_ladder)
 
-        # Right: Position + Order tabs (top) + 期权理论价计算器 (bottom-right corner)
+        # Right: Position + Order + Watch tabs (top) + 期权理论价计算器 (bottom-right corner)
         self.right_tabs = QTabWidget()
         self.position_panel = PositionPanel()
         self.order_panel = OrderPanel()
+        self.watch_panel = WatchPanel()
+        self.watch_panel.set_manager(self.watch_manager)
         self.right_tabs.addTab(self.position_panel, "持仓")
         self.right_tabs.addTab(self.order_panel, "委托")
+        self.right_tabs.addTab(self.watch_panel, "监控")
 
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.addWidget(self.right_tabs)
@@ -284,16 +287,10 @@ class MainWindow(QMainWindow):
         self.right_splitter.setChildrenCollapsible(False)
         self.bottom_splitter.addWidget(self.right_splitter)
 
-        # 最右: 自选监控面板 (实时价 + 到价警报)
-        self.watch_panel = WatchPanel()
-        self.watch_panel.set_manager(self.watch_manager)
-        self.bottom_splitter.addWidget(self.watch_panel)
-
-        self.bottom_splitter.setSizes([380, 500, 220])
-        # 下方横向: 点价梯 / 持仓委托 / 自选监控 按 4:5:2 比例联动缩放
+        self.bottom_splitter.setSizes([380, 500])
+        # 下方横向: 点价梯与右侧面板按 4:5 比例联动缩放
         self.bottom_splitter.setStretchFactor(0, 4)
         self.bottom_splitter.setStretchFactor(1, 5)
-        self.bottom_splitter.setStretchFactor(2, 2)
         self.bottom_splitter.setChildrenCollapsible(False)
         self.main_splitter.addWidget(self.bottom_splitter)
 
@@ -1263,7 +1260,8 @@ class MainWindow(QMainWindow):
             return
         if self.watch_manager.add(option):
             self.statusBar().showMessage(
-                f"已加入自选监控: {option.display_name} (右侧面板可设到价警报)")
+                f"已加入自选监控: {option.display_name} (「监控」页可设到价警报)")
+            self.right_tabs.setCurrentWidget(self.watch_panel)
         else:
             self.statusBar().showMessage(f"{option.display_name} 已在自选列表中")
 

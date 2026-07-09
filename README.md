@@ -250,7 +250,7 @@ ibkr_trader/
 | `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
 | `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。**双击**某合约 → 打开该期权**当日 1 分钟图**(`chart_requested` → `option_chart_window.py`; 单击载入点价梯不变)。 |
 | `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + **标的价触发行** + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**标的价触发**(仅期权):勾「标的价」+ 选方向(≥涨到/≤跌到)+ 填标的触发价 → 监控**标的**价, 到价即对本期权发**市价卖出**(本地监控; `arm(...,watch="UNDER",market=True)`)。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
-| `watch_panel.py` (≈220) | **自选监控面板** (持仓/委托右侧, bottom_splitter 第三列)。表: 合约/现价/⚠≥/⚠≤/✕; 点价梯左下「☆ 加自选」把当前合约加入; 现价 0.5s 刷新 (面板不可见时跳过重绘, 警报巡检照常); 双击警报列编辑触发价 (空=关, 一次性触发后自动清除); 触发 = 声音(`sound_alerts.play_alert`, sounds/ALERT 可自定义) + 非模态弹窗 + 行高亮 3s + 状态栏。逻辑在根目录 `watchlist.py` (WatchListManager)。 |
+| `watch_panel.py` (≈220) | **自选监控面板** (right_tabs 第三个 Tab「监控」, 与持仓/委托同窗口点击切换)。表: 合约/现价/⚠≥/⚠≤/✕; 点价梯左下「☆ 加自选」把当前合约加入并自动切到该 Tab; 现价 0.5s 刷新 (Tab 不可见时跳过重绘, 警报巡检照常); 双击警报列编辑触发价 (空=关, 一次性触发后自动清除); 触发 = 声音(`sound_alerts.play_alert`, sounds/ALERT 可自定义) + 非模态弹窗 + 行高亮 3s + 状态栏。逻辑在根目录 `watchlist.py` (WatchListManager)。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选;「费$」后缀 = 该合约**今日实际佣金**(`get_position_commission`)。 |
 | `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。**重启后自动加载当日已完成委托**(引擎 `reqCompletedOrders`,见 §4.3)。 |
 | `account_bar.py` (≈270) | 账户摘要条,**两行布局**(窄屏单行会截断,故拆开):**第一行**=资金摘要(总资产/可用/购买力/未实现/今日盈亏 + 右侧**今日手续费**,`on_computed_daily` 取 `computed_daily_pnl` 信号的手续费分量,真实=IBKR commissionReport 日内累计,模拟=各笔估算佣金累计;**今日盈亏=IBKR dailyPnL**(较昨收、含费),仅当 dailyPnL 本会话从未有效时才用 已实现+未实现 兜底——两口径对隔夜仓差异大,不混用以免显示跳变);**第二行**=账户名(左)+ **美东时间实时时钟**(右,`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地)。**币种余额条已从账户栏移除**(`on_currency_balance` 保留为空槽,数据仍在引擎侧流动,不动主窗口信号接线)。每 `ACCOUNT_REFRESH_MS` (3s) 调 `request_account_summary()` + `request_currency_balances()`,但这两者已**幂等**(订一次流式订阅, 之后调用直接返回, 不再 cancel+重订), 故定时器只是兜底、不再给 Gateway 制造 churn。 |
@@ -416,8 +416,9 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 - **2026-07-09** — **新增「自选监控 (watch list)」+ 修点价梯盘口空档消失**。
   ① **自选监控**: 点价梯左下角新增「☆ 加自选」按钮 (`watch_requested` 信号), 把当前合约加入
-  右侧新面板 (`widgets/watch_panel.py`, bottom_splitter 第三列, 持仓/委托右边); 现价 **0.5s 刷新**
-  (面板不可见时跳过重绘); 每条可双击设置 **高于(⚠≥)/低于(⚠≤) 到价警报** —— 触发 = 警报音
+  **「监控」Tab** (`widgets/watch_panel.py`, right_tabs 第三页, 与持仓/委托同窗口点击切换,
+  加自选后自动切到该页); 现价 **0.5s 刷新**
+  (Tab 不可见时跳过重绘); 每条可双击设置 **高于(⚠≥)/低于(⚠≤) 到价警报** —— 触发 = 警报音
   (`sound_alerts.play_alert`, `sounds/ALERT.wav` 可自定义, 缺省三连蜂鸣) + 非模态弹窗 +
   行高亮 + 状态栏, **一次性** (触发后该方向自动清除); 手动 ✕ 删除; 持久化 `watchlist.json`
   (gitignore), **启动 resume 时自动删除过期合约** (期权 expiry<今日, 期货月份<本月, 正股不过期)。
